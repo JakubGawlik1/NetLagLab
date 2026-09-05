@@ -12,7 +12,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(netlaglab_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(netlaglab src/main.cpp)
+add_executable(netlaglab src/main.cpp src/session.cpp)
 
 target_compile_features(netlaglab PRIVATE cxx_std_20)
 target_compile_definitions(netlaglab PRIVATE NETLAGLAB_VERSION="${PROJECT_VERSION}")

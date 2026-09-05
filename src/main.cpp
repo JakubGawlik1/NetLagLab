@@ -1,11 +1,7 @@
-#include <cerrno>
-#include <cstring>
-#include <iostream>
-#include <spawn.h>
-#include <string_view>
-#include <sys/wait.h>
+#include "session.hpp"
 
-extern char** environ;
+#include <iostream>
+#include <string_view>
 
 namespace {
 
@@ -28,61 +24,6 @@ int run_usage_error(const std::string_view message, std::ostream& error)
     error << "NetLagLab: " << message << '\n'
           << "Usage: netlaglab run -- <program> [arguments...]\n";
     return 2;
-}
-
-int spawn_error_exit_code(const int error_code)
-{
-    if (error_code == ENOENT) {
-        return 127;
-    }
-
-    if (error_code == EACCES || error_code == ENOEXEC) {
-        return 126;
-    }
-
-    return 125;
-}
-
-int wait_for_child(const pid_t child_pid, std::ostream& error)
-{
-    int status{};
-    pid_t wait_result{};
-
-    do {
-        wait_result = waitpid(child_pid, &status, 0);
-    } while (wait_result == -1 && errno == EINTR);
-
-    if (wait_result == -1) {
-        const int wait_error{errno};
-        error << "NetLagLab: failed to wait for child process: " << std::strerror(wait_error) << '\n';
-        return 125;
-    }
-
-    if (WIFEXITED(status)) {
-        return WEXITSTATUS(status);
-    }
-
-    if (WIFSIGNALED(status)) {
-        return 128 + WTERMSIG(status);
-    }
-
-    error << "NetLagLab: child process ended with an unsupported status\n";
-    return 125;
-}
-
-int run_program(char* const child_arguments[], std::ostream& error)
-{
-    pid_t child_pid{};
-    const int spawn_error{
-        posix_spawnp(&child_pid, child_arguments[0], nullptr, nullptr, child_arguments, environ)};
-
-    if (spawn_error != 0) {
-        error << "NetLagLab: failed to launch '" << child_arguments[0]
-              << "': " << std::strerror(spawn_error) << '\n';
-        return spawn_error_exit_code(spawn_error);
-    }
-
-    return wait_for_child(child_pid, error);
 }
 
 int run_cli(
@@ -112,7 +53,7 @@ int run_cli(
             return run_usage_error("expected a program after '--'", error);
         }
 
-        return run_program(argv + 3, error);
+        return netlaglab::run_session(argv + 3, error);
     }
 
     if (argc > 2) {
