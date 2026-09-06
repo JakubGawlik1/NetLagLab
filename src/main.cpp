@@ -11,10 +11,13 @@ constexpr std::string_view help_text{
     "conditions.\n\n"
     "Usage:\n"
     "  netlaglab [OPTION]\n"
-    "  netlaglab run -- <program> [arguments...]\n\n"
+    "  netlaglab run -- <program> [arguments...]\n"
+    "  netlaglab attach\n\n"
     "Commands:\n"
     "  run -- <program> [arguments...]\n"
-    "      Run a program and wait for it to exit\n\n"
+    "      Run a program and wait for it to exit\n"
+    "  attach\n"
+    "      Attach a controller to the active session\n\n"
     "Options:\n"
     "  -h, --help  Show this help message\n"
     "      --version  Show version information\n"};
@@ -54,6 +57,16 @@ int run_cli(
         }
 
         return netlaglab::run_session(argv + 3, error);
+    }
+
+    if (argument == "attach") {
+        if (argc != 2) {
+            error << "NetLagLab: 'attach' does not accept arguments\n"
+                  << "Usage: netlaglab attach\n";
+            return 2;
+        }
+
+        return netlaglab::attach_to_session(output, error);
     }
 
     if (argc > 2) {
