@@ -1227,6 +1227,11 @@ int run_session(char* const child_arguments[], std::ostream& error)
         control_socket_path_owner,
         error)};
     if (listening_descriptor == -1) {
+        const int cleanup_error{control_socket_path_owner.remove_owned()};
+        if (cleanup_error != 0) {
+            error << "NetLagLab: failed to remove control.sock after listener setup failure: "
+                  << std::strerror(cleanup_error) << '\n';
+        }
         return 125;
     }
     FileDescriptor listening_socket{listening_descriptor};
