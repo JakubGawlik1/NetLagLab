@@ -1,6 +1,7 @@
 #include "session.hpp"
 #include "file_descriptor.hpp"
 #include "session_paths.hpp"
+#include "session_validation.hpp"
 
 #include "netlaglab/network_profile.hpp"
 
@@ -149,62 +150,6 @@ private:
     const std::string socket_path_;
     bool owned_{false};
 };
-
-[[nodiscard]] bool validate_runtime_directory(const int descriptor, std::ostream& error)
-{
-    struct stat directory_status {};
-    if (fstat(descriptor, &directory_status) == -1) {
-        const int status_error{errno};
-        error << "NetLagLab: failed to inspect XDG_RUNTIME_DIR: " << std::strerror(status_error)
-              << '\n';
-        return false;
-    }
-
-    if (!S_ISDIR(directory_status.st_mode)) {
-        error << "NetLagLab: XDG_RUNTIME_DIR is not a directory\n";
-        return false;
-    }
-
-    if (directory_status.st_uid != geteuid()) {
-        error << "NetLagLab: XDG_RUNTIME_DIR is not owned by the current user\n";
-        return false;
-    }
-
-    if ((directory_status.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-        error << "NetLagLab: XDG_RUNTIME_DIR must not be accessible by group or other users\n";
-        return false;
-    }
-
-    return true;
-}
-
-[[nodiscard]] bool validate_session_directory(const int descriptor, std::ostream& error)
-{
-    struct stat directory_status {};
-    if (fstat(descriptor, &directory_status) == -1) {
-        const int status_error{errno};
-        error << "NetLagLab: failed to inspect the netlaglab runtime directory: "
-              << std::strerror(status_error) << '\n';
-        return false;
-    }
-
-    if (!S_ISDIR(directory_status.st_mode)) {
-        error << "NetLagLab: the netlaglab runtime path is not a directory\n";
-        return false;
-    }
-
-    if (directory_status.st_uid != geteuid()) {
-        error << "NetLagLab: the netlaglab runtime directory is owned by another user\n";
-        return false;
-    }
-
-    if ((directory_status.st_mode & 0777) != 0700) {
-        error << "NetLagLab: the netlaglab runtime directory must have permissions 0700\n";
-        return false;
-    }
-
-    return true;
-}
 
 [[nodiscard]] int spawn_error_exit_code(const int error_code)
 {
@@ -1057,7 +1002,7 @@ int attach_to_session(std::ostream& output, std::ostream& error)
     }
     const FileDescriptor runtime_directory{runtime_descriptor};
 
-    if (!validate_runtime_directory(runtime_directory.get(), error)) {
+    if (!validate_runtime_directory(runtime_directory.get(), geteuid(), error)) {
         return 1;
     }
 
@@ -1077,7 +1022,7 @@ int attach_to_session(std::ostream& output, std::ostream& error)
     }
     const FileDescriptor session_directory{session_directory_descriptor};
 
-    if (!validate_session_directory(session_directory.get(), error)
+    if (!validate_session_directory(session_directory.get(), geteuid(), error)
         || !validate_control_socket(session_directory.get(), error)) {
         return 1;
     }
@@ -1111,7 +1056,7 @@ int run_session(char* const child_arguments[], std::ostream& error)
     }
     const FileDescriptor runtime_directory{runtime_descriptor};
 
-    if (!validate_runtime_directory(runtime_directory.get(), error)) {
+    if (!validate_runtime_directory(runtime_directory.get(), geteuid(), error)) {
         return 125;
     }
 
@@ -1146,7 +1091,7 @@ int run_session(char* const child_arguments[], std::ostream& error)
     }
     const FileDescriptor session_directory{session_directory_descriptor};
 
-    if (!validate_session_directory(session_directory.get(), error)) {
+    if (!validate_session_directory(session_directory.get(), geteuid(), error)) {
         return 125;
     }
 

@@ -12,7 +12,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(netlaglab_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(netlaglab src/main.cpp src/session.cpp)
+add_executable(
+    netlaglab
+    src/main.cpp
+    src/session.cpp
+    src/session_validation.cpp
+)
 
 target_compile_features(netlaglab PRIVATE cxx_std_20)
 target_compile_definitions(netlaglab PRIVATE NETLAGLAB_VERSION="${PROJECT_VERSION}")
@@ -23,7 +28,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(netlaglab PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(netlaglab-helper src/helper_main.cpp)
+add_executable(netlaglab-helper src/helper_main.cpp src/session_validation.cpp)
 
 target_compile_features(netlaglab-helper PRIVATE cxx_std_20)
 set_target_properties(netlaglab-helper PROPERTIES CXX_EXTENSIONS OFF)
