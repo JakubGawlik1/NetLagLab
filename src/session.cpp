@@ -1,4 +1,5 @@
 #include "session.hpp"
+#include "file_descriptor.hpp"
 #include "session_paths.hpp"
 
 #include "netlaglab/network_profile.hpp"
@@ -48,36 +49,6 @@ constexpr int poll_timeout_ms{100};
 constexpr int listen_backlog{1};
 constexpr std::size_t maximum_command_size{1024};
 constexpr std::size_t maximum_status_size{8 * 1024};
-
-class FileDescriptor {
-public:
-    explicit FileDescriptor(const int descriptor) : descriptor_{descriptor} {}
-
-    ~FileDescriptor() { reset(); }
-
-    FileDescriptor(const FileDescriptor&) = delete;
-    FileDescriptor& operator=(const FileDescriptor&) = delete;
-
-    [[nodiscard]] int get() const {return descriptor_; }
-
-    void reset()
-    {
-        if (descriptor_ != -1) {
-            close(descriptor_);
-            descriptor_ = -1;
-        }
-    }
-
-    [[nodiscard]] int release()
-    {
-        const int released_descriptor{descriptor_};
-        descriptor_ = -1;
-        return released_descriptor;
-    }
-
-private:
-    int descriptor_;
-};
 
 class SocketPathOwner {
 public:
