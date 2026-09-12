@@ -23,6 +23,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(netlaglab PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_executable(netlaglab-helper src/helper_main.cpp)
+
+target_compile_features(netlaglab-helper PRIVATE cxx_std_20)
+set_target_properties(netlaglab-helper PROPERTIES CXX_EXTENSIONS OFF)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(netlaglab-helper PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 include(CTest)
 
 if(BUILD_TESTING)
