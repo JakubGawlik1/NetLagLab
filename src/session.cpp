@@ -1,4 +1,5 @@
 #include "session.hpp"
+#include "session_paths.hpp"
 
 #include "netlaglab/network_profile.hpp"
 
@@ -27,9 +28,22 @@ extern char** environ;
 namespace netlaglab {
 namespace {
 
-constexpr std::string_view session_directory_name{"netlaglab"};
-constexpr std::string_view lock_file_name{"session.lock"};
-constexpr std::string_view control_socket_name{"control.sock"};
+[[nodiscard]] std::optional<SessionPaths> make_session_paths(std::ostream& error)
+{
+    const char* const runtime_path{std::getenv("XDG_RUNTIME_DIR")};
+    if (runtime_path == nullptr || runtime_path[0] == '\0') {
+        error << "NetLagLab: XDG_RUNTIME_DIR is not set\n";
+        return std::nullopt;
+    }
+
+    if (runtime_path[0] != '/') {
+        error << "NetLagLab: XDG_RUNTIME_DIR must be an absolute path\n";
+        return std::nullopt;
+    }
+
+    return SessionPaths{runtime_path};
+}
+
 constexpr int poll_timeout_ms{100};
 constexpr int listen_backlog{1};
 constexpr std::size_t maximum_command_size{1024};
@@ -37,23 +51,14 @@ constexpr std::size_t maximum_status_size{8 * 1024};
 
 class FileDescriptor {
 public:
-    explicit FileDescriptor(const int descriptor)
-        : descriptor_{descriptor}
-    {
-    }
+    explicit FileDescriptor(const int descriptor) : descriptor_{descriptor} {}
 
-    ~FileDescriptor()
-    {
-        reset();
-    }
+    ~FileDescriptor() { reset(); }
 
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
-    [[nodiscard]] int get() const
-    {
-        return descriptor_;
-    }
+    [[nodiscard]] int get() const {return descriptor_; }
 
     void reset()
     {
@@ -74,27 +79,39 @@ private:
     int descriptor_;
 };
 
-class ControlSocketPath {
+class SocketPathOwner {
 public:
-    explicit ControlSocketPath(const int session_directory_descriptor)
-        : session_directory_descriptor_{session_directory_descriptor}
+    SocketPathOwner(
+        const int session_directory_descriptor,
+        const std::string_view socket_name,
+        const std::string& socket_path)
+        : session_directory_descriptor_{session_directory_descriptor},
+          socket_name_{socket_name},
+          socket_path_{socket_path}
     {
     }
 
-    ~ControlSocketPath()
+    ~SocketPathOwner() { (void)remove_owned(); }
+
+    SocketPathOwner(const SocketPathOwner&) = delete;
+    SocketPathOwner& operator=(const SocketPathOwner&) = delete;
+
+    [[nodiscard]] const std::string& name() const noexcept
     {
-        (void)remove_owned();
+        return socket_name_;
     }
 
-    ControlSocketPath(const ControlSocketPath&) = delete;
-    ControlSocketPath& operator=(const ControlSocketPath&) = delete;
+    [[nodiscard]] const std::string& path() const noexcept
+    {
+        return socket_path_;
+    }
 
     [[nodiscard]] bool remove_stale(std::ostream& error) const
     {
         struct stat socket_status {};
         if (fstatat(
                 session_directory_descriptor_,
-                control_socket_name.data(),
+                socket_name_.data(),
                 &socket_status,
                 AT_SYMLINK_NOFOLLOW)
             == -1) {
@@ -103,24 +120,26 @@ public:
             }
 
             const int status_error{errno};
-            error << "NetLagLab: failed to inspect control.sock: "
+            error << "NetLagLab: failed to inspect " << socket_name_ << ": "
                   << std::strerror(status_error) << '\n';
             return false;
         }
 
         if (!S_ISSOCK(socket_status.st_mode)) {
-            error << "NetLagLab: refusing to remove control.sock because it is not a socket\n";
+            error << "NetLagLab: refusing to remove " << socket_name_
+                  << " because it is not a socket\n";
             return false;
         }
 
         if (socket_status.st_uid != geteuid()) {
-            error << "NetLagLab: refusing to remove control.sock owned by another user\n";
+            error << "NetLagLab: refusing to remove " << socket_name_
+                  << " owned by another user\n";
             return false;
         }
 
-        if (unlinkat(session_directory_descriptor_, control_socket_name.data(), 0) == -1) {
+        if (unlinkat(session_directory_descriptor_, socket_name_.c_str(), 0) == -1) {
             const int unlink_error{errno};
-            error << "NetLagLab: failed to remove stale control.sock: "
+            error << "NetLagLab: failed to remove stale " << socket_name_ << ": "
                   << std::strerror(unlink_error) << '\n';
             return false;
         }
@@ -139,7 +158,7 @@ public:
             return 0;
         }
 
-        if (unlinkat(session_directory_descriptor_, control_socket_name.data(), 0) == 0) {
+        if (unlinkat(session_directory_descriptor_, socket_name_.c_str(), 0) == 0) {
             owned_ = false;
             return 0;
         }
@@ -155,6 +174,8 @@ public:
 
 private:
     int session_directory_descriptor_;
+    const std::string socket_name_;
+    const std::string socket_path_;
     bool owned_{false};
 };
 
@@ -259,36 +280,25 @@ private:
     return child_exit_code(status, error);
 }
 
-[[nodiscard]] std::string make_control_socket_path(const std::string_view runtime_path)
-{
-    std::string path{runtime_path};
-    if (path.back() != '/') {
-        path.push_back('/');
-    }
-
-    path.append(session_directory_name);
-    path.push_back('/');
-    path.append(control_socket_name);
-    return path;
-}
-
 [[nodiscard]] int create_listening_socket(
-    const std::string& socket_path,
     const int session_directory_descriptor,
-    ControlSocketPath& socket_path_owner,
+    SocketPathOwner& socket_path_owner,
     std::ostream& error)
 {
+    const std::string& socket_path{socket_path_owner.path()};
+    const std::string& socket_name{socket_path_owner.name()};
+
     struct sockaddr_un address {};
     if (socket_path.size() >= sizeof(address.sun_path)) {
-        error << "NetLagLab: control socket path is too long\n";
+        error << "NetLagLab: " << socket_name << " path is too long\n";
         return -1;
     }
 
     const int raw_socket{socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)};
     if (raw_socket == -1) {
         const int socket_error{errno};
-        error << "NetLagLab: failed to create control socket: " << std::strerror(socket_error)
-              << '\n';
+        error << "NetLagLab: failed to create " << socket_name << ": "
+              << std::strerror(socket_error) << '\n';
         return -1;
     }
     FileDescriptor listening_socket{raw_socket};
@@ -304,21 +314,22 @@ private:
             address_size)
         == -1) {
         const int bind_error{errno};
-        error << "NetLagLab: failed to bind control socket: " << std::strerror(bind_error) << '\n';
+        error << "NetLagLab: failed to bind " << socket_name << ": "
+              << std::strerror(bind_error) << '\n';
         return -1;
     }
     socket_path_owner.mark_owned();
 
-    if (fchmodat(session_directory_descriptor, control_socket_name.data(), 0600, 0) == -1) {
+    if (fchmodat(session_directory_descriptor, socket_name.c_str(), 0600, 0) == -1) {
         const int chmod_error{errno};
-        error << "NetLagLab: failed to set permissions on control.sock: "
+        error << "NetLagLab: failed to set permissions on " << socket_name << ": "
               << std::strerror(chmod_error) << '\n';
         return -1;
     }
 
     if (listen(listening_socket.get(), listen_backlog) == -1) {
         const int listen_error{errno};
-        error << "NetLagLab: failed to listen on control socket: "
+        error << "NetLagLab: failed to listen on " << socket_name << ": "
               << std::strerror(listen_error) << '\n';
         return -1;
     }
@@ -333,7 +344,7 @@ private:
     struct stat socket_status {};
     if (fstatat(
             session_directory_descriptor,
-            control_socket_name.data(),
+            SessionPaths::control_socket_name.data(),
             &socket_status,
             AT_SYMLINK_NOFOLLOW)
         == -1) {
@@ -365,21 +376,22 @@ private:
     return true;
 }
 
-[[nodiscard]] int connect_to_control_socket(
+[[nodiscard]] int connect_to_socket(
     const std::string& socket_path,
+    const std::string_view socket_name,
     std::ostream& error)
 {
     struct sockaddr_un address {};
     if (socket_path.size() >= sizeof(address.sun_path)) {
-        error << "NetLagLab: control socket path is too long\n";
+        error << "NetLagLab: " << socket_name << " path is too long\n";
         return -1;
     }
 
     const int raw_socket{socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)};
     if (raw_socket == -1) {
         const int socket_error{errno};
-        error << "NetLagLab: failed to create client socket: " << std::strerror(socket_error)
-              << '\n';
+        error << "NetLagLab: failed to create client socket for " << socket_name << ": "
+              << std::strerror(socket_error) << '\n';
         return -1;
     }
     FileDescriptor client_socket{raw_socket};
@@ -712,7 +724,7 @@ void print_terminal_summary(const int child_status, std::ostream& error)
 [[nodiscard]] int finish_session(
     const int child_status,
     FileDescriptor& listening_socket,
-    ControlSocketPath& socket_path_owner,
+    SocketPathOwner& socket_path_owner,
     std::optional<FileDescriptor>& client,
     std::ostream& error)
 {
@@ -741,7 +753,7 @@ void print_terminal_summary(const int child_status, std::ostream& error)
 
 void close_control_channel_after_supervisor_error(
     FileDescriptor& listening_socket,
-    ControlSocketPath& socket_path_owner,
+    SocketPathOwner& socket_path_owner,
     std::optional<FileDescriptor>& client,
     std::ostream& error)
 {
@@ -761,7 +773,7 @@ void close_control_channel_after_supervisor_error(
 [[nodiscard]] int wait_after_supervisor_error(
     const pid_t child_pid,
     FileDescriptor& listening_socket,
-    ControlSocketPath& socket_path_owner,
+    SocketPathOwner& socket_path_owner,
     std::optional<FileDescriptor>& client,
     std::ostream& error)
 {
@@ -775,7 +787,7 @@ void close_control_channel_after_supervisor_error(
     const pid_t child_pid,
     char* const child_arguments[],
     FileDescriptor& listening_socket,
-    ControlSocketPath& socket_path_owner,
+    SocketPathOwner& socket_path_owner,
     std::ostream& error)
 {
     std::optional<FileDescriptor> client;
@@ -1057,19 +1069,15 @@ enum class ResponseBlock {
 
 int attach_to_session(std::ostream& output, std::ostream& error)
 {
-    const char* const runtime_path{std::getenv("XDG_RUNTIME_DIR")};
-    if (runtime_path == nullptr || runtime_path[0] == '\0') {
-        error << "NetLagLab: XDG_RUNTIME_DIR is not set\n";
-        return 1;
-    }
-
-    if (runtime_path[0] != '/') {
-        error << "NetLagLab: XDG_RUNTIME_DIR must be an absolute path\n";
+    const std::optional<SessionPaths> paths{make_session_paths(error)};
+    if (!paths.has_value()) {
         return 1;
     }
 
     const int runtime_descriptor{
-        open(runtime_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+        open(
+            paths->xdg_runtime_directory().c_str(),
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
     if (runtime_descriptor == -1) {
         const int open_error{errno};
         error << "NetLagLab: failed to open XDG_RUNTIME_DIR: " << std::strerror(open_error)
@@ -1084,7 +1092,7 @@ int attach_to_session(std::ostream& output, std::ostream& error)
 
     const int session_directory_descriptor{openat(
         runtime_directory.get(),
-        session_directory_name.data(),
+        SessionPaths::session_directory_name.data(),
         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
     if (session_directory_descriptor == -1) {
         const int open_error{errno};
@@ -1103,8 +1111,8 @@ int attach_to_session(std::ostream& output, std::ostream& error)
         return 1;
     }
 
-    const std::string control_socket_path{make_control_socket_path(runtime_path)};
-    const int connected_descriptor{connect_to_control_socket(control_socket_path, error)};
+    const int connected_descriptor{connect_to_socket(
+        paths->control_socket(), SessionPaths::control_socket_name, error)};
     if (connected_descriptor == -1) {
         return 1;
     }
@@ -1115,19 +1123,15 @@ int attach_to_session(std::ostream& output, std::ostream& error)
 
 int run_session(char* const child_arguments[], std::ostream& error)
 {
-    const char* const runtime_path{std::getenv("XDG_RUNTIME_DIR")};
-    if (runtime_path == nullptr || runtime_path[0] == '\0') {
-        error << "NetLagLab: XDG_RUNTIME_DIR is not set\n";
-        return 125;
-    }
-
-    if (runtime_path[0] != '/') {
-        error << "NetLagLab: XDG_RUNTIME_DIR must be an absolute path\n";
+    const std::optional<SessionPaths> paths{make_session_paths(error)};
+    if (!paths.has_value()) {
         return 125;
     }
 
     const int runtime_descriptor{
-        open(runtime_path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+        open(
+            paths->xdg_runtime_directory().c_str(),
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
     if (runtime_descriptor == -1) {
         const int open_error{errno};
         error << "NetLagLab: failed to open XDG_RUNTIME_DIR: " << std::strerror(open_error)
@@ -1140,7 +1144,8 @@ int run_session(char* const child_arguments[], std::ostream& error)
         return 125;
     }
 
-    const int mkdir_result{mkdirat(runtime_directory.get(), session_directory_name.data(), 0700)};
+    const int mkdir_result{mkdirat(
+        runtime_directory.get(), SessionPaths::session_directory_name.data(), 0700)};
     if (mkdir_result == -1 && errno != EEXIST) {
         const int mkdir_error{errno};
         error << "NetLagLab: failed to create the netlaglab runtime directory: "
@@ -1149,7 +1154,9 @@ int run_session(char* const child_arguments[], std::ostream& error)
     }
 
     if (mkdir_result == 0
-        && fchmodat(runtime_directory.get(), session_directory_name.data(), 0700, 0) == -1) {
+        && fchmodat(
+               runtime_directory.get(), SessionPaths::session_directory_name.data(), 0700, 0)
+            == -1) {
         const int chmod_error{errno};
         error << "NetLagLab: failed to set permissions on the netlaglab runtime directory: "
               << std::strerror(chmod_error) << '\n';
@@ -1158,7 +1165,7 @@ int run_session(char* const child_arguments[], std::ostream& error)
 
     const int session_directory_descriptor{openat(
         runtime_directory.get(),
-        session_directory_name.data(),
+        SessionPaths::session_directory_name.data(),
         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
     if (session_directory_descriptor == -1) {
         const int open_error{errno};
@@ -1174,7 +1181,7 @@ int run_session(char* const child_arguments[], std::ostream& error)
 
     const int lock_descriptor{openat(
         session_directory.get(),
-        lock_file_name.data(),
+        SessionPaths::lock_file_name.data(),
         O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
         0600)};
     if (lock_descriptor == -1) {
@@ -1215,14 +1222,15 @@ int run_session(char* const child_arguments[], std::ostream& error)
         return 125;
     }
 
-    ControlSocketPath control_socket_path_owner{session_directory.get()};
+    SocketPathOwner control_socket_path_owner{
+        session_directory.get(),
+        SessionPaths::control_socket_name,
+        paths->control_socket()};
     if (!control_socket_path_owner.remove_stale(error)) {
         return 125;
     }
 
-    const std::string control_socket_path{make_control_socket_path(runtime_path)};
     const int listening_descriptor{create_listening_socket(
-        control_socket_path,
         session_directory.get(),
         control_socket_path_owner,
         error)};
