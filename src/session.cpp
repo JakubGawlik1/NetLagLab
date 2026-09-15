@@ -947,10 +947,8 @@ int run_session(char* const child_arguments[], std::ostream& error)
         return 125;
     }
 
-    const int listening_descriptor{create_listening_socket(
-        session_directory->get(),
-        control_socket_path_owner,
-        error)};
+    const int listening_descriptor{
+        control_socket_path_owner.create_listening_socket(error)};
     if (listening_descriptor == -1) {
         const int cleanup_error{control_socket_path_owner.remove_owned()};
         if (cleanup_error != 0) {

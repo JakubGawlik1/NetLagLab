@@ -18,11 +18,8 @@ public:
     SocketPathOwner(const SocketPathOwner&) = delete;
     SocketPathOwner& operator=(const SocketPathOwner&) = delete;
 
-    [[nodiscard]] const std::string& name() const noexcept;
-    [[nodiscard]] const std::string& path() const noexcept;
     [[nodiscard]] bool remove_stale(std::ostream& error) const;
-
-    void mark_owned();
+    [[nodiscard]] int create_listening_socket(std::ostream& error);
     [[nodiscard]] int remove_owned();
 
 private:
@@ -31,10 +28,5 @@ private:
     const std::string socket_path_;
     bool owned_{false};
 };
-
-[[nodiscard]] int create_listening_socket(
-    int session_directory_descriptor,
-    SocketPathOwner& socket_path_owner,
-    std::ostream& error);
 
 } // namespace netlaglab
