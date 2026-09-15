@@ -16,6 +16,7 @@ add_executable(
     netlaglab
     src/main.cpp
     src/session.cpp
+    src/session_socket.cpp
     src/session_validation.cpp
 )
 
