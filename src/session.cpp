@@ -990,40 +990,17 @@ int attach_to_session(std::ostream& output, std::ostream& error)
         return 1;
     }
 
-    const int runtime_descriptor{
-        open(
-            paths->xdg_runtime_directory().c_str(),
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-    if (runtime_descriptor == -1) {
-        const int open_error{errno};
-        error << "NetLagLab: failed to open XDG_RUNTIME_DIR: " << std::strerror(open_error)
-              << '\n';
-        return 1;
-    }
-    const FileDescriptor runtime_directory{runtime_descriptor};
-
-    if (!validate_runtime_directory(runtime_directory.get(), geteuid(), error)) {
+    const std::optional<FileDescriptor> runtime_directory{
+        open_and_validate_runtime_directory(
+            paths->xdg_runtime_directory(), geteuid(), error)};
+    if (!runtime_directory.has_value()) {
         return 1;
     }
 
-    const int session_directory_descriptor{openat(
-        runtime_directory.get(),
-        SessionPaths::session_directory_name.data(),
-        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-    if (session_directory_descriptor == -1) {
-        const int open_error{errno};
-        if (open_error == ENOENT) {
-            error << "NetLagLab: no active session\n";
-        } else {
-            error << "NetLagLab: failed to open the netlaglab runtime directory: "
-                  << std::strerror(open_error) << '\n';
-        }
-        return 1;
-    }
-    const FileDescriptor session_directory{session_directory_descriptor};
-
-    if (!validate_session_directory(session_directory.get(), geteuid(), error)
-        || !validate_control_socket(session_directory.get(), error)) {
+    const std::optional<FileDescriptor> session_directory{
+        open_and_validate_session_directory(runtime_directory->get(), geteuid(), error)};
+    if (!session_directory.has_value()
+        || !validate_control_socket(session_directory->get(), error)) {
         return 1;
     }
 
@@ -1044,24 +1021,15 @@ int run_session(char* const child_arguments[], std::ostream& error)
         return 125;
     }
 
-    const int runtime_descriptor{
-        open(
-            paths->xdg_runtime_directory().c_str(),
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-    if (runtime_descriptor == -1) {
-        const int open_error{errno};
-        error << "NetLagLab: failed to open XDG_RUNTIME_DIR: " << std::strerror(open_error)
-              << '\n';
-        return 125;
-    }
-    const FileDescriptor runtime_directory{runtime_descriptor};
-
-    if (!validate_runtime_directory(runtime_directory.get(), geteuid(), error)) {
+    const std::optional<FileDescriptor> runtime_directory{
+        open_and_validate_runtime_directory(
+            paths->xdg_runtime_directory(), geteuid(), error)};
+    if (!runtime_directory.has_value()) {
         return 125;
     }
 
     const int mkdir_result{mkdirat(
-        runtime_directory.get(), SessionPaths::session_directory_name.data(), 0700)};
+        runtime_directory->get(), SessionPaths::session_directory_name.data(), 0700)};
     if (mkdir_result == -1 && errno != EEXIST) {
         const int mkdir_error{errno};
         error << "NetLagLab: failed to create the netlaglab runtime directory: "
@@ -1071,7 +1039,7 @@ int run_session(char* const child_arguments[], std::ostream& error)
 
     if (mkdir_result == 0
         && fchmodat(
-               runtime_directory.get(), SessionPaths::session_directory_name.data(), 0700, 0)
+               runtime_directory->get(), SessionPaths::session_directory_name.data(), 0700, 0)
             == -1) {
         const int chmod_error{errno};
         error << "NetLagLab: failed to set permissions on the netlaglab runtime directory: "
@@ -1079,24 +1047,14 @@ int run_session(char* const child_arguments[], std::ostream& error)
         return 125;
     }
 
-    const int session_directory_descriptor{openat(
-        runtime_directory.get(),
-        SessionPaths::session_directory_name.data(),
-        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-    if (session_directory_descriptor == -1) {
-        const int open_error{errno};
-        error << "NetLagLab: failed to open the netlaglab runtime directory: "
-              << std::strerror(open_error) << '\n';
-        return 125;
-    }
-    const FileDescriptor session_directory{session_directory_descriptor};
-
-    if (!validate_session_directory(session_directory.get(), geteuid(), error)) {
+    const std::optional<FileDescriptor> session_directory{
+        open_and_validate_session_directory(runtime_directory->get(), geteuid(), error)};
+    if (!session_directory.has_value()) {
         return 125;
     }
 
     const int lock_descriptor{openat(
-        session_directory.get(),
+        session_directory->get(),
         SessionPaths::lock_file_name.data(),
         O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW,
         0600)};
@@ -1139,7 +1097,7 @@ int run_session(char* const child_arguments[], std::ostream& error)
     }
 
     SocketPathOwner control_socket_path_owner{
-        session_directory.get(),
+        session_directory->get(),
         SessionPaths::control_socket_name,
         paths->control_socket()};
     if (!control_socket_path_owner.remove_stale(error)) {
@@ -1147,7 +1105,7 @@ int run_session(char* const child_arguments[], std::ostream& error)
     }
 
     const int listening_descriptor{create_listening_socket(
-        session_directory.get(),
+        session_directory->get(),
         control_socket_path_owner,
         error)};
     if (listening_descriptor == -1) {

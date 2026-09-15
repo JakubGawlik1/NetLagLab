@@ -1,7 +1,10 @@
 #include "session_validation.hpp"
 
+#include "session_paths.hpp"
+
 #include <cerrno>
 #include <cstring>
+#include <fcntl.h>
 #include <ostream>
 #include <sys/stat.h>
 
@@ -67,6 +70,56 @@ bool validate_session_directory(
     }
 
     return true;
+}
+
+std::optional<FileDescriptor> open_and_validate_runtime_directory(
+    const std::string& path,
+    const uid_t expected_owner,
+    std::ostream& error)
+{
+    const int descriptor{
+        open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+    if (descriptor == -1) {
+        const int open_error{errno};
+        error << "NetLagLab: failed to open XDG_RUNTIME_DIR: "
+              << std::strerror(open_error) << '\n';
+        return std::nullopt;
+    }
+
+    FileDescriptor directory{descriptor};
+    if (!validate_runtime_directory(directory.get(), expected_owner, error)) {
+        return std::nullopt;
+    }
+
+    return directory;
+}
+
+std::optional<FileDescriptor> open_and_validate_session_directory(
+    const int runtime_directory_descriptor,
+    const uid_t expected_owner,
+    std::ostream& error)
+{
+    const int descriptor{openat(
+        runtime_directory_descriptor,
+        SessionPaths::session_directory_name.data(),
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
+    if (descriptor == -1) {
+        const int open_error{errno};
+        if (open_error == ENOENT) {
+            error << "NetLagLab: no active session\n";
+        } else {
+            error << "NetLagLab: failed to open the netlaglab runtime directory: "
+                  << std::strerror(open_error) << '\n';
+        }
+        return std::nullopt;
+    }
+
+    FileDescriptor directory{descriptor};
+    if (!validate_session_directory(directory.get(), expected_owner, error)) {
+        return std::nullopt;
+    }
+
+    return directory;
 }
 
 } // namespace netlaglab
