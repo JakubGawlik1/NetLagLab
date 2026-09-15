@@ -16,16 +16,19 @@ namespace netlaglab {
 namespace {
 
 constexpr int listen_backlog{1};
+constexpr mode_t socket_creation_mask{0177};
 
 } // namespace
 
 SocketPathOwner::SocketPathOwner(
     const int session_directory_descriptor,
     const std::string_view socket_name,
-    const std::string& socket_path)
+    const std::string& socket_path,
+    const uid_t owner_uid)
     : session_directory_descriptor_{session_directory_descriptor},
       socket_name_{socket_name},
-      socket_path_{socket_path}
+      socket_path_{socket_path},
+      owner_uid_{owner_uid}
 {
 }
 
@@ -59,9 +62,9 @@ bool SocketPathOwner::remove_stale(std::ostream& error) const
         return false;
     }
 
-    if (socket_status.st_uid != geteuid()) {
+    if (socket_status.st_uid != owner_uid_ && socket_status.st_uid != geteuid()) {
         error << "NetLagLab: refusing to remove " << socket_name_
-              << " owned by another user\n";
+              << " owned by an unexpected user\n";
         return false;
     }
 
@@ -117,22 +120,35 @@ int SocketPathOwner::create_listening_socket(std::ostream& error)
     const auto address_size{static_cast<socklen_t>(
         offsetof(sockaddr_un, sun_path) + socket_path_.size() + 1)};
 
-    if (bind(
-            listening_socket.get(),
-            reinterpret_cast<const struct sockaddr*>(&address),
-            address_size)
-        == -1) {
-        const int bind_error{errno};
+    // The helper can bind inside a user-owned directory while running as root.
+    // Apply 0600 at creation time to avoid a wider-permission window and a
+    // path-based chmod after bind.
+    const mode_t previous_mask{umask(socket_creation_mask)};
+    const int bind_result{bind(
+        listening_socket.get(),
+        reinterpret_cast<const struct sockaddr*>(&address),
+        address_size)};
+    const int bind_error{errno};
+    (void)umask(previous_mask);
+
+    if (bind_result == -1) {
         error << "NetLagLab: failed to bind " << socket_name_ << ": "
               << std::strerror(bind_error) << '\n';
         return -1;
     }
     owned_ = true;
 
-    if (fchmodat(session_directory_descriptor_, socket_name_.c_str(), 0600, 0) == -1) {
-        const int chmod_error{errno};
-        error << "NetLagLab: failed to set permissions on " << socket_name_ << ": "
-              << std::strerror(chmod_error) << '\n';
+    if (owner_uid_ != geteuid()
+        && fchownat(
+               session_directory_descriptor_,
+               socket_name_.c_str(),
+               owner_uid_,
+               static_cast<gid_t>(-1),
+               AT_SYMLINK_NOFOLLOW)
+            == -1) {
+        const int owner_error{errno};
+        error << "NetLagLab: failed to set owner of " << socket_name_ << ": "
+              << std::strerror(owner_error) << '\n';
         return -1;
     }
 

@@ -1,5 +1,6 @@
 #include "file_descriptor.hpp"
 #include "session_paths.hpp"
+#include "session_socket.hpp"
 #include "session_validation.hpp"
 
 #include <cerrno>
@@ -11,6 +12,7 @@
 #include <string>
 #include <string_view>
 #include <sys/file.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <system_error>
@@ -24,6 +26,23 @@ namespace {
 constexpr std::string_view usage{
     "Usage: netlaglab-helper --runtime-dir <absolute-path>\n"};
 constexpr int usage_error_exit_code{2};
+
+[[nodiscard]] bool cleanup_helper_listener(
+    netlaglab::FileDescriptor& listening_socket,
+    netlaglab::SocketPathOwner& socket_path_owner,
+    std::ostream& error)
+{
+    listening_socket.reset();
+
+    const int cleanup_error{socket_path_owner.remove_owned()};
+    if (cleanup_error == 0) {
+        return true;
+    }
+
+    error << "NetLagLab helper: failed to remove helper.sock: "
+          << std::strerror(cleanup_error) << '\n';
+    return false;
+}
 
 [[nodiscard]] std::optional<netlaglab::FileDescriptor> validate_session(
     const netlaglab::SessionPaths& paths,
@@ -148,6 +167,74 @@ int run_helper(const int argc, char* argv[])
     const std::optional<netlaglab::FileDescriptor> session_directory{
         validate_session(paths, *sudo_uid, std::cerr)};
     if (!session_directory.has_value()) {
+        return 125;
+    }
+
+    netlaglab::SocketPathOwner helper_socket_path_owner{
+        session_directory->get(),
+        netlaglab::SessionPaths::helper_socket_name,
+        paths.helper_socket(),
+        *sudo_uid};
+    if (!helper_socket_path_owner.remove_stale(std::cerr)) {
+        return 125;
+    }
+
+    const int listening_descriptor{
+        helper_socket_path_owner.create_listening_socket(std::cerr)};
+    if (listening_descriptor == -1) {
+        const int cleanup_error{helper_socket_path_owner.remove_owned()};
+        if (cleanup_error != 0) {
+            std::cerr << "NetLagLab helper: failed to remove helper.sock after listener "
+                         "setup failure: "
+                      << std::strerror(cleanup_error) << '\n';
+        }
+        return 125;
+    }
+    netlaglab::FileDescriptor listening_socket{listening_descriptor};
+
+    int supervisor_descriptor{};
+    do {
+        supervisor_descriptor =
+            accept4(listening_socket.get(), nullptr, nullptr, SOCK_CLOEXEC);
+    } while (supervisor_descriptor == -1 && errno == EINTR);
+
+    if (supervisor_descriptor == -1) {
+        const int accept_error{errno};
+        std::cerr << "NetLagLab helper: failed to accept supervisor: "
+                  << std::strerror(accept_error) << '\n';
+        (void)cleanup_helper_listener(
+            listening_socket, helper_socket_path_owner, std::cerr);
+        return 125;
+    }
+    const netlaglab::FileDescriptor supervisor_socket{supervisor_descriptor};
+
+    struct ucred peer_credentials {};
+    socklen_t credentials_size{sizeof(peer_credentials)};
+    if (getsockopt(
+            supervisor_socket.get(),
+            SOL_SOCKET,
+            SO_PEERCRED,
+            &peer_credentials,
+            &credentials_size)
+        == -1) {
+        const int credentials_error{errno};
+        std::cerr << "NetLagLab helper: failed to inspect supervisor credentials: "
+                  << std::strerror(credentials_error) << '\n';
+        (void)cleanup_helper_listener(
+            listening_socket, helper_socket_path_owner, std::cerr);
+        return 125;
+    }
+
+    if (credentials_size != static_cast<socklen_t>(sizeof(peer_credentials))
+        || peer_credentials.uid != *sudo_uid) {
+        std::cerr << "NetLagLab helper: rejected connection from an unexpected user\n";
+        (void)cleanup_helper_listener(
+            listening_socket, helper_socket_path_owner, std::cerr);
+        return 125;
+    }
+
+    if (!cleanup_helper_listener(
+            listening_socket, helper_socket_path_owner, std::cerr)) {
         return 125;
     }
 

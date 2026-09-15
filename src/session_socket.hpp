@@ -3,6 +3,7 @@
 #include <iosfwd>
 #include <string>
 #include <string_view>
+#include <sys/types.h>
 
 namespace netlaglab {
 
@@ -11,7 +12,8 @@ public:
     SocketPathOwner(
         int session_directory_descriptor,
         std::string_view socket_name,
-        const std::string& socket_path);
+        const std::string& socket_path,
+        uid_t owner_uid);
 
     ~SocketPathOwner();
 
@@ -26,6 +28,7 @@ private:
     int session_directory_descriptor_;
     const std::string socket_name_;
     const std::string socket_path_;
+    uid_t owner_uid_;
     bool owned_{false};
 };
 

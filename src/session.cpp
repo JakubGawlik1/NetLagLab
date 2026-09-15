@@ -942,7 +942,8 @@ int run_session(char* const child_arguments[], std::ostream& error)
     SocketPathOwner control_socket_path_owner{
         session_directory->get(),
         SessionPaths::control_socket_name,
-        paths->control_socket()};
+        paths->control_socket(),
+        geteuid()};
     if (!control_socket_path_owner.remove_stale(error)) {
         return 125;
     }

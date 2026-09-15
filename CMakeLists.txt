@@ -29,7 +29,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(netlaglab PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(netlaglab-helper src/helper_main.cpp src/session_validation.cpp)
+add_executable(
+    netlaglab-helper
+    src/helper_main.cpp
+    src/session_socket.cpp
+    src/session_validation.cpp
+)
 
 target_compile_features(netlaglab-helper PRIVATE cxx_std_20)
 set_target_properties(netlaglab-helper PROPERTIES CXX_EXTENSIONS OFF)
