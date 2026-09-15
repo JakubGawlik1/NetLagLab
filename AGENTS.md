@@ -76,8 +76,12 @@
   features, premature generalization, and large code dumps.
 - If the expected scope must materially expand, explain why before editing
   additional components.
-- Do not commit, push, install packages, or change persistent host networking
-  unless the user explicitly requests it.
+- After a clearly bounded stage is complete and its required validation passes,
+  create a local commit without asking for separate confirmation. Do not commit
+  incomplete work or changes with known failing validation.
+- Never push unless the user explicitly requests it.
+- Do not install packages or change persistent host networking unless the user
+  explicitly requests it.
 - Explain changed files, important C++ choices, ownership or lifetime concerns,
   and failure handling for a learner.
 - Do not paste complete source files unless asked.
