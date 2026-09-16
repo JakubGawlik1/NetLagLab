@@ -1,5 +1,7 @@
 #pragma once
 
+#include <iosfwd>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -66,5 +68,8 @@ private:
     std::string control_socket_;
     std::string helper_socket_;
 };
+
+[[nodiscard]] std::optional<SessionPaths> make_session_paths_from_environment(
+    std::ostream& error);
 
 } // namespace netlaglab

@@ -3,13 +3,13 @@
 #include "session_paths.hpp"
 #include "session_socket.hpp"
 #include "session_validation.hpp"
+#include "socket_io.hpp"
 
 #include "netlaglab/network_profile.hpp"
 
 #include <array>
 #include <cerrno>
 #include <cstddef>
-#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <optional>
@@ -22,7 +22,6 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -30,22 +29,6 @@ extern char** environ;
 
 namespace netlaglab {
 namespace {
-
-[[nodiscard]] std::optional<SessionPaths> make_session_paths(std::ostream& error)
-{
-    const char* const runtime_path{std::getenv("XDG_RUNTIME_DIR")};
-    if (runtime_path == nullptr || runtime_path[0] == '\0') {
-        error << "NetLagLab: XDG_RUNTIME_DIR is not set\n";
-        return std::nullopt;
-    }
-
-    if (runtime_path[0] != '/') {
-        error << "NetLagLab: XDG_RUNTIME_DIR must be an absolute path\n";
-        return std::nullopt;
-    }
-
-    return SessionPaths{runtime_path};
-}
 
 constexpr int poll_timeout_ms{100};
 constexpr std::size_t maximum_command_size{1024};
@@ -94,88 +77,6 @@ constexpr std::size_t maximum_status_size{8 * 1024};
     }
 
     return child_exit_code(status, error);
-}
-
-[[nodiscard]] bool validate_control_socket(
-    const int session_directory_descriptor,
-    std::ostream& error)
-{
-    struct stat socket_status {};
-    if (fstatat(
-            session_directory_descriptor,
-            SessionPaths::control_socket_name.data(),
-            &socket_status,
-            AT_SYMLINK_NOFOLLOW)
-        == -1) {
-        const int status_error{errno};
-        if (status_error == ENOENT) {
-            error << "NetLagLab: no active session\n";
-        } else {
-            error << "NetLagLab: failed to inspect control.sock: "
-                  << std::strerror(status_error) << '\n';
-        }
-        return false;
-    }
-
-    if (!S_ISSOCK(socket_status.st_mode)) {
-        error << "NetLagLab: control.sock is not a socket\n";
-        return false;
-    }
-
-    if (socket_status.st_uid != geteuid()) {
-        error << "NetLagLab: control.sock is owned by another user\n";
-        return false;
-    }
-
-    if ((socket_status.st_mode & 0777) != 0600) {
-        error << "NetLagLab: control.sock must have permissions 0600\n";
-        return false;
-    }
-
-    return true;
-}
-
-[[nodiscard]] int connect_to_socket(
-    const std::string& socket_path,
-    const std::string_view socket_name,
-    std::ostream& error)
-{
-    struct sockaddr_un address {};
-    if (socket_path.size() >= sizeof(address.sun_path)) {
-        error << "NetLagLab: " << socket_name << " path is too long\n";
-        return -1;
-    }
-
-    const int raw_socket{socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)};
-    if (raw_socket == -1) {
-        const int socket_error{errno};
-        error << "NetLagLab: failed to create client socket for " << socket_name << ": "
-              << std::strerror(socket_error) << '\n';
-        return -1;
-    }
-    FileDescriptor client_socket{raw_socket};
-
-    address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
-    const auto address_size{static_cast<socklen_t>(
-        offsetof(sockaddr_un, sun_path) + socket_path.size() + 1)};
-
-    if (connect(
-            client_socket.get(),
-            reinterpret_cast<const struct sockaddr*>(&address),
-            address_size)
-        == -1) {
-        const int connect_error{errno};
-        if (connect_error == ENOENT || connect_error == ECONNREFUSED) {
-            error << "NetLagLab: no active session\n";
-        } else {
-            error << "NetLagLab: failed to connect to session: "
-                  << std::strerror(connect_error) << '\n';
-        }
-        return -1;
-    }
-
-    return client_socket.release();
 }
 
 [[nodiscard]] bool append_escaped_limited(
@@ -318,31 +219,6 @@ void append_direction_status(
     return response;
 }
 
-[[nodiscard]] bool send_text(const int socket_descriptor, const std::string_view message)
-{
-    std::size_t sent_size{};
-    while (sent_size < message.size()) {
-        const ssize_t result{send(
-            socket_descriptor,
-            message.data() + sent_size,
-            message.size() - sent_size,
-            MSG_NOSIGNAL)};
-
-        if (result > 0) {
-            sent_size += static_cast<std::size_t>(result);
-            continue;
-        }
-
-        if (result == -1 && errno == EINTR) {
-            continue;
-        }
-
-        return false;
-    }
-
-    return true;
-}
-
 enum class CommandResult {
     keep_connected,
     disconnect,
@@ -361,24 +237,25 @@ enum class CommandResult {
             "status - Show the active session\n"
             "detach - Disconnect this controller\n"
             "HELP_END\n"};
-        return send_text(client_descriptor, help_response) ? CommandResult::keep_connected
-                                                           : CommandResult::disconnect;
+        return send_socket_text(client_descriptor, help_response)
+            ? CommandResult::keep_connected
+            : CommandResult::disconnect;
     }
 
     if (command == "status") {
         const std::string status{build_status(child_pid, child_arguments)};
-        return send_text(client_descriptor, status) ? CommandResult::keep_connected
-                                                    : CommandResult::disconnect;
+        return send_socket_text(client_descriptor, status) ? CommandResult::keep_connected
+                                                           : CommandResult::disconnect;
     }
 
     if (command == "detach") {
-        (void)send_text(client_descriptor, "DETACHED\n");
+        (void)send_socket_text(client_descriptor, "DETACHED\n");
         return CommandResult::disconnect;
     }
 
     const std::string response{"ERROR Unknown command: " + escape_command(command) + '\n'};
-    return send_text(client_descriptor, response) ? CommandResult::keep_connected
-                                                  : CommandResult::disconnect;
+    return send_socket_text(client_descriptor, response) ? CommandResult::keep_connected
+                                                         : CommandResult::disconnect;
 }
 
 [[nodiscard]] bool read_client_commands(
@@ -387,45 +264,35 @@ enum class CommandResult {
     const pid_t child_pid,
     char* const child_arguments[])
 {
-    std::array<char, 4096> read_buffer{};
-    const ssize_t read_size{read(client_descriptor, read_buffer.data(), read_buffer.size())};
-
-    if (read_size == 0) {
+    const SocketReadResult read_result{read_socket_data(client_descriptor, command_buffer)};
+    if (read_result.status != SocketReadStatus::data_received) {
         return false;
     }
 
-    if (read_size == -1) {
-        return errno == EINTR;
-    }
-
-    command_buffer.append(read_buffer.data(), static_cast<std::size_t>(read_size));
-
     while (true) {
-        const std::size_t newline_position{command_buffer.find('\n')};
-        if (newline_position == std::string::npos) {
+        const std::optional<std::string> command{take_next_line(command_buffer)};
+        if (!command.has_value()) {
             break;
         }
 
-        if (newline_position > maximum_command_size) {
-            (void)send_text(client_descriptor, "ERROR Command exceeds 1024 bytes.\n");
+        if (command->size() > maximum_command_size) {
+            (void)send_socket_text(
+                client_descriptor, "ERROR Command exceeds 1024 bytes.\n");
             return false;
         }
 
-        const std::string command{command_buffer.substr(0, newline_position)};
-        command_buffer.erase(0, newline_position + 1);
-
-        if (command.empty()) {
+        if (command->empty()) {
             continue;
         }
 
-        if (handle_command(client_descriptor, command, child_pid, child_arguments)
+        if (handle_command(client_descriptor, *command, child_pid, child_arguments)
             == CommandResult::disconnect) {
             return false;
         }
     }
 
     if (command_buffer.size() > maximum_command_size) {
-        (void)send_text(client_descriptor, "ERROR Command exceeds 1024 bytes.\n");
+        (void)send_socket_text(client_descriptor, "ERROR Command exceeds 1024 bytes.\n");
         return false;
     }
 
@@ -451,14 +318,14 @@ enum class CommandResult {
 
     if (client.has_value()) {
         FileDescriptor rejected_client{accepted_descriptor};
-        (void)send_text(
+        (void)send_socket_text(
             rejected_client.get(), "ERROR Another controller is already attached.\n");
         return true;
     }
 
     client.emplace(accepted_descriptor);
     command_buffer.clear();
-    if (!send_text(client->get(), "ATTACHED\n")) {
+    if (!send_socket_text(client->get(), "ATTACHED\n")) {
         client.reset();
     }
 
@@ -493,7 +360,7 @@ void print_terminal_summary(const int child_status, std::ostream& error)
     const int cleanup_error{socket_path_owner.remove_owned()};
     if (cleanup_error != 0) {
         if (client.has_value()) {
-            (void)send_text(client->get(), "SESSION_FAILED\n");
+            (void)send_socket_text(client->get(), "SESSION_FAILED\n");
         }
         client.reset();
         error << "NetLagLab: application exited with status " << application_exit_code
@@ -503,7 +370,7 @@ void print_terminal_summary(const int child_status, std::ostream& error)
     }
 
     if (client.has_value()) {
-        (void)send_text(client->get(), "SESSION_ENDED\n");
+        (void)send_socket_text(client->get(), "SESSION_ENDED\n");
     }
     client.reset();
     print_terminal_summary(child_status, error);
@@ -524,7 +391,7 @@ void close_control_channel_after_supervisor_error(
     }
 
     if (client.has_value()) {
-        (void)send_text(client->get(), "SESSION_FAILED\n");
+        (void)send_socket_text(client->get(), "SESSION_FAILED\n");
     }
     client.reset();
 }
@@ -615,251 +482,12 @@ void close_control_channel_after_supervisor_error(
     }
 }
 
-enum class ResponseBlock {
-    none,
-    help,
-    status,
-};
-
-[[nodiscard]] std::optional<int> handle_response_line(
-    const std::string_view line,
-    ResponseBlock& response_block,
-    std::ostream& output,
-    std::ostream& error)
-{
-    if (response_block == ResponseBlock::help) {
-        if (line == "HELP_END") {
-            response_block = ResponseBlock::none;
-        } else {
-            output << line << '\n';
-        }
-        return std::nullopt;
-    }
-
-    if (response_block == ResponseBlock::status) {
-        if (line == "STATUS_END") {
-            response_block = ResponseBlock::none;
-        } else {
-            output << line << '\n';
-        }
-        return std::nullopt;
-    }
-
-    if (line == "ATTACHED") {
-        return std::nullopt;
-    }
-
-    if (line == "HELP_BEGIN") {
-        response_block = ResponseBlock::help;
-        return std::nullopt;
-    }
-
-    if (line == "STATUS_BEGIN") {
-        response_block = ResponseBlock::status;
-        return std::nullopt;
-    }
-
-    if (line == "DETACHED") {
-        return 0;
-    }
-
-    if (line == "SESSION_ENDED") {
-        output << "Session ended.\n";
-        return 0;
-    }
-
-    if (line == "SESSION_FAILED") {
-        error << "NetLagLab: session failed\n";
-        return 1;
-    }
-
-    constexpr std::string_view error_prefix{"ERROR "};
-    if (line.starts_with(error_prefix)) {
-        const std::string_view message{line.substr(error_prefix.size())};
-        error << message << '\n';
-
-        if (message == "Another controller is already attached.") {
-            return 1;
-        }
-        return std::nullopt;
-    }
-
-    error << "NetLagLab: invalid response from session\n";
-    return 1;
-}
-
-[[nodiscard]] std::optional<int> read_session_responses(
-    const int socket_descriptor,
-    std::string& response_buffer,
-    ResponseBlock& response_block,
-    std::ostream& output,
-    std::ostream& error)
-{
-    std::array<char, 4096> read_buffer{};
-    const ssize_t read_size{read(socket_descriptor, read_buffer.data(), read_buffer.size())};
-
-    if (read_size == 0) {
-        error << "NetLagLab: connection to session lost; session result is unknown.\n";
-        return 1;
-    }
-
-    if (read_size == -1) {
-        if (errno == EINTR) {
-            return std::nullopt;
-        }
-
-        const int read_error{errno};
-        error << "NetLagLab: failed to read from session: " << std::strerror(read_error) << '\n';
-        return 1;
-    }
-
-    response_buffer.append(read_buffer.data(), static_cast<std::size_t>(read_size));
-
-    while (true) {
-        const std::size_t newline_position{response_buffer.find('\n')};
-        if (newline_position == std::string::npos) {
-            break;
-        }
-
-        const std::string line{response_buffer.substr(0, newline_position)};
-        response_buffer.erase(0, newline_position + 1);
-
-        if (const std::optional<int> result{
-                handle_response_line(line, response_block, output, error)};
-            result.has_value()) {
-            return result;
-        }
-    }
-
-    if (response_buffer.size() > maximum_status_size) {
-        error << "NetLagLab: response from session exceeds 8 KiB\n";
-        return 1;
-    }
-
-    output.flush();
-    error.flush();
-    return std::nullopt;
-}
-
-[[nodiscard]] int control_attached_session(
-    const int socket_descriptor,
-    std::ostream& output,
-    std::ostream& error)
-{
-    std::string response_buffer;
-    ResponseBlock response_block{ResponseBlock::none};
-    bool read_stdin{true};
-    bool input_ends_with_newline{true};
-
-    while (true) {
-        std::array<struct pollfd, 2> descriptors{{
-            {read_stdin ? STDIN_FILENO : -1, POLLIN, 0},
-            {socket_descriptor, POLLIN, 0},
-        }};
-
-        const int poll_result{poll(descriptors.data(), descriptors.size(), -1)};
-        if (poll_result == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-
-            const int poll_error{errno};
-            error << "NetLagLab: poll failed: " << std::strerror(poll_error) << '\n';
-            return 1;
-        }
-
-        const short socket_events{descriptors[1].revents};
-        if ((socket_events & (POLLIN | POLLHUP)) != 0) {
-            if (const std::optional<int> result{read_session_responses(
-                    socket_descriptor,
-                    response_buffer,
-                    response_block,
-                    output,
-                    error)};
-                result.has_value()) {
-                return *result;
-            }
-        }
-
-        if ((socket_events & (POLLERR | POLLNVAL)) != 0) {
-            error << "NetLagLab: connection to session lost; session result is unknown.\n";
-            return 1;
-        }
-
-        const short stdin_events{descriptors[0].revents};
-        if (read_stdin && (stdin_events & (POLLIN | POLLHUP)) != 0) {
-            std::array<char, 4096> input_buffer{};
-            const ssize_t read_size{read(STDIN_FILENO, input_buffer.data(), input_buffer.size())};
-
-            if (read_size > 0) {
-                const std::string_view input{
-                    input_buffer.data(), static_cast<std::size_t>(read_size)};
-                if (!send_text(socket_descriptor, input)) {
-                    error << "NetLagLab: connection to session lost; session result is unknown.\n";
-                    return 1;
-                }
-                input_ends_with_newline = input.back() == '\n';
-            } else if (read_size == 0) {
-                if (!input_ends_with_newline && !send_text(socket_descriptor, "\n")) {
-                    error << "NetLagLab: connection to session lost; session result is unknown.\n";
-                    return 1;
-                }
-
-                if (!send_text(socket_descriptor, "detach\n")) {
-                    error << "NetLagLab: connection to session lost; session result is unknown.\n";
-                    return 1;
-                }
-                read_stdin = false;
-            } else if (errno != EINTR) {
-                const int read_error{errno};
-                error << "NetLagLab: failed to read stdin: " << std::strerror(read_error) << '\n';
-                return 1;
-            }
-        }
-
-        if (read_stdin && (stdin_events & (POLLERR | POLLNVAL)) != 0) {
-            error << "NetLagLab: stdin is not readable\n";
-            return 1;
-        }
-    }
-}
-
 } // namespace
-
-int attach_to_session(std::ostream& output, std::ostream& error)
-{
-    const std::optional<SessionPaths> paths{make_session_paths(error)};
-    if (!paths.has_value()) {
-        return 1;
-    }
-
-    const std::optional<FileDescriptor> runtime_directory{
-        open_and_validate_runtime_directory(
-            paths->xdg_runtime_directory(), geteuid(), error)};
-    if (!runtime_directory.has_value()) {
-        return 1;
-    }
-
-    const std::optional<FileDescriptor> session_directory{
-        open_and_validate_session_directory(runtime_directory->get(), geteuid(), error)};
-    if (!session_directory.has_value()
-        || !validate_control_socket(session_directory->get(), error)) {
-        return 1;
-    }
-
-    const int connected_descriptor{connect_to_socket(
-        paths->control_socket(), SessionPaths::control_socket_name, error)};
-    if (connected_descriptor == -1) {
-        return 1;
-    }
-    const FileDescriptor client_socket{connected_descriptor};
-
-    return control_attached_session(client_socket.get(), output, error);
-}
 
 int run_session(char* const child_arguments[], std::ostream& error)
 {
-    const std::optional<SessionPaths> paths{make_session_paths(error)};
+    const std::optional<SessionPaths> paths{
+        make_session_paths_from_environment(error)};
     if (!paths.has_value()) {
         return 125;
     }

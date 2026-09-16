@@ -1,3 +1,4 @@
+#include "attach_client.hpp"
 #include "session.hpp"
 
 #include <iostream>

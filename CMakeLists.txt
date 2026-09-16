@@ -14,8 +14,11 @@ endif()
 
 add_executable(
     netlaglab
+    src/attach_client.cpp
     src/main.cpp
     src/session.cpp
+    src/session_paths.cpp
+    src/socket_io.cpp
     src/session_socket.cpp
     src/session_validation.cpp
 )
