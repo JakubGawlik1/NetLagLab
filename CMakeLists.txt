@@ -15,6 +15,7 @@ endif()
 add_executable(
     netlaglab
     src/attach_client.cpp
+    src/helper_protocol.cpp
     src/main.cpp
     src/session.cpp
     src/session_paths.cpp
@@ -34,9 +35,11 @@ endif()
 
 add_executable(
     netlaglab-helper
+    src/helper_protocol.cpp
     src/helper_main.cpp
     src/session_socket.cpp
     src/session_validation.cpp
+    src/socket_io.cpp
 )
 
 target_compile_features(netlaglab-helper PRIVATE cxx_std_20)

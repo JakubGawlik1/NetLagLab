@@ -1,7 +1,9 @@
 #include "file_descriptor.hpp"
+#include "helper_protocol.hpp"
 #include "session_paths.hpp"
 #include "session_socket.hpp"
 #include "session_validation.hpp"
+#include "socket_io.hpp"
 
 #include <cerrno>
 #include <charconv>
@@ -26,6 +28,82 @@ namespace {
 constexpr std::string_view usage{
     "Usage: netlaglab-helper --runtime-dir <absolute-path>\n"};
 constexpr int usage_error_exit_code{2};
+
+[[nodiscard]] bool send_helper_error(
+    const int supervisor_descriptor,
+    const std::string_view message)
+{
+    std::string response{netlaglab::helper_error_prefix};
+    response.append(message);
+    response.push_back('\n');
+    return netlaglab::send_socket_text(supervisor_descriptor, response);
+}
+
+[[nodiscard]] int handle_supervisor_commands(
+    const int supervisor_descriptor,
+    std::ostream& error)
+{
+    std::string command_buffer;
+
+    while (true) {
+        const netlaglab::SocketReadResult read_result{
+            netlaglab::read_socket_data(supervisor_descriptor, command_buffer)};
+
+        if (read_result.status == netlaglab::SocketReadStatus::peer_closed) {
+            error << "NetLagLab helper: supervisor disconnected before shutdown\n";
+            return 125;
+        }
+
+        if (read_result.status == netlaglab::SocketReadStatus::error) {
+            error << "NetLagLab helper: failed to read supervisor command: "
+                  << std::strerror(read_result.error_code) << '\n';
+            return 125;
+        }
+
+        while (true) {
+            const std::optional<std::string> line{
+                netlaglab::take_next_line(command_buffer)};
+            if (!line.has_value()) {
+                break;
+            }
+
+            if (line->size() > netlaglab::maximum_helper_message_size) {
+                (void)send_helper_error(
+                    supervisor_descriptor, "Command exceeds 1024 bytes.");
+                error << "NetLagLab helper: supervisor command exceeds 1024 bytes\n";
+                return 125;
+            }
+
+            const std::optional<netlaglab::HelperCommand> command{
+                netlaglab::parse_helper_command(*line)};
+
+            if (!command.has_value()) {
+                (void)send_helper_error(supervisor_descriptor, "Unknown command.");
+                error << "NetLagLab helper: received an unknown supervisor command\n";
+                return 125;
+            }
+
+            if (*command == netlaglab::HelperCommand::shutdown) {
+                if (!netlaglab::send_socket_text(
+                        supervisor_descriptor,
+                        netlaglab::helper_event_message(
+                            netlaglab::HelperEvent::stopped))) {
+                    error << "NetLagLab helper: failed to send STOPPED to supervisor\n";
+                    return 125;
+                }
+
+                return 0;
+            }
+        }
+
+        if (command_buffer.size() > netlaglab::maximum_helper_message_size) {
+            (void)send_helper_error(
+                supervisor_descriptor, "Command exceeds 1024 bytes.");
+            error << "NetLagLab helper: supervisor command exceeds 1024 bytes\n";
+            return 125;
+        }
+    }
+}
 
 [[nodiscard]] bool cleanup_helper_listener(
     netlaglab::FileDescriptor& listening_socket,
@@ -238,7 +316,14 @@ int run_helper(const int argc, char* argv[])
         return 125;
     }
 
-    return EXIT_SUCCESS;
+    if (!netlaglab::send_socket_text(
+            supervisor_socket.get(),
+            netlaglab::helper_event_message(netlaglab::HelperEvent::ready))) {
+        std::cerr << "NetLagLab helper: failed to send READY to supervisor\n";
+        return 125;
+    }
+
+    return handle_supervisor_commands(supervisor_socket.get(), std::cerr);
 }
 
 } // namespace
