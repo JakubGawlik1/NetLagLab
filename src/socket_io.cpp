@@ -3,10 +3,59 @@
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstring>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
+#include <utility>
 
 namespace netlaglab {
+
+UnixSocketConnectResult connect_to_unix_socket(const std::string_view socket_path)
+{
+    struct sockaddr_un address {};
+    if (socket_path.size() >= sizeof(address.sun_path)) {
+        return {
+            std::nullopt,
+            UnixSocketConnectFailure::path_too_long,
+            ENAMETOOLONG,
+        };
+    }
+
+    const int raw_socket{socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)};
+    if (raw_socket == -1) {
+        return {
+            std::nullopt,
+            UnixSocketConnectFailure::socket_creation,
+            errno,
+        };
+    }
+    FileDescriptor client_socket{raw_socket};
+
+    address.sun_family = AF_UNIX;
+    std::memcpy(address.sun_path, socket_path.data(), socket_path.size());
+    const auto address_size{static_cast<socklen_t>(
+        offsetof(sockaddr_un, sun_path) + socket_path.size() + 1)};
+
+    if (connect(
+            client_socket.get(),
+            reinterpret_cast<const struct sockaddr*>(&address),
+            address_size)
+        == -1) {
+        const int connect_error{errno};
+        return {
+            std::nullopt,
+            UnixSocketConnectFailure::connection,
+            connect_error,
+        };
+    }
+
+    return {
+        std::move(client_socket),
+        UnixSocketConnectFailure::none,
+        0,
+    };
+}
 
 bool send_socket_text(const int socket_descriptor, const std::string_view message)
 {

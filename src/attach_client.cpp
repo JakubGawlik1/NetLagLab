@@ -15,9 +15,7 @@
 #include <poll.h>
 #include <string>
 #include <string_view>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 namespace netlaglab {
@@ -62,49 +60,6 @@ constexpr std::size_t maximum_status_size{8 * 1024};
     }
 
     return true;
-}
-
-[[nodiscard]] int connect_to_control_socket(
-    const std::string& socket_path,
-    std::ostream& error)
-{
-    struct sockaddr_un address {};
-    if (socket_path.size() >= sizeof(address.sun_path)) {
-        error << "NetLagLab: " << SessionPaths::control_socket_name << " path is too long\n";
-        return -1;
-    }
-
-    const int raw_socket{socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)};
-    if (raw_socket == -1) {
-        const int socket_error{errno};
-        error << "NetLagLab: failed to create client socket for "
-              << SessionPaths::control_socket_name << ": "
-              << std::strerror(socket_error) << '\n';
-        return -1;
-    }
-    FileDescriptor client_socket{raw_socket};
-
-    address.sun_family = AF_UNIX;
-    std::memcpy(address.sun_path, socket_path.c_str(), socket_path.size() + 1);
-    const auto address_size{static_cast<socklen_t>(
-        offsetof(sockaddr_un, sun_path) + socket_path.size() + 1)};
-
-    if (connect(
-            client_socket.get(),
-            reinterpret_cast<const struct sockaddr*>(&address),
-            address_size)
-        == -1) {
-        const int connect_error{errno};
-        if (connect_error == ENOENT || connect_error == ECONNREFUSED) {
-            error << "NetLagLab: no active session\n";
-        } else {
-            error << "NetLagLab: failed to connect to session: "
-                  << std::strerror(connect_error) << '\n';
-        }
-        return -1;
-    }
-
-    return client_socket.release();
 }
 
 enum class ResponseBlock {
@@ -331,14 +286,27 @@ int attach_to_session(std::ostream& output, std::ostream& error)
         return 1;
     }
 
-    const int connected_descriptor{
-        connect_to_control_socket(paths->control_socket(), error)};
-    if (connected_descriptor == -1) {
+    UnixSocketConnectResult connection{
+        connect_to_unix_socket(paths->control_socket())};
+    if (!connection.socket.has_value()) {
+        if (connection.failure == UnixSocketConnectFailure::path_too_long) {
+            error << "NetLagLab: " << SessionPaths::control_socket_name
+                  << " path is too long\n";
+        } else if (connection.failure == UnixSocketConnectFailure::socket_creation) {
+            error << "NetLagLab: failed to create client socket for "
+                  << SessionPaths::control_socket_name << ": "
+                  << std::strerror(connection.error_code) << '\n';
+        } else if (connection.error_code == ENOENT
+                   || connection.error_code == ECONNREFUSED) {
+            error << "NetLagLab: no active session\n";
+        } else {
+            error << "NetLagLab: failed to connect to session: "
+                  << std::strerror(connection.error_code) << '\n';
+        }
         return 1;
     }
-    const FileDescriptor client_socket{connected_descriptor};
 
-    return run_attached_controller(client_socket.get(), output, error);
+    return run_attached_controller(connection.socket->get(), output, error);
 }
 
 } // namespace netlaglab
