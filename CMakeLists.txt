@@ -15,6 +15,7 @@ endif()
 add_executable(
     netlaglab
     src/attach_client.cpp
+    src/helper_process.cpp
     src/helper_protocol.cpp
     src/main.cpp
     src/session.cpp

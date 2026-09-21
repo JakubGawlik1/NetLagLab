@@ -1,5 +1,6 @@
 #include "session.hpp"
 #include "file_descriptor.hpp"
+#include "helper_process.hpp"
 #include "session_paths.hpp"
 #include "session_socket.hpp"
 #include "session_validation.hpp"
@@ -564,6 +565,21 @@ int run_session(char* const child_arguments[], std::ostream& error)
             error << "NetLagLab: failed to lock session.lock: " << std::strerror(lock_error)
                   << '\n';
         }
+        return 125;
+    }
+
+    const std::optional<pid_t> helper_launcher_pid{spawn_helper(*paths, error)};
+    if (!helper_launcher_pid.has_value()) {
+        return 125;
+    }
+
+    const std::optional<FileDescriptor> helper_connection_descriptor{
+        wait_for_helper_connection(*paths, *helper_launcher_pid, error)};
+    if (!helper_connection_descriptor.has_value()) {
+        return 125;
+    }
+
+    if (!wait_for_helper_ready(helper_connection_descriptor->get(), error)) {
         return 125;
     }
 
