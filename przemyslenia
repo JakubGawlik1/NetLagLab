@@ -1,2 +1,0 @@
-pisze, po zmianie już kilku rzeczy bo dobrym pomysłem jest dokumentować mój proces myślowy. przenoszę runtime_path z run_session poza funkcje żeby było zmienną globalną bo łatwiej mi to wykorzystać w klasie przy tworzeniu socket path.
-chciałem pousuwać niektóre zmienne w celu zrobienia przejrzystości i zobaczyłem, że namespace netlaglab kończy się przed attach_to_session i nie obejmuje też run_session, dlaczego? zdefiniowałem funkcję w make_socket_path w .hpp i nie mogę jej użyć w attach_to_session w celu zaoszczędzenia miejsca.
