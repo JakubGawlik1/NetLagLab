@@ -2,10 +2,11 @@
 
 ## Status
 
-The current code uses RAII for file descriptors and Unix-socket path cleanup,
-and the Supervisor reaps the directly spawned Workload. The integrated helper
-lifecycle is incomplete, and there are no privileged namespace, veth, route,
-NAT, firewall, DNS-mount, or qdisc resources to clean up yet.
+The implemented helper lifecycle reaps the directly managed Workload, releases
+the root-owned host lock before its final result, and uses RAII for descriptors
+and Unix-socket paths. The Supervisor then reaps its launcher and removes the
+user control socket. There are no privileged namespace, veth, route, NAT,
+firewall, DNS-mount, or qdisc resources to clean up yet.
 
 The ownership and cleanup rules below are accepted target design. A durable
 recovery journal is accepted in principle for persistent firewall changes, but

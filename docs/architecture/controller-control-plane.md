@@ -2,11 +2,11 @@
 
 ## Status
 
-The current Controller supports `help`, `status`, and `detach` over
-`control.sock`. Status always shows an unrestricted default profile and
-`shaping: not applied`. The accepted target adds typed profile mutations and
-Session stop while preserving the existing one-Controller, line-oriented
-model.
+The current Controller supports `help`, `status`, `stop`, and `detach` over
+`control.sock`. `stop` enters the implemented helper-owned termination policy.
+Status always shows an unrestricted default profile and `shaping: not
+applied`. The accepted target still adds typed profile mutations while
+preserving the existing one-Controller, line-oriented model.
 
 ## Role and ownership
 
@@ -116,9 +116,9 @@ lifecycle, not by the Controller client.
 ## Current-to-target gap
 
 The current Supervisor handles Controller commands immediately and recognizes
-only `help`, `status`, and `detach`. It has no typed parser for settings, no
-operation queue, no helper mutation request, no stopping state, and only the
-older terminal messages `SESSION_ENDED` and `SESSION_FAILED` without the target
+`help`, `status`, `stop`, and `detach`. It has no typed parser for settings, no
+operation queue, no helper mutation request, no public stopping state, and only
+the terminal messages `SESSION_ENDED` and `SESSION_FAILED` without the target
 result detail.
 
 ## Open implementation design

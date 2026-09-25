@@ -23,14 +23,14 @@ Each feature document separates four kinds of information:
 
 | Feature | Responsibility | Current state |
 |---|---|---|
-| [Session lifecycle](session-lifecycle.md) | Session scope, startup, termination, result precedence, and host-wide exclusivity | Partially implemented; target lifecycle accepted |
-| [Workload execution](workload-execution.md) | Workload parentage, namespace entry, user identity, execution context, and descendant ownership | Direct supervisor launch implemented; helper-owned launch is target design |
-| [Supervisor-helper protocol](supervisor-helper-protocol.md) | Privilege boundary, authentication, framing, start block, commands, acknowledgements, and events | Initial `READY` handshake implemented; full protocol is target design |
-| [Controller control plane](controller-control-plane.md) | Attached commands, value grammar, serialization, status, stop, detach, and terminal responses | `help`, `status`, and `detach` implemented; mutation and stop commands are target design |
+| [Session lifecycle](session-lifecycle.md) | Session scope, startup, termination, result precedence, and host-wide exclusivity | Lifecycle checkpoint implemented; privileged network resources remain absent |
+| [Workload execution](workload-execution.md) | Workload parentage, namespace entry, user identity, execution context, and descendant ownership | Helper-owned launch and execution context implemented; namespace entry remains absent |
+| [Supervisor-helper protocol](supervisor-helper-protocol.md) | Privilege boundary, authentication, framing, start block, commands, acknowledgements, and events | Lifecycle/start/stop protocol implemented; profile mutation vocabulary remains open |
+| [Controller control plane](controller-control-plane.md) | Attached commands, value grammar, serialization, status, stop, detach, and terminal responses | `help`, `status`, `stop`, and `detach` implemented; profile mutation commands remain target design |
 | [Network environment](network-environment.md) | Network namespace, veth pair, addresses, routing, DNS mount, and readiness | Manually verified only; DNS contents and host route policy remain open |
 | [Host networking and firewall](host-networking-and-firewall.md) | Forwarding preflight, NAT, firewall adapters, consent, and host-policy boundaries | Manually verified only; production adapters and recovery are not implemented |
 | [Traffic shaping](traffic-shaping.md) | Network Profile semantics, direction mapping, `tc/netem`, live deltas, and rollback | Typed validation implemented; runtime shaping is not implemented |
-| [Cleanup and recovery](cleanup-and-recovery.md) | Owned-resource cleanup, partial-failure rollback, descendant semantics, and interrupted persistent changes | User-runtime RAII exists; complete privileged cleanup and recovery are target design |
+| [Cleanup and recovery](cleanup-and-recovery.md) | Owned-resource cleanup, partial-failure rollback, descendant semantics, and interrupted persistent changes | Process/descriptor/socket/lock cleanup implemented; network cleanup and durable recovery remain target design |
 
 ## System boundary
 
@@ -52,9 +52,9 @@ flowchart LR
 - The **Controller** is optional and owns no Session resources. Detaching or
   losing it does not end the Session.
 
-This differs from the current implementation: today the Supervisor directly
-starts and reaps the Workload, while the helper only authenticates the
-Supervisor, sends `READY`, and waits for a limited shutdown protocol.
+The current implementation follows these process ownership boundaries, but it
+does not yet create the network or mount environment shown by the target
+design. The Workload therefore still runs in the host namespaces.
 
 ## Cross-cutting invariants
 
@@ -83,7 +83,6 @@ Three decisions are deliberately unresolved:
 3. **Persistent recovery journal (Q47):** the final path, schema, transaction
    protocol, and reconciliation behavior for persistent firewall changes.
 
-The exact complete helper-protocol state machine and message vocabulary also
-remain implementation design work. The semantic ordering and safety contracts
-already accepted are recorded in
-[Supervisor-helper protocol](supervisor-helper-protocol.md).
+The profile-mutation portion of the helper protocol remains implementation
+design work. The implemented lifecycle frames and remaining open vocabulary
+are recorded in [Supervisor-helper protocol](supervisor-helper-protocol.md).

@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstring>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -80,6 +81,128 @@ bool send_socket_text(const int socket_descriptor, const std::string_view messag
     }
 
     return true;
+}
+
+bool send_standard_descriptors(
+    const int socket_descriptor,
+    const std::array<int, 3>& descriptors)
+{
+    constexpr unsigned char transferred_shift{0};
+    constexpr unsigned char closed_shift{3};
+    unsigned char marker{};
+    std::array<int, 3> transferred{};
+    std::size_t transferred_count{};
+
+    for (std::size_t index{}; index < descriptors.size(); ++index) {
+        errno = 0;
+        if (fcntl(descriptors[index], F_GETFD) == -1 && errno == EBADF) {
+            marker |= static_cast<unsigned char>(1U << (closed_shift + index));
+        } else if (isatty(descriptors[index]) != 1) {
+            marker |= static_cast<unsigned char>(1U << (transferred_shift + index));
+            transferred[transferred_count++] = descriptors[index];
+        }
+    }
+
+    struct iovec payload {&marker, sizeof(marker)};
+    std::array<unsigned char, CMSG_SPACE(sizeof(int) * 3)> control{};
+    struct msghdr message {};
+    message.msg_iov = &payload;
+    message.msg_iovlen = 1;
+    if (transferred_count != 0) {
+        message.msg_control = control.data();
+        message.msg_controllen = CMSG_SPACE(sizeof(int) * transferred_count);
+        struct cmsghdr* const header{CMSG_FIRSTHDR(&message)};
+        header->cmsg_level = SOL_SOCKET;
+        header->cmsg_type = SCM_RIGHTS;
+        header->cmsg_len = CMSG_LEN(sizeof(int) * transferred_count);
+        std::memcpy(
+            CMSG_DATA(header), transferred.data(), sizeof(int) * transferred_count);
+    }
+
+    ssize_t sent{};
+    do {
+        sent = sendmsg(socket_descriptor, &message, MSG_NOSIGNAL);
+    } while (sent == -1 && errno == EINTR);
+    return sent == static_cast<ssize_t>(sizeof(marker));
+}
+
+std::optional<ReceivedStandardDescriptors> receive_standard_descriptors(
+    const int socket_descriptor)
+{
+    unsigned char marker{};
+    struct iovec payload {&marker, sizeof(marker)};
+    std::array<unsigned char, CMSG_SPACE(sizeof(int) * 3)> control{};
+    struct msghdr message {};
+    message.msg_iov = &payload;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+
+    ssize_t received{};
+    do {
+        received = recvmsg(socket_descriptor, &message, MSG_CMSG_CLOEXEC);
+    } while (received == -1 && errno == EINTR);
+    if (received != static_cast<ssize_t>(sizeof(marker))
+        || (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0
+        || (marker & 0xC0U) != 0) {
+        return std::nullopt;
+    }
+
+    std::array<int, 3> raw_descriptors{};
+    std::size_t raw_count{};
+    for (struct cmsghdr* header{CMSG_FIRSTHDR(&message)};
+         header != nullptr;
+         header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS
+            || header->cmsg_len < CMSG_LEN(0)) {
+            for (std::size_t index{}; index < raw_count; ++index) {
+                close(raw_descriptors[index]);
+            }
+            return std::nullopt;
+        }
+        const std::size_t bytes{header->cmsg_len - CMSG_LEN(0)};
+        if (bytes % sizeof(int) != 0 || raw_count + bytes / sizeof(int) > 3) {
+            for (std::size_t index{}; index < raw_count; ++index) {
+                close(raw_descriptors[index]);
+            }
+            return std::nullopt;
+        }
+        const std::size_t count{bytes / sizeof(int)};
+        std::memcpy(
+            raw_descriptors.data() + raw_count, CMSG_DATA(header), bytes);
+        raw_count += count;
+    }
+
+    ReceivedStandardDescriptors result;
+    std::size_t next_descriptor{};
+    for (std::size_t index{}; index < result.dispositions.size(); ++index) {
+        const bool transferred{(marker & (1U << index)) != 0};
+        const bool closed{(marker & (1U << (index + 3))) != 0};
+        if (transferred && closed) {
+            for (std::size_t raw_index{next_descriptor}; raw_index < raw_count;
+                 ++raw_index) {
+                close(raw_descriptors[raw_index]);
+            }
+            return std::nullopt;
+        }
+        if (transferred) {
+            if (next_descriptor == raw_count) {
+                return std::nullopt;
+            }
+            result.dispositions[index] = StandardDescriptorDisposition::transferred;
+            result.descriptors[index].emplace(raw_descriptors[next_descriptor++]);
+        } else if (closed) {
+            result.dispositions[index] =
+                StandardDescriptorDisposition::explicitly_closed;
+        }
+    }
+    if (next_descriptor != raw_count) {
+        for (std::size_t index{next_descriptor}; index < raw_count; ++index) {
+            close(raw_descriptors[index]);
+        }
+        return std::nullopt;
+    }
+    return result;
 }
 
 SocketReadResult read_socket_data(

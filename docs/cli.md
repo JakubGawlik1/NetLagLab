@@ -15,9 +15,13 @@ For example:
 netlaglab run -- firefox --private-window
 ```
 
-NetLagLab searches for the program using `PATH`, starts it with the current environment, and
-waits for it to finish. The program inherits the standard input, standard output, and standard
-error streams of NetLagLab.
+The privileged helper resolves a bare program name using the first exact `PATH=` entry in the
+captured environment, starts it with the captured argv, environment, working directory, user
+identity, supplementary groups, and standard streams, and waits for it to finish. The helper is
+the program's direct parent.
+
+This lifecycle checkpoint does not yet create a network namespace or apply shaping. The program
+therefore still uses the host network environment.
 
 ## Attach a controller
 
@@ -34,6 +38,8 @@ The controller accepts newline-terminated commands:
 - `help` lists the controller commands;
 - `status` shows the application PID and arguments, followed by the default outbound and inbound
   profiles;
+- `stop` requests `SIGTERM`, waits five seconds, then requests `SIGKILL` if the application has
+  not exited;
 - `detach` disconnects the controller without stopping the application or its supervisor.
 
 The status output says `shaping: not applied`. NetLagLab does not apply the displayed network
@@ -65,15 +71,15 @@ NetLagLab: connection to session lost; session result is unknown.
 | Status | Meaning |
 |---:|---|
 | 2 | The NetLagLab command has invalid syntax. |
-| 125 | The launcher or `waitpid()` encountered an internal error. |
-| 126 | `posix_spawnp()` directly reported that the program could not be executed. |
-| 127 | `posix_spawnp()` directly reported that the program was not found. |
+| 125 | Session infrastructure, communication, reaping, or cleanup failed. |
+| 126 | The helper could not execute the program because of permission or executable-format failure. |
+| 127 | The helper could not find the program. |
 | `128 + signal` | The program was terminated by a signal. |
 
 After a program has been started successfully, its normal exit status is returned unchanged.
 For example, a program that exits with status 1 makes NetLagLab exit with status 1.
 
-Statuses 125, 126, and 127 are not reserved after a program has been started successfully. An
-application can intentionally return any of them, and NetLagLab passes that value through.
-Consequently, the numeric status alone cannot always distinguish an application result from a
-NetLagLab or later execution failure; use the accompanying diagnostic on standard error.
+After activation, an infrastructure failure overrides the returned application result with 125,
+but the diagnostic preserves the already known application outcome. Statuses 125, 126, and 127
+are not reserved application exit values after successful activation, so use the accompanying
+diagnostic to distinguish their source.

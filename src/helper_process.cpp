@@ -1,19 +1,24 @@
 #include "helper_process.hpp"
 
-#include "helper_protocol.hpp"
 #include "session_paths.hpp"
 #include "socket_io.hpp"
 
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <limits.h>
 #include <ostream>
 #include <spawn.h>
+#include <sys/socket.h>
 #include <string>
+#include <string_view>
+#include <system_error>
+#include <csignal>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -26,24 +31,71 @@ namespace {
 
 constexpr std::chrono::milliseconds helper_connection_retry_delay{50};
 
-void report_helper_exit_before_connection(
+[[nodiscard]] std::optional<pid_t> read_parent_pid(const pid_t pid)
+{
+    std::ifstream stat{"/proc/" + std::to_string(pid) + "/stat"};
+    std::string line;
+    if (!std::getline(stat, line)) {
+        return std::nullopt;
+    }
+    const std::size_t closing_parenthesis{line.rfind(')')};
+    if (closing_parenthesis == std::string::npos
+        || closing_parenthesis + 4 >= line.size()) {
+        return std::nullopt;
+    }
+    std::string_view remainder{line};
+    remainder.remove_prefix(closing_parenthesis + 2);
+    const std::size_t state_separator{remainder.find(' ')};
+    if (state_separator == std::string_view::npos) {
+        return std::nullopt;
+    }
+    remainder.remove_prefix(state_separator + 1);
+    const std::size_t parent_end{remainder.find(' ')};
+    const std::string_view parent_text{remainder.substr(0, parent_end)};
+    pid_t parent{};
+    const auto parsed{std::from_chars(
+        parent_text.data(), parent_text.data() + parent_text.size(), parent)};
+    if (parsed.ec != std::errc{} || parsed.ptr != parent_text.data() + parent_text.size()) {
+        return std::nullopt;
+    }
+    return parent;
+}
+
+[[nodiscard]] bool belongs_to_helper_launcher(
+    const pid_t peer_pid,
+    const pid_t helper_launcher_pid)
+{
+    pid_t current{peer_pid};
+    for (std::size_t depth{}; depth < 32 && current > 1; ++depth) {
+        if (current == helper_launcher_pid) {
+            return true;
+        }
+        const std::optional<pid_t> parent{read_parent_pid(current)};
+        if (!parent.has_value() || *parent == current) {
+            return false;
+        }
+        current = *parent;
+    }
+    return current == helper_launcher_pid;
+}
+
+void report_helper_exit(
     const int status,
     std::ostream& error)
 {
     if (WIFEXITED(status)) {
-        error << "NetLagLab: privileged helper exited before opening helper.sock; exit code: "
+        error << "NetLagLab: privileged helper launcher exited; exit code: "
               << WEXITSTATUS(status) << '\n';
         return;
     }
 
     if (WIFSIGNALED(status)) {
-        error << "NetLagLab: privileged helper terminated before opening helper.sock; signal: "
+        error << "NetLagLab: privileged helper launcher terminated; signal: "
               << WTERMSIG(status) << '\n';
         return;
     }
 
-    error << "NetLagLab: privileged helper ended with an unsupported status before opening "
-             "helper.sock\n";
+    error << "NetLagLab: privileged helper launcher ended with an unsupported status\n";
 }
 
 [[nodiscard]] std::optional<std::string> resolve_helper_executable_path(
@@ -122,6 +174,23 @@ std::optional<FileDescriptor> wait_for_helper_connection(
         UnixSocketConnectResult connection{
             connect_to_unix_socket(paths.helper_socket())};
         if (connection.socket.has_value()) {
+            struct ucred credentials {};
+            socklen_t credentials_size{sizeof(credentials)};
+            if (getsockopt(
+                    connection.socket->get(),
+                    SOL_SOCKET,
+                    SO_PEERCRED,
+                    &credentials,
+                    &credentials_size)
+                    == -1
+                || credentials_size != static_cast<socklen_t>(sizeof(credentials))
+                || credentials.uid != 0
+                || !belongs_to_helper_launcher(
+                    credentials.pid, helper_launcher_pid)) {
+                error << "NetLagLab: rejected helper.sock peer not belonging to the "
+                         "launched root helper process tree\n";
+                return std::nullopt;
+            }
             return std::move(*connection.socket);
         }
 
@@ -145,14 +214,27 @@ std::optional<FileDescriptor> wait_for_helper_connection(
             return std::nullopt;
         }
 
-        int helper_status{};
-        pid_t wait_result{};
+        siginfo_t helper_info {};
+        int wait_result{};
         do {
-            wait_result = waitpid(helper_launcher_pid, &helper_status, WNOHANG);
+            wait_result = waitid(
+                P_PID,
+                static_cast<id_t>(helper_launcher_pid),
+                &helper_info,
+                WEXITED | WNOHANG | WNOWAIT);
         } while (wait_result == -1 && errno == EINTR);
 
-        if (wait_result == helper_launcher_pid) {
-            report_helper_exit_before_connection(helper_status, error);
+        if (wait_result == 0 && helper_info.si_pid == helper_launcher_pid) {
+            int helper_status{};
+            pid_t reaped{};
+            do {
+                reaped = waitpid(helper_launcher_pid, &helper_status, 0);
+            } while (reaped == -1 && errno == EINTR);
+            if (reaped == helper_launcher_pid) {
+                report_helper_exit(helper_status, error);
+            } else {
+                error << "NetLagLab: failed to reap privileged helper before connection\n";
+            }
             return std::nullopt;
         }
 
@@ -167,56 +249,66 @@ std::optional<FileDescriptor> wait_for_helper_connection(
     }
 }
 
-bool wait_for_helper_ready(
-    const int helper_socket_descriptor,
-    std::ostream& error)
+bool reap_helper_launcher(const pid_t helper_launcher_pid, std::ostream& error)
 {
-    std::string read_buffer;
-
-    while (true) {
-        const SocketReadResult result{
-            read_socket_data(helper_socket_descriptor, read_buffer)};
-
-        if (result.status == SocketReadStatus::error) {
-            error << "NetLagLab: failed to read from privileged helper: "
-                  << std::strerror(result.error_code) << '\n';
-            return false;
-        }
-
-        if (result.status == SocketReadStatus::peer_closed) {
-            error << "NetLagLab: privileged helper closed the connection before sending "
-                     "READY\n";
-            return false;
-        }
-
-        while (true) {
-            const std::optional<std::string> line{take_next_line(read_buffer)};
-            if (!line.has_value()) {
-                break;
-            }
-
-            if (line->size() > maximum_helper_message_size) {
-                error << "NetLagLab: message from privileged helper exceeds "
-                      << maximum_helper_message_size << " bytes\n";
-                return false;
-            }
-
-            const std::optional<HelperEvent> event{parse_helper_event(*line)};
-            if (event == HelperEvent::ready) {
+    const auto wait_until = [helper_launcher_pid](
+                                const std::chrono::steady_clock::time_point deadline,
+                                int& status) -> std::optional<bool> {
+        while (std::chrono::steady_clock::now() < deadline) {
+            pid_t result{};
+            do {
+                result = waitpid(helper_launcher_pid, &status, WNOHANG);
+            } while (result == -1 && errno == EINTR);
+            if (result == helper_launcher_pid) {
                 return true;
             }
-
-            error << "NetLagLab: expected READY from privileged helper, received: "
-                  << *line << '\n';
-            return false;
+            if (result == -1) {
+                return std::nullopt;
+            }
+            std::this_thread::sleep_for(helper_connection_retry_delay);
         }
+        return false;
+    };
 
-        if (read_buffer.size() > maximum_helper_message_size) {
-            error << "NetLagLab: message from privileged helper exceeds "
-                  << maximum_helper_message_size << " bytes\n";
-            return false;
-        }
+    int status{};
+    const std::optional<bool> natural{
+        wait_until(std::chrono::steady_clock::now() + std::chrono::seconds{2}, status)};
+    if (!natural.has_value()) {
+        error << "NetLagLab: failed to reap privileged helper launcher: "
+              << std::strerror(errno) << '\n';
+        return false;
     }
+    if (*natural) {
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            return true;
+        }
+        report_helper_exit(status, error);
+        return false;
+    }
+
+    (void)kill(helper_launcher_pid, SIGTERM);
+    const std::optional<bool> after_term{
+        wait_until(std::chrono::steady_clock::now() + std::chrono::seconds{2}, status)};
+    if (!after_term.has_value()) {
+        error << "NetLagLab: failed to reap privileged helper launcher after SIGTERM\n";
+        return false;
+    }
+    if (*after_term) {
+        error << "NetLagLab: privileged helper launcher required SIGTERM during reaping\n";
+        return false;
+    }
+
+    (void)kill(helper_launcher_pid, SIGKILL);
+    pid_t result{};
+    do {
+        result = waitpid(helper_launcher_pid, &status, 0);
+    } while (result == -1 && errno == EINTR);
+    if (result != helper_launcher_pid) {
+        error << "NetLagLab: failed to reap privileged helper launcher after SIGKILL\n";
+        return false;
+    }
+    error << "NetLagLab: privileged helper launcher required SIGKILL during reaping\n";
+    return false;
 }
 
 } // namespace netlaglab

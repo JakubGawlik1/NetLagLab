@@ -19,8 +19,8 @@ class SessionPaths;
     pid_t helper_launcher_pid,
     std::ostream& error);
 
-[[nodiscard]] bool wait_for_helper_ready(
-    int helper_socket_descriptor,
+[[nodiscard]] bool reap_helper_launcher(
+    pid_t helper_launcher_pid,
     std::ostream& error);
 
 } // namespace netlaglab

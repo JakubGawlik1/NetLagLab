@@ -2,11 +2,11 @@
 
 ## Status
 
-The current code implements only helper startup, server-side peer validation,
-`READY`, and helper-side parsing of `SHUTDOWN`. The Supervisor does not send
-`SHUTDOWN`, await `STOPPED`, monitor the helper after readiness, or reap its
-launcher reliably. The protocol described below is the accepted target
-contract unless a section is explicitly marked open.
+The lifecycle conversation, start block, explicit standard-descriptor
+transfer, stop commands, terminal events, and final cleanup result are
+implemented. The conversation module owns stream framing and legal ordering on
+both sides. Profile-mutation operations and privileged network-resource events
+remain unimplemented.
 
 ## Boundary and responsibilities
 
@@ -26,6 +26,23 @@ The protocol transports per-setting profile deltas rather than CLI text or a
 complete Network Profile. A semantic operation can resemble
 `SET_OUTBOUND_DELAY 10`, but the complete final wire vocabulary is not yet
 settled.
+
+## Semantic lifecycle boundary
+
+The Supervisor-side Session lifecycle consumes only these typed categories
+from its conversation adapter:
+
+- activation succeeded;
+- activation failed;
+- a runtime operation finished;
+- the Workload finished;
+- privileged cleanup finished;
+- the conversation was lost.
+
+Conversation loss is produced locally from EOF, transport failure, malformed
+input, or impossible ordering; it is not a helper frame. These categories are
+stable lifecycle facts, not proposed wire names. Resource-level events such as
+veth, NAT, or qdisc creation remain private to the helper.
 
 ## Transport and authentication
 
@@ -47,8 +64,9 @@ Authentication is mutual at the process boundary:
 - The helper checks `SO_PEERCRED` and accepts only the invoking user represented
   by its validated `SUDO_UID` context.
 - The Supervisor must check that the connected peer is the expected root
-  helper, rather than trusting the socket pathname or `sudo` authentication
-  alone.
+  helper. It requires root credentials and binds the peer PID to the process
+  tree of the `sudo` launcher it created, rather than trusting the pathname or
+  `sudo` authentication alone.
 - Path ownership, file type, permissions, descriptor inheritance, and stale
   socket cleanup remain defense-in-depth checks; they do not replace peer
   credential checks.
@@ -57,13 +75,22 @@ Authentication is mutual at the process boundary:
 
 | Direction | Frame | Implemented behavior |
 |---|---|---|
-| Helper to Supervisor | `READY\n` | Sent after authenticated accept; Supervisor accepts it as the initial handshake. |
-| Supervisor to helper | `SHUTDOWN\n` | Parser and message generator exist, but the Supervisor never sends it. |
-| Helper to Supervisor | `STOPPED\n` | Sent in response to `SHUTDOWN`; the Supervisor has no post-`READY` receive loop. |
-| Helper to Supervisor | `ERROR <text>\n` | Helper can report an invalid command; the Supervisor has no general receiver for it. |
+| Helper to Supervisor | `READY\n` | Starts the authenticated conversation after the helper acquires the host lock. |
+| Supervisor to helper | one descriptor marker plus optional `SCM_RIGHTS` | Explicitly distinguishes transferred non-terminal descriptors, inherited terminal descriptors, and closed descriptors. |
+| Supervisor to helper | `START_BEGIN...START_END\n` | Carries bounded argv, environment, and cwd. |
+| Helper to Supervisor | `ACTIVE <pid>\n` | Sent only after the exec-success pipe closes on successful `execve`. |
+| Helper to Supervisor | `START_FAILED 125|126|127\n` | Reports a pre-activation execution failure. |
+| Supervisor to helper | `STOP TERM\n`, `STOP KILL\n` | Signals only the directly managed Workload PID. |
+| Supervisor to helper | `SHUTDOWN\n` | Compatibility command currently treated as a TERM stop request. |
+| Helper to Supervisor | `WORKLOAD_EXITED <0..255>\n` | Reports a reaped normal Workload result. |
+| Helper to Supervisor | `WORKLOAD_SIGNALED <1..127>\n` | Reports a reaped signal result. |
+| Helper to Supervisor | `CLEANUP_OK\n`, `CLEANUP_FAILED\n` | Final result after releasing the host lock and cleaning implemented owned state. |
+| Helper to Supervisor | `ERROR <safe text>\n` | Terminates the conversation; text never includes execution-context values. |
 
-These frames describe only the current staged lifecycle. They are not a
-complete target protocol.
+The implemented state machine allows only `READY`, then activation or start
+failure, then (after activation) one Workload terminal result, and finally one
+cleanup result. EOF is successful only after the final result and with no
+partial trailing frame.
 
 ## Workload start block
 
@@ -144,18 +171,15 @@ Supervisor requests shutdown or observes the terminal event
   -> Supervisor reaps the sudo launcher
 ```
 
-The existing `SHUTDOWN` and `STOPPED` names may participate in that design,
-but the final state machine must also represent activation, Workload result,
-cleanup failure, and terminal ordering. Those exact frames are still open.
+The implemented lifecycle uses the frames listed above. `SHUTDOWN` remains a
+compatibility spelling for a TERM request; clean completion is proven by the
+Workload terminal frame followed by the cleanup frame.
 
 ## Open implementation design
 
-- The exhaustive states and legal message ordering.
-- Exact command, acknowledgement, error, activation, Workload-result, and
-  final-cleanup frame names.
-- The exec-success handshake that separates pre-activation `126`/`127` from
-  an active Workload result.
+- Exact wire names and encodings for future Network Profile mutations and
+  acknowledgements.
 - Safe error-reason vocabulary exposed to the Controller without leaking
   environment or privileged host details.
-- Focused parser and process-integration tests for partial reads, multiple
-  frames, EOF, malformed input, timeouts, and terminal races.
+- Privileged integration coverage for the real `sudo`/PTY topology; this
+  requires separate explicit authorization.

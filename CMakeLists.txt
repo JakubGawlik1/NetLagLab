@@ -19,10 +19,12 @@ add_executable(
     src/helper_protocol.cpp
     src/main.cpp
     src/session.cpp
+    src/session_lifecycle.cpp
     src/session_paths.cpp
     src/socket_io.cpp
     src/session_socket.cpp
     src/session_validation.cpp
+    src/workload_context.cpp
 )
 
 target_compile_features(netlaglab PRIVATE cxx_std_20)
@@ -41,6 +43,8 @@ add_executable(
     src/session_socket.cpp
     src/session_validation.cpp
     src/socket_io.cpp
+    src/workload_context.cpp
+    src/workload_process.cpp
 )
 
 target_compile_features(netlaglab-helper PRIVATE cxx_std_20)
@@ -76,4 +80,92 @@ if(BUILD_TESTING)
 
     include(GoogleTest)
     gtest_discover_tests(netlaglab_core_tests)
+
+    add_executable(
+        netlaglab_lifecycle_tests
+        src/session_lifecycle.cpp
+        tests/session_lifecycle_test.cpp
+    )
+    target_include_directories(netlaglab_lifecycle_tests PRIVATE src)
+    target_link_libraries(netlaglab_lifecycle_tests PRIVATE GTest::gtest_main)
+    target_compile_features(netlaglab_lifecycle_tests PRIVATE cxx_std_20)
+    set_target_properties(netlaglab_lifecycle_tests PROPERTIES CXX_EXTENSIONS OFF)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_lifecycle_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    gtest_discover_tests(netlaglab_lifecycle_tests)
+
+    add_executable(
+        netlaglab_protocol_tests
+        src/helper_protocol.cpp
+        src/workload_context.cpp
+        tests/helper_protocol_test.cpp
+        tests/workload_context_test.cpp
+    )
+    target_include_directories(netlaglab_protocol_tests PRIVATE src)
+    target_link_libraries(netlaglab_protocol_tests PRIVATE GTest::gtest_main)
+    target_compile_features(netlaglab_protocol_tests PRIVATE cxx_std_20)
+    set_target_properties(netlaglab_protocol_tests PROPERTIES CXX_EXTENSIONS OFF)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_protocol_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    gtest_discover_tests(netlaglab_protocol_tests)
+
+    add_executable(netlaglab-workload-probe tests/workload_probe.cpp)
+    target_compile_features(netlaglab-workload-probe PRIVATE cxx_std_20)
+    set_target_properties(netlaglab-workload-probe PROPERTIES CXX_EXTENSIONS OFF)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab-workload-probe
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    add_executable(
+        netlaglab_process_tests
+        src/workload_context.cpp
+        src/workload_process.cpp
+        src/socket_io.cpp
+        tests/workload_process_test.cpp
+    )
+    target_include_directories(netlaglab_process_tests PRIVATE src)
+    target_link_libraries(netlaglab_process_tests PRIVATE GTest::gtest_main)
+    target_compile_definitions(
+        netlaglab_process_tests
+        PRIVATE WORKLOAD_PROBE_PATH="$<TARGET_FILE:netlaglab-workload-probe>"
+    )
+    add_dependencies(netlaglab_process_tests netlaglab-workload-probe)
+    target_compile_features(netlaglab_process_tests PRIVATE cxx_std_20)
+    set_target_properties(netlaglab_process_tests PROPERTIES CXX_EXTENSIONS OFF)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_process_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    gtest_discover_tests(netlaglab_process_tests)
 endif()

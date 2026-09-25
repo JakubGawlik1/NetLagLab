@@ -110,6 +110,11 @@ enum class ResponseBlock {
         return 0;
     }
 
+    if (line == "STOPPING") {
+        output << "Stopping Workload.\n";
+        return std::nullopt;
+    }
+
     if (line == "SESSION_ENDED") {
         output << "Session ended.\n";
         return 0;

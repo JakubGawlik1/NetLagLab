@@ -2,10 +2,10 @@
 
 ## Status
 
-The current Supervisor starts the Workload directly with `posix_spawnp()`.
-The accepted target makes the helper the Workload's direct parent so it can
-enter the child into the Session namespaces before permanently dropping to the
-invoking user's identity. The target is not implemented.
+The helper now forks, launches, signals, and reaps the directly managed
+Workload. It restores the invoking identity and transmitted execution context,
+but namespace and mount entry are not implemented, so the Workload still uses
+the host network environment.
 
 ## Ownership boundary
 
@@ -13,23 +13,29 @@ NetLagLab owns, stops, and reaps only the directly managed Workload process.
 Descendants may inherit its network environment, but NetLagLab does not own,
 track, signal, or reap them, and they may outlive the Session.
 
-The helper owns the directly managed Workload process in the target design.
+The helper owns the directly managed Workload process.
 The long-lived helper remains privileged and outside the Workload's network
 namespace so it can manage host-side resources, apply profile changes, receive
 Supervisor requests, signal the Workload, reap it, and clean up.
 
 ## Current implementation
 
-After receiving helper `READY`, the Supervisor calls:
+After `READY`, the Supervisor transfers standard descriptors and the bounded
+start block. The helper then performs:
 
 ```text
-posix_spawnp(child_arguments[0], child_arguments, environ)
+fork
+  -> establish PR_SET_PDEATHSIG
+  -> map standard descriptors
+  -> restore supplementary groups, GID, and UID
+  -> set PR_SET_NO_NEW_PRIVS
+  -> chdir to transmitted cwd
+  -> execve with transmitted argv and environment
 ```
 
-The Workload is therefore a direct child of the Supervisor, stays in the
-host's namespaces, inherits the current environment and standard descriptors,
-and is reaped by the Supervisor. No namespace, veth, DNS mount, routing, NAT,
-or shaping setup affects it.
+An exec-status pipe distinguishes successful execution from `125`, `126`, or
+`127` start failure. The Workload remains in the host namespaces because no
+namespace, veth, DNS mount, routing, NAT, or shaping setup exists yet.
 
 ## Accepted target launch sequence
 
@@ -50,8 +56,12 @@ fork in the helper
 Namespace and mount operations that require privilege happen before the
 identity and capability drop. The Workload must execute with the invoking
 user's UID, GID, supplementary groups, environment, current working directory,
-and standard input/output/error. Dropping UID alone is not considered enough
-to restore the user's execution context.
+and standard input/output/error. Non-terminal descriptors preserve their pipe,
+file, socket, and redirection semantics. Terminal descriptors may use the
+pseudo-terminal created by `sudo`; basic interactive I/O and terminal detection
+remain supported, but the MVP does not promise the original `/dev/tty`, process
+group, or full job-control behavior. Dropping UID alone is not considered
+enough to restore the user's execution context.
 
 Linux cannot move an arbitrary already-running process into a different
 network namespace. `setns()` changes the calling thread, while `ip netns
@@ -68,8 +78,11 @@ line arguments for user data.
 - The environment is the full ordered snapshot inherited by `netlaglab`.
   Duplicate entries and their order are preserved.
 - The current working directory is sent as an absolute path.
-- The standard descriptors are preserved for the Workload and are not reused
-  for consent input.
+- Non-terminal standard descriptors are transferred as descriptors so their
+  underlying open-file semantics survive the `sudo` boundary. Terminal streams
+  may instead use the `sudo` pseudo-terminal and are subject to the documented
+  job-control limitation. Standard descriptors are never reused for consent
+  input.
 - The root helper treats environment data as inert child data: it does not put
   it in the root process environment, interpret it there, or log it.
 
@@ -94,6 +107,10 @@ If the working directory is renamed or deleted before the child calls
 
 ## Terminal and parent failure behavior
 
+- A first terminal Ctrl-C reaches the Workload exactly once. The Supervisor
+  observes it to start the grace period but does not forward another `SIGINT`.
+- The helper survives its own copy of terminal `SIGINT`; the Workload does not
+  inherit that helper-side handling policy.
 - `PR_SET_PDEATHSIG(SIGKILL)` protects the directly managed Workload if its
   helper parent dies unexpectedly.
 - Controller `stop` and Supervisor loss use the target stop sequence described

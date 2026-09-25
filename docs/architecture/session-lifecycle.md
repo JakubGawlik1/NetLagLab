@@ -2,11 +2,11 @@
 
 ## Status
 
-The current code implements a user-scoped Session supervisor, starts the
-privileged helper, waits for `READY`, directly starts the Workload, serves one
-Controller, and reaps the Workload. The accepted target lifecycle moves
-Workload and privileged-resource ownership to the helper and adds transactional
-setup and cleanup. That target lifecycle is not implemented.
+The lifecycle checkpoint is implemented through one blocking typed boundary.
+The helper owns and reaps the directly managed Workload and holds the
+host-wide lock through cleanup; the Supervisor owns Controller coordination
+and reaps its `sudo` launcher. Network-resource setup and cleanup are not yet
+implemented.
 
 ## Responsibility
 
@@ -27,18 +27,20 @@ The implemented startup path is:
 validate XDG_RUNTIME_DIR and session directory
   -> acquire per-user session.lock
   -> start sudo -- netlaglab-helper
-  -> connect helper.sock and receive READY
-  -> create control.sock
-  -> posix_spawnp() the Workload directly from the Supervisor
-  -> poll control.sock and waitpid(WNOHANG) for the Workload
+  -> authenticate the root peer as part of that launcher process tree
+  -> helper acquires /run/netlaglab/host.lock and sends READY
+  -> transfer standard descriptors plus bounded argv/environment/cwd
+  -> helper fork/execve()s the Workload under the invoking identity
+  -> receive ACTIVE and only then publish control.sock
+  -> poll helper, Controller, and signal self-pipe
+  -> helper reports the Workload result, releases the host lock, and reports cleanup
+  -> Supervisor reaps the sudo launcher and removes control.sock
 ```
 
-The per-user `session.lock` prevents two Sessions for that user. It does not
-provide host-wide exclusion. The helper launcher is checked only until the
-socket connection succeeds; it is not monitored or reliably reaped afterward.
-The Supervisor does not send `SHUTDOWN`, await `STOPPED`, or continue reading
-helper events after `READY`. Closing `helper.sock` on normal Session teardown
-therefore makes the helper report an error.
+The per-user `session.lock` protects the user runtime while the root-owned
+`/run/netlaglab/host.lock` provides host-wide exclusion. The lifecycle keeps
+reading helper events after `READY`, rejects malformed or impossible ordering,
+and returns only after final cleanup and launcher reaping.
 
 See the [runtime call map](../runtime_call_map.md) for the exact implemented
 functions, descriptors, processes, and incomplete connections.
@@ -78,9 +80,15 @@ all resources created so far and leaves no Workload running. Successful system
 calls and semantic precondition checks are sufficient readiness evidence;
 startup does not add public ping, DNS, or Internet-connectivity gates.
 
-The exact helper frame that proves successful `exec` and activates the Session
-is still protocol design work. It must preserve the accepted distinction
-between pre-activation execution failure and an active Workload result.
+The Supervisor does not mirror the helper's privileged setup substeps or
+resource ledger. Before activation, startup is merely pending; the
+implementation may express that through control flow rather than a stored or
+public `starting` state. Absence of an error is not activation evidence. Only an
+explicit semantic activation event allows the Supervisor to treat the Session
+as active.
+
+The helper's close-on-exec error pipe proves successful `exec`; only then does
+it send `ACTIVE <pid>`. `START_FAILED 126|127` remains a pre-activation result.
 
 ### Runtime
 
@@ -95,12 +103,30 @@ between pre-activation execution failure and an active Workload result.
 - Natural Workload exit, a terminal signal handled by `netlaglab run`, and a
   Controller `stop` request all converge on reaping followed by cleanup.
 
+### Supervisor event loop
+
+The one-threaded Supervisor integrates handled signals through a non-blocking,
+close-on-exec self-pipe observed by `poll()`. The same loop observes the helper
+conversation and Controller endpoints; the nearest stop or launcher-reaping
+deadline determines the poll timeout. It may reap only the `sudo` launcher.
+Workload activation and termination arrive as semantic helper events, never as
+a Supervisor-side `waitpid()` target.
+
+The production adapters still perform the real `poll()`, `waitpid()`, signal,
+and process operations. Narrow adapters translate those mechanisms into typed
+lifecycle events and launcher outcomes. Deterministic tests provide scripted
+events and outcomes at those same seams; the design does not introduce one
+general-purpose mock of Linux system calls.
+
 ### Stop policy
 
 - Controller `stop` or Supervisor loss sends `SIGTERM` to the directly managed
   Workload PID, waits 5 seconds, then sends `SIGKILL`, reaps, and cleans up.
-- On the first terminal Ctrl-C, preserve `SIGINT`; after 5 seconds escalate to
-  `SIGTERM`, and after another 5 seconds to `SIGKILL`.
+- The first terminal Ctrl-C reaches the Workload exactly once through the
+  terminal and process topology. The Supervisor observes the same signal and
+  starts the stop deadline without asking the helper to send another `SIGINT`.
+- Five seconds after that first Ctrl-C, the helper sends `SIGTERM`; after
+  another 5 seconds it sends `SIGKILL`.
 - A second Ctrl-C skips the remaining grace periods and requests immediate
   `SIGKILL`.
 - NetLagLab-generated signals target only the directly managed Workload PID,
@@ -141,11 +167,30 @@ helper launcher to be reaped, and every NetLagLab-owned resource to be cleaned
 up. Detailed resource and descendant semantics are in
 [Cleanup and recovery](cleanup-and-recovery.md).
 
-## Open implementation design
+## Focused lifecycle tests
 
-- The complete helper protocol state machine and exact activation/final-event
-  vocabulary.
-- The precise integration of terminal signal handling with the one-threaded
-  Supervisor loop while preserving Workload standard input.
-- Focused protocol, process, and lifecycle tests, followed by a separately
-  authorized privileged happy-path test.
+Tests through the blocking lifecycle boundary must cover these observable
+contracts:
+
+1. activation, Workload exit, privileged cleanup, and launcher reaping return
+   the Workload outcome on a clean path;
+2. a pre-activation execution or infrastructure failure leaves no active
+   Workload and preserves the `126`, `127`, or `125` distinction;
+3. a Workload that exits immediately after successful execution is still
+   classified as an activated Workload outcome;
+4. helper loss, cleanup failure, or launcher-reaping failure produces
+   infrastructure result `125` without discarding an already known Workload
+   outcome;
+5. Controller loss does not stop the Session, the first terminal Ctrl-C starts
+   the grace period, and the second requests immediate `SIGKILL`.
+
+Conversation framing and malformed-input behavior belong to focused tests of
+the conversation module rather than being duplicated here. Local unprivileged
+process tests cover production socket and launcher adapters. A privileged
+happy-path test remains a separate, explicitly authorized integration step.
+
+## Remaining implementation boundary
+
+The lifecycle seam is implemented. The next incomplete responsibility is the
+privileged network transaction: namespace/veth/routing/DNS/NAT/firewall/qdisc
+setup, its resource ledger, rollback, and persistent recovery where required.
