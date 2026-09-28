@@ -19,6 +19,20 @@ Each feature document separates four kinds of information:
   that depend on it must stop and obtain a decision instead of choosing
   silently.
 
+## Architecture explorations
+
+The following notes preserve architecture-review findings and their current
+decision status. They are not implementation plans or authorization to change
+code. An unresolved candidate must be explored against the current working tree
+and accepted feature documents before its interface is designed.
+
+| Exploration | Status | Main question |
+|---|---|---|
+| [Deepen the Session lifecycle module](candidate-session-lifecycle.md) | Implemented checkpoint | Can helper, Workload, result, and cleanup ownership become one coherent lifecycle? |
+| [Deepen the Supervisor-helper conversation](candidate-supervisor-helper-conversation.md) | Implemented for lifecycle | Can framing and legal ordering become one test surface? |
+| [Concentrate Workload execution](candidate-workload-execution.md) | Implemented checkpoint | Can implicit execution-context knowledge become local? |
+| [Deepen the Controller control plane](candidate-controller-control-plane.md) | Worth exploring | Can both endpoints share semantic conversation rules without coupling presentation to the Session? |
+
 ## Feature map
 
 | Feature | Responsibility | Current state |
