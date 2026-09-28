@@ -1,6 +1,7 @@
 #include "session.hpp"
 
 #include "controller_control_plane.hpp"
+#include "controller_session_outcome.hpp"
 #include "file_descriptor.hpp"
 #include "helper_process.hpp"
 #include "helper_protocol.hpp"
@@ -297,7 +298,6 @@ public:
             if (poll_result == -1) {
                 error_ << "NetLagLab: lifecycle poll failed: "
                        << std::strerror(errno) << '\n';
-                conversation_failed_ = true;
                 return {LifecycleEventKind::conversation_lost};
             }
 
@@ -305,7 +305,6 @@ public:
                 read_helper_events();
             }
             if ((descriptors[0].revents & (POLLERR | POLLNVAL)) != 0) {
-                conversation_failed_ = true;
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
             }
 
@@ -327,11 +326,9 @@ public:
                     workload_pid_,
                     child_arguments_,
                     error_)) {
-                conversation_failed_ = true;
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
             }
             if ((descriptors[1].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
-                conversation_failed_ = true;
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
             }
 
@@ -373,11 +370,10 @@ public:
     bool reap_launcher() override
     {
         helper_socket_.reset();
-        launcher_clean_ = reap_helper_launcher(helper_launcher_pid_, error_);
-        return launcher_clean_;
+        return reap_helper_launcher(helper_launcher_pid_, error_);
     }
 
-    bool finalize(const bool session_succeeded) override
+    bool finalize() override
     {
         listening_socket_.reset();
         const int cleanup_error{control_socket_owner_.remove_owned()};
@@ -385,15 +381,20 @@ public:
             error_ << "NetLagLab: failed to remove control.sock: "
                    << std::strerror(cleanup_error) << '\n';
         }
-        const bool session_clean{
-            session_succeeded && launcher_clean_ && cleanup_error == 0
-            && final_cleanup_succeeded_ && !conversation_failed_};
+        return cleanup_error == 0;
+    }
+
+    void publish_outcome(const SessionOutcome& outcome) override
+    {
         if (client_.has_value()) {
-            send_controller_session_result(client_->get(), session_clean);
+            const ControllerSessionOutcomeSerialization serialized{
+                serialize_controller_session_outcome(outcome)};
+            if (const auto* block{std::get_if<std::string>(&serialized)}) {
+                (void)send_socket_text(client_->get(), *block);
+            }
         }
         client_.reset();
         controller_conversation_.reset();
-        return cleanup_error == 0;
     }
 
 private:
@@ -407,14 +408,12 @@ private:
         } else if (result.status == SocketReadStatus::peer_closed) {
             helper_events = conversation_.peer_closed();
         } else {
-            conversation_failed_ = true;
             pending_events_.push_back({LifecycleEventKind::conversation_lost});
             return;
         }
 
         for (const HelperConversationEvent event : helper_events) {
             if (event.kind == HelperConversationEventKind::ready) {
-                conversation_failed_ = true;
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
                 continue;
             }
@@ -423,7 +422,6 @@ private:
                 const int descriptor{
                     control_socket_owner_.create_listening_socket(error_)};
                 if (descriptor == -1) {
-                    conversation_failed_ = true;
                     pending_events_.push_back({LifecycleEventKind::conversation_lost});
                     continue;
                 }
@@ -434,11 +432,6 @@ private:
                            == HelperConversationEventKind::workload_signaled) {
                 workload_finished_ = true;
                 activated_ = false;
-            } else if (event.kind == HelperConversationEventKind::cleanup_succeeded) {
-                final_cleanup_succeeded_ = true;
-            } else if (event.kind == HelperConversationEventKind::cleanup_failed
-                       || event.kind == HelperConversationEventKind::conversation_lost) {
-                conversation_failed_ = true;
             }
             pending_events_.push_back(map_helper_event(event));
         }
@@ -467,9 +460,6 @@ private:
     pid_t workload_pid_{};
     bool activated_{false};
     bool workload_finished_{false};
-    bool final_cleanup_succeeded_{false};
-    bool conversation_failed_{false};
-    bool launcher_clean_{false};
 };
 
 } // namespace

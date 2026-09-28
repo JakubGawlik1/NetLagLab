@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-09-25
+Last verified: 2026-09-28
 
 ## How to use this file
 
@@ -35,7 +35,9 @@ cross-platform support are not current goals.
   one attached Controller. `attach` supports `help`, `status`, `stop`, and
   `detach`; Controller loss does not stop the application. Its pure typed
   parser also validates and normalizes `set`/`reset` Profile Changes, which are
-  reported as unavailable until helper dispatch exists.
+  reported as unavailable until helper dispatch exists. An attached Controller
+  receives the complete typed Session Outcome after Supervisor cleanup and
+  reports the Workload result independently from infrastructure failures.
 - Session paths and Unix sockets are validated for ownership, type, permissions,
   stale entries, peer credentials, and descriptor inheritance.
 - The Supervisor starts the helper through `sudo`, authenticates the root peer

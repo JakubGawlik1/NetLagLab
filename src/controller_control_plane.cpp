@@ -613,13 +613,4 @@ void reject_additional_controller(const int socket_descriptor)
         socket_descriptor, "ERROR Another controller is already attached.\n");
 }
 
-void send_controller_session_result(
-    const int socket_descriptor,
-    const bool session_succeeded)
-{
-    (void)send_socket_text(
-        socket_descriptor,
-        session_succeeded ? "SESSION_ENDED\n" : "SESSION_FAILED\n");
-}
-
 } // namespace netlaglab

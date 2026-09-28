@@ -1,5 +1,7 @@
 #include "attach_client.hpp"
 
+#include "attach_session_presentation.hpp"
+#include "controller_session_outcome.hpp"
 #include "file_descriptor.hpp"
 #include "session_paths.hpp"
 #include "session_validation.hpp"
@@ -68,6 +70,26 @@ enum class ResponseBlock {
     status,
 };
 
+struct SupervisorResponseState {
+    ResponseBlock response_block{ResponseBlock::none};
+    std::optional<ControllerSessionOutcomeParser> session_outcome_parser;
+};
+
+[[nodiscard]] std::optional<int> handle_session_outcome_result(
+    const ControllerSessionOutcomeParseResult& result,
+    std::ostream& output,
+    std::ostream& error)
+{
+    if (std::holds_alternative<IncompleteControllerSessionOutcome>(result)) {
+        return std::nullopt;
+    }
+    if (const auto* outcome{std::get_if<SessionOutcome>(&result)}) {
+        return report_attached_session_outcome(*outcome, output, error);
+    }
+    error << "NetLagLab: invalid response from session\n";
+    return 1;
+}
+
 [[nodiscard]] std::optional<int> handle_supervisor_response_line(
     const std::string_view line,
     ResponseBlock& response_block,
@@ -115,14 +137,11 @@ enum class ResponseBlock {
         return std::nullopt;
     }
 
-    if (line == "SESSION_ENDED") {
-        output << "Session ended.\n";
-        return 0;
-    }
-
-    if (line == "SESSION_FAILED") {
-        error << "NetLagLab: session failed\n";
-        return 1;
+    if (const std::optional<int> legacy_result{
+            report_legacy_attached_session_outcome(
+                line, output, error)};
+        legacy_result.has_value()) {
+        return legacy_result;
     }
 
     constexpr std::string_view error_prefix{"ERROR "};
@@ -143,7 +162,7 @@ enum class ResponseBlock {
 [[nodiscard]] std::optional<int> read_and_handle_supervisor_responses(
     const int socket_descriptor,
     std::string& response_buffer,
-    ResponseBlock& response_block,
+    SupervisorResponseState& response_state,
     std::ostream& output,
     std::ostream& error)
 {
@@ -159,14 +178,35 @@ enum class ResponseBlock {
         return 1;
     }
 
+    if (response_state.session_outcome_parser.has_value()) {
+        const ControllerSessionOutcomeParseResult result{
+            response_state.session_outcome_parser->receive(response_buffer)};
+        response_buffer.clear();
+        return handle_session_outcome_result(result, output, error);
+    }
+
     while (true) {
         const std::optional<std::string> line{take_next_line(response_buffer)};
         if (!line.has_value()) {
             break;
         }
 
+        if (*line == "SESSION_OUTCOME_BEGIN") {
+            response_state.session_outcome_parser.emplace();
+            ControllerSessionOutcomeParseResult result{
+                response_state.session_outcome_parser->receive(
+                    "SESSION_OUTCOME_BEGIN\n")};
+            if (!response_buffer.empty()) {
+                result = response_state.session_outcome_parser->receive(
+                    response_buffer);
+                response_buffer.clear();
+            }
+            return handle_session_outcome_result(result, output, error);
+        }
+
         const std::optional<int> line_result{
-            handle_supervisor_response_line(*line, response_block, output, error)};
+            handle_supervisor_response_line(
+                *line, response_state.response_block, output, error)};
         if (line_result.has_value()) {
             return line_result;
         }
@@ -182,13 +222,13 @@ enum class ResponseBlock {
     return std::nullopt;
 }
 
-[[nodiscard]] int run_attached_controller(
+[[nodiscard]] int run_attached_controller_impl(
     const int socket_descriptor,
     std::ostream& output,
     std::ostream& error)
 {
     std::string response_buffer;
-    ResponseBlock response_block{ResponseBlock::none};
+    SupervisorResponseState response_state;
     bool read_stdin{true};
     bool input_ends_with_newline{true};
 
@@ -215,7 +255,7 @@ enum class ResponseBlock {
                 read_and_handle_supervisor_responses(
                     socket_descriptor,
                     response_buffer,
-                    response_block,
+                    response_state,
                     output,
                     error)};
             if (response_result.has_value()) {
@@ -268,6 +308,14 @@ enum class ResponseBlock {
 }
 
 } // namespace
+
+int run_attached_controller(
+    const int socket_descriptor,
+    std::ostream& output,
+    std::ostream& error)
+{
+    return run_attached_controller_impl(socket_descriptor, output, error);
+}
 
 int attach_to_session(std::ostream& output, std::ostream& error)
 {

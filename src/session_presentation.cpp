@@ -13,7 +13,9 @@ namespace {
                                                        : result.value;
 }
 
-[[nodiscard]] std::string_view failure_name(
+} // namespace
+
+std::string_view infrastructure_failure_name(
     const InfrastructureFailure failure) noexcept
 {
     switch (failure) {
@@ -35,8 +37,6 @@ namespace {
     return "unknown infrastructure stage";
 }
 
-} // namespace
-
 int session_exit_status(const SessionOutcome& outcome) noexcept
 {
     if (!outcome.infrastructure_succeeded() || !outcome.workload.has_value()) {
@@ -56,7 +56,8 @@ void report_session_outcome(
             if (index != 0) {
                 error << ", ";
             }
-            error << failure_name(outcome.infrastructure_failures[index]);
+            error << infrastructure_failure_name(
+                outcome.infrastructure_failures[index]);
         }
         if (outcome.workload.has_value()) {
             error << "; Workload result was "

@@ -70,7 +70,8 @@ public:
     [[nodiscard]] virtual LifecycleEvent wait(LifecycleWait wait) = 0;
     [[nodiscard]] virtual bool request_stop(StopRequest request) = 0;
     [[nodiscard]] virtual bool reap_launcher() = 0;
-    [[nodiscard]] virtual bool finalize(bool session_succeeded) = 0;
+    [[nodiscard]] virtual bool finalize() = 0;
+    virtual void publish_outcome(const SessionOutcome& outcome) = 0;
 };
 
 [[nodiscard]] SessionOutcome run_session_lifecycle(LifecycleAdapter& adapter);

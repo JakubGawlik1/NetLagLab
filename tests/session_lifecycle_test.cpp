@@ -1,5 +1,7 @@
 #include "session_lifecycle.hpp"
+#include "controller_session_outcome.hpp"
 #include "session_presentation.hpp"
+#include "socket_io.hpp"
 
 #include <gtest/gtest.h>
 
@@ -16,8 +18,13 @@ class ScriptedLifecycleAdapter final : public LifecycleAdapter {
 public:
     ScriptedLifecycleAdapter(
         const std::initializer_list<LifecycleEvent> events,
-        const bool launcher_reaping_succeeds = true)
-        : events_{events}, launcher_reaping_succeeds_{launcher_reaping_succeeds}
+        const bool launcher_reaping_succeeds = true,
+        const bool supervisor_cleanup_succeeds = true,
+        const bool terminal_delivery_succeeds = true)
+        : events_{events},
+          launcher_reaping_succeeds_{launcher_reaping_succeeds},
+          supervisor_cleanup_succeeds_{supervisor_cleanup_succeeds},
+          terminal_delivery_succeeds_{terminal_delivery_succeeds}
     {
     }
 
@@ -51,23 +58,43 @@ public:
         return launcher_reaping_succeeds_;
     }
 
-    bool finalize(const bool session_succeeded) override
+    bool finalize() override
     {
+        finalization_order.push_back("cleanup");
         finalized = true;
-        final_session_success = session_succeeded;
-        return true;
+        return supervisor_cleanup_succeeds_;
+    }
+
+    void publish_outcome(const SessionOutcome& outcome) override
+    {
+        finalization_order.push_back("publish");
+        published_outcome = outcome;
+        const ControllerSessionOutcomeSerialization serialized{
+            serialize_controller_session_outcome(outcome)};
+        if (const auto* block{std::get_if<std::string>(&serialized)}) {
+            published_block = *block;
+            terminal_delivery_succeeded = terminal_delivery_succeeds_
+                || send_socket_text(-1, *block);
+        } else {
+            terminal_delivery_succeeded = false;
+        }
     }
 
     bool began{false};
     bool launcher_reaped{false};
     bool finalized{false};
-    bool final_session_success{false};
+    bool terminal_delivery_succeeded{true};
+    std::optional<SessionOutcome> published_outcome;
+    std::string published_block;
+    std::vector<std::string> finalization_order;
     std::vector<LifecycleWait> waits;
     std::vector<StopRequest> stop_requests;
 
 private:
     std::deque<LifecycleEvent> events_;
     bool launcher_reaping_succeeds_;
+    bool supervisor_cleanup_succeeds_;
+    bool terminal_delivery_succeeds_;
 };
 
 TEST(SessionLifecycleTest, ReturnsWorkloadOutcomeAfterCleanupAndLauncherReaping)
@@ -167,6 +194,53 @@ TEST(SessionLifecycleTest, LauncherReapingFailureOverridesButPreservesWorkloadOu
     ASSERT_TRUE(outcome.workload.has_value());
     EXPECT_EQ(outcome.workload->value, 9);
     EXPECT_EQ(session_exit_status(outcome), 125);
+}
+
+TEST(SessionLifecycleTest, PublishesOutcomeAfterSupervisorCleanupIsKnown)
+{
+    ScriptedLifecycleAdapter adapter{
+        {{LifecycleEventKind::activated, 4321},
+         {LifecycleEventKind::workload_exited, 9},
+         {LifecycleEventKind::cleanup_succeeded}},
+        true,
+        false};
+
+    const SessionOutcome outcome{run_session_lifecycle(adapter)};
+
+    EXPECT_EQ(
+        adapter.finalization_order,
+        (std::vector<std::string>{"cleanup", "publish"}));
+    ASSERT_TRUE(adapter.published_outcome.has_value());
+    EXPECT_EQ(
+        adapter.published_outcome->infrastructure_failures,
+        (std::vector{InfrastructureFailure::supervisor_cleanup}));
+    EXPECT_EQ(
+        outcome.infrastructure_failures,
+        adapter.published_outcome->infrastructure_failures);
+    EXPECT_NE(
+        adapter.published_block.find("FAILURE SUPERVISOR_CLEANUP\n"),
+        std::string::npos);
+}
+
+TEST(SessionLifecycleTest, TerminalDeliveryFailureDoesNotChangeSessionOutcome)
+{
+    ScriptedLifecycleAdapter adapter{
+        {{LifecycleEventKind::activated, 4321},
+         {LifecycleEventKind::workload_exited, 0},
+         {LifecycleEventKind::cleanup_succeeded}},
+        true,
+        true,
+        false};
+
+    const SessionOutcome outcome{run_session_lifecycle(adapter)};
+
+    EXPECT_TRUE(outcome.infrastructure_succeeded());
+    EXPECT_FALSE(adapter.terminal_delivery_succeeded);
+    ASSERT_TRUE(adapter.published_outcome.has_value());
+    EXPECT_TRUE(adapter.published_outcome->infrastructure_succeeded());
+    EXPECT_NE(
+        adapter.published_block.find("INFRASTRUCTURE OK\n"),
+        std::string::npos);
 }
 
 TEST(SessionLifecycleTest, HelperLossIsInfrastructureFailure)

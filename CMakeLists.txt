@@ -15,7 +15,9 @@ endif()
 add_executable(
     netlaglab
     src/attach_client.cpp
+    src/attach_session_presentation.cpp
     src/controller_control_plane.cpp
+    src/controller_session_outcome.cpp
     src/helper_process.cpp
     src/helper_protocol.cpp
     src/main.cpp
@@ -87,8 +89,10 @@ if(BUILD_TESTING)
 
     add_executable(
         netlaglab_lifecycle_tests
+        src/controller_session_outcome.cpp
         src/session_lifecycle.cpp
         src/session_presentation.cpp
+        src/socket_io.cpp
         tests/session_lifecycle_test.cpp
     )
     target_include_directories(netlaglab_lifecycle_tests PRIVATE src)
@@ -162,6 +166,43 @@ if(BUILD_TESTING)
     endif()
 
     gtest_discover_tests(netlaglab_controller_protocol_tests)
+
+    add_executable(
+        netlaglab_controller_outcome_tests
+        src/attach_client.cpp
+        src/attach_session_presentation.cpp
+        src/controller_session_outcome.cpp
+        src/session_paths.cpp
+        src/session_lifecycle.cpp
+        src/session_presentation.cpp
+        src/session_socket.cpp
+        src/session_validation.cpp
+        src/socket_io.cpp
+        tests/attach_client_test.cpp
+        tests/controller_session_outcome_test.cpp
+    )
+    target_include_directories(netlaglab_controller_outcome_tests PRIVATE src)
+    target_link_libraries(
+        netlaglab_controller_outcome_tests
+        PRIVATE GTest::gtest_main
+    )
+    target_compile_features(netlaglab_controller_outcome_tests PRIVATE cxx_std_20)
+    set_target_properties(
+        netlaglab_controller_outcome_tests
+        PROPERTIES CXX_EXTENSIONS OFF
+    )
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_controller_outcome_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    gtest_discover_tests(netlaglab_controller_outcome_tests)
 
     add_executable(netlaglab-workload-probe tests/workload_probe.cpp)
     target_compile_features(netlaglab-workload-probe PRIVATE cxx_std_20)

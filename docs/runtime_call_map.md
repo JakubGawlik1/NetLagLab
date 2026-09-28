@@ -16,6 +16,7 @@ flow. It does not treat accepted target architecture as implemented behavior.
 | `netlaglab_lifecycle_tests` | Scripted tests through the blocking lifecycle seam. |
 | `netlaglab_protocol_tests` | Start-block and helper-conversation tests. |
 | `netlaglab_controller_protocol_tests` | Controller framing, escaping, and typed-command tests. |
+| `netlaglab_controller_outcome_tests` | Structured terminal Session Outcome protocol and attach-presentation tests. |
 | `netlaglab_process_tests` | Local unprivileged Workload-launch tests using `netlaglab-workload-probe`. |
 
 ## Process and IPC topology
@@ -67,7 +68,9 @@ main
          -> adapter.wait(): poll helper.sock, self-pipe, and active Controller fds
          -> adapter.request_stop(): send STOP TERM or STOP KILL
          -> adapter.reap_launcher(): close helper channel and reap sudo
-         -> adapter.finalize(): remove control.sock and notify the Controller
+         -> adapter.finalize(): remove control.sock
+         -> append Supervisor cleanup failure when necessary
+         -> adapter.publish_outcome(): notify the Controller without changing the outcome
       -> session_presentation maps SessionOutcome to diagnostics and CLI status
 ```
 
@@ -221,8 +224,25 @@ lifecycle adapter consumes only typed disconnect/stop outcomes.
 | `detach` | Send `DETACHED` and close only this Controller. |
 
 Controller EOF, detach, protocol failure, or connection loss does not stop the
-Session. A clean Session completion sends `SESSION_ENDED`; infrastructure
-failure sends `SESSION_FAILED`.
+Session. After helper cleanup, launcher reaping, and Supervisor cleanup, a new
+Supervisor serializes the final typed `SessionOutcome` as one bounded block:
+
+```text
+SESSION_OUTCOME_BEGIN
+WORKLOAD EXIT <0..255> | WORKLOAD SIGNAL <1..127> | WORKLOAD UNKNOWN
+INFRASTRUCTURE OK | INFRASTRUCTURE FAILED
+FAILURE <allowlisted stage>  # one or more lines only after FAILED
+SESSION_OUTCOME_END
+```
+
+The shared `controller_session_outcome` boundary owns serialization, incremental
+parsing, exact tokens, ranges, duplicate rejection, structural ordering, and
+the 1024-byte exchange limit. `INFRASTRUCTURE OK` requires a known Workload
+result; `INFRASTRUCTURE FAILED` requires at least one failure. A terminal send
+failure is Controller loss and cannot change the already final Session Outcome.
+The attach client maps the typed value to its own output and status policy and
+continues to accept legacy `SESSION_ENDED`/`SESSION_FAILED` input from an older
+Supervisor. New Supervisors do not emit the legacy lines.
 
 ## Resource ownership and cleanup
 
@@ -248,6 +268,10 @@ failure sends `SESSION_FAILED`.
   units, numeric bounds and normalization, every structured parser error,
   partial/oversized framing, fixed responses, connection policy, status,
   stop, and detach;
+- terminal Session Outcome: clean exit/signal, all allowlisted infrastructure
+  failures, known/unknown Workload results, fragmentation/coalescing, malformed
+  and impossible blocks, bounds, legacy input, attach presentation, cleanup
+  ordering, and delivery-failure independence;
 - context: byte-preserving round trip, duplicates/order, malformed input,
   invalid ordering, and bounds;
 - process: exec-success handshake, first `PATH=`, missing/non-executable

@@ -67,10 +67,22 @@ Only one controller can be connected at a time. After a successful `detach`, ano
 `netlaglab attach` can connect to the same session. End-of-file on the controller's standard input
 (for example, Ctrl-D on an empty terminal line) requests the same controlled detach.
 
-If the application ends while a controller is connected, the controller receives a terminal
-session message, prints `Session ended.`, and exits successfully. If the socket instead reaches
-EOF without a terminal session message, the result of the application is unknown and the
-controller reports:
+If the application ends while a controller is connected, the Supervisor waits for helper
+cleanup, launcher reaping, and its own cleanup before sending the complete Session Outcome.
+For an infrastructure-clean Session, the controller prints either
+`Session ended; Workload exit code: <code>.` or
+`Session ended; Workload terminated by signal <n>.` and exits successfully. Its exit status
+describes successful observation of the Session, so it remains zero even when the Workload exit
+code was nonzero.
+
+If Session infrastructure failed, the controller reports every failed infrastructure stage and
+then the known Workload result, or explicitly says that the Workload result is unknown. It exits
+with status 1. The client still accepts the legacy `SESSION_ENDED` and `SESSION_FAILED` messages
+from an older Supervisor without inventing typed details, but a new Supervisor emits only the
+structured Session Outcome block.
+
+If the socket instead reaches EOF without a complete terminal Session Outcome, the result of the
+application is unknown and the controller reports:
 
 ```text
 NetLagLab: connection to session lost; session result is unknown.
@@ -80,8 +92,8 @@ NetLagLab: connection to session lost; session result is unknown.
 
 | Status | Meaning |
 |---:|---|
-| 0 | The controller detached successfully, or the session ended normally. |
-| 1 | There is no session, another controller is attached, the connection failed, or the connection ended unexpectedly. |
+| 0 | The controller detached successfully, or it observed an infrastructure-clean Session end. |
+| 1 | There is no session, another controller is attached, Session infrastructure failed, the protocol was invalid, the connection failed, or the connection ended unexpectedly. |
 | 2 | The `attach` command has invalid syntax. |
 
 ## Run exit status

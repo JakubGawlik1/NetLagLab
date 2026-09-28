@@ -159,10 +159,11 @@ SessionOutcome run_session_lifecycle(LifecycleAdapter& adapter)
         outcome.infrastructure_failures.push_back(
             InfrastructureFailure::launcher_reaping);
     }
-    if (!adapter.finalize(outcome.infrastructure_succeeded())) {
+    if (!adapter.finalize()) {
         outcome.infrastructure_failures.push_back(
             InfrastructureFailure::supervisor_cleanup);
     }
+    adapter.publish_outcome(outcome);
 
     return outcome;
 }
