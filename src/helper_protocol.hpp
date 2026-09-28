@@ -101,5 +101,6 @@ inline constexpr std::string_view helper_error_prefix{"ERROR "};
 [[nodiscard]] std::string helper_conversation_event_message(
     HelperConversationEventKind event,
     int value = 0);
+[[nodiscard]] std::string helper_error_message(std::string_view safe_message);
 
 } // namespace netlaglab

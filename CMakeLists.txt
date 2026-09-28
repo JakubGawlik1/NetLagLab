@@ -15,11 +15,14 @@ endif()
 add_executable(
     netlaglab
     src/attach_client.cpp
+    src/controller_control_plane.cpp
     src/helper_process.cpp
     src/helper_protocol.cpp
     src/main.cpp
+    src/process_status.cpp
     src/session.cpp
     src/session_lifecycle.cpp
+    src/session_presentation.cpp
     src/session_paths.cpp
     src/socket_io.cpp
     src/session_socket.cpp
@@ -40,6 +43,7 @@ add_executable(
     netlaglab-helper
     src/helper_protocol.cpp
     src/helper_main.cpp
+    src/process_status.cpp
     src/session_socket.cpp
     src/session_validation.cpp
     src/socket_io.cpp
@@ -84,6 +88,7 @@ if(BUILD_TESTING)
     add_executable(
         netlaglab_lifecycle_tests
         src/session_lifecycle.cpp
+        src/session_presentation.cpp
         tests/session_lifecycle_test.cpp
     )
     target_include_directories(netlaglab_lifecycle_tests PRIVATE src)
@@ -127,6 +132,37 @@ if(BUILD_TESTING)
 
     gtest_discover_tests(netlaglab_protocol_tests)
 
+    add_executable(
+        netlaglab_controller_protocol_tests
+        src/controller_control_plane.cpp
+        src/socket_io.cpp
+        tests/controller_control_plane_test.cpp
+    )
+    target_include_directories(netlaglab_controller_protocol_tests PRIVATE src)
+    target_link_libraries(
+        netlaglab_controller_protocol_tests
+        PRIVATE
+            netlaglab_core
+            GTest::gtest_main
+    )
+    target_compile_features(netlaglab_controller_protocol_tests PRIVATE cxx_std_20)
+    set_target_properties(
+        netlaglab_controller_protocol_tests
+        PROPERTIES CXX_EXTENSIONS OFF
+    )
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_controller_protocol_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    gtest_discover_tests(netlaglab_controller_protocol_tests)
+
     add_executable(netlaglab-workload-probe tests/workload_probe.cpp)
     target_compile_features(netlaglab-workload-probe PRIVATE cxx_std_20)
     set_target_properties(netlaglab-workload-probe PROPERTIES CXX_EXTENSIONS OFF)
@@ -142,10 +178,12 @@ if(BUILD_TESTING)
 
     add_executable(
         netlaglab_process_tests
+        src/process_status.cpp
         src/workload_context.cpp
         src/workload_process.cpp
         src/socket_io.cpp
         tests/workload_process_test.cpp
+        tests/process_status_test.cpp
     )
     target_include_directories(netlaglab_process_tests PRIVATE src)
     target_link_libraries(netlaglab_process_tests PRIVATE GTest::gtest_main)

@@ -1,9 +1,12 @@
 #include "session_lifecycle.hpp"
+#include "session_presentation.hpp"
 
 #include <gtest/gtest.h>
 
 #include <deque>
 #include <initializer_list>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace netlaglab {
@@ -80,7 +83,7 @@ TEST(SessionLifecycleTest, ReturnsWorkloadOutcomeAfterCleanupAndLauncherReaping)
     EXPECT_EQ(outcome.workload->kind, WorkloadResultKind::exited);
     EXPECT_EQ(outcome.workload->value, 23);
     EXPECT_TRUE(outcome.infrastructure_succeeded());
-    EXPECT_EQ(outcome.exit_code(), 23);
+    EXPECT_EQ(session_exit_status(outcome), 23);
     EXPECT_TRUE(adapter.began);
     EXPECT_TRUE(adapter.launcher_reaped);
 }
@@ -97,7 +100,7 @@ TEST(SessionLifecycleTest, PreservesPreActivationStartFailureAfterCleanRollback)
     EXPECT_EQ(outcome.workload->kind, WorkloadResultKind::start_failure);
     EXPECT_EQ(outcome.workload->value, 127);
     EXPECT_TRUE(outcome.infrastructure_succeeded());
-    EXPECT_EQ(outcome.exit_code(), 127);
+    EXPECT_EQ(session_exit_status(outcome), 127);
     EXPECT_TRUE(adapter.launcher_reaped);
 }
 
@@ -116,10 +119,10 @@ TEST(SessionLifecycleTest, DistinguishesPermissionAndInfrastructureStartFailures
 
     ASSERT_TRUE(permission.workload.has_value());
     EXPECT_EQ(permission.workload->kind, WorkloadResultKind::start_failure);
-    EXPECT_EQ(permission.exit_code(), 126);
+    EXPECT_EQ(session_exit_status(permission), 126);
     EXPECT_FALSE(infrastructure.workload.has_value());
     EXPECT_FALSE(infrastructure.infrastructure_succeeded());
-    EXPECT_EQ(infrastructure.exit_code(), 125);
+    EXPECT_EQ(session_exit_status(infrastructure), 125);
 }
 
 TEST(SessionLifecycleTest, ClassifiesImmediateExitAsActivatedWorkloadOutcome)
@@ -133,7 +136,7 @@ TEST(SessionLifecycleTest, ClassifiesImmediateExitAsActivatedWorkloadOutcome)
 
     ASSERT_TRUE(outcome.workload.has_value());
     EXPECT_EQ(outcome.workload->kind, WorkloadResultKind::exited);
-    EXPECT_EQ(outcome.exit_code(), 0);
+    EXPECT_EQ(session_exit_status(outcome), 0);
 }
 
 TEST(SessionLifecycleTest, CleanupFailureOverridesButPreservesWorkloadOutcome)
@@ -148,7 +151,7 @@ TEST(SessionLifecycleTest, CleanupFailureOverridesButPreservesWorkloadOutcome)
     ASSERT_TRUE(outcome.workload.has_value());
     EXPECT_EQ(outcome.workload->value, 7);
     EXPECT_FALSE(outcome.infrastructure_succeeded());
-    EXPECT_EQ(outcome.exit_code(), 125);
+    EXPECT_EQ(session_exit_status(outcome), 125);
 }
 
 TEST(SessionLifecycleTest, LauncherReapingFailureOverridesButPreservesWorkloadOutcome)
@@ -163,7 +166,7 @@ TEST(SessionLifecycleTest, LauncherReapingFailureOverridesButPreservesWorkloadOu
 
     ASSERT_TRUE(outcome.workload.has_value());
     EXPECT_EQ(outcome.workload->value, 9);
-    EXPECT_EQ(outcome.exit_code(), 125);
+    EXPECT_EQ(session_exit_status(outcome), 125);
 }
 
 TEST(SessionLifecycleTest, HelperLossIsInfrastructureFailure)
@@ -175,7 +178,7 @@ TEST(SessionLifecycleTest, HelperLossIsInfrastructureFailure)
     const SessionOutcome outcome{run_session_lifecycle(adapter)};
 
     EXPECT_FALSE(outcome.infrastructure_succeeded());
-    EXPECT_EQ(outcome.exit_code(), 125);
+    EXPECT_EQ(session_exit_status(outcome), 125);
     EXPECT_TRUE(adapter.launcher_reaped);
 }
 
@@ -191,7 +194,7 @@ TEST(SessionLifecycleTest, HelperLossPreservesKnownWorkloadOutcome)
     ASSERT_TRUE(outcome.workload.has_value());
     EXPECT_EQ(outcome.workload->value, 12);
     EXPECT_FALSE(outcome.infrastructure_succeeded());
-    EXPECT_EQ(outcome.exit_code(), 125);
+    EXPECT_EQ(session_exit_status(outcome), 125);
 }
 
 TEST(SessionLifecycleTest, ControllerLossDoesNotStopSession)
@@ -204,7 +207,7 @@ TEST(SessionLifecycleTest, ControllerLossDoesNotStopSession)
 
     const SessionOutcome outcome{run_session_lifecycle(adapter)};
 
-    EXPECT_EQ(outcome.exit_code(), 4);
+    EXPECT_EQ(session_exit_status(outcome), 4);
     EXPECT_TRUE(adapter.stop_requests.empty());
 }
 
@@ -223,7 +226,7 @@ TEST(SessionLifecycleTest, FirstInterruptUsesGracePeriodsBeforeTermAndKill)
     ASSERT_EQ(adapter.stop_requests.size(), 2U);
     EXPECT_EQ(adapter.stop_requests[0], StopRequest::terminate);
     EXPECT_EQ(adapter.stop_requests[1], StopRequest::kill);
-    EXPECT_EQ(outcome.exit_code(), 137);
+    EXPECT_EQ(session_exit_status(outcome), 137);
 }
 
 TEST(SessionLifecycleTest, SecondInterruptRequestsImmediateKill)
@@ -239,7 +242,58 @@ TEST(SessionLifecycleTest, SecondInterruptRequestsImmediateKill)
 
     ASSERT_EQ(adapter.stop_requests.size(), 1U);
     EXPECT_EQ(adapter.stop_requests.front(), StopRequest::kill);
-    EXPECT_EQ(outcome.exit_code(), 137);
+    EXPECT_EQ(session_exit_status(outcome), 137);
+}
+
+TEST(SessionLifecycleTest, TerminalEventCancelsQueuedControllerAndSignalEvents)
+{
+    ScriptedLifecycleAdapter adapter{
+        {{LifecycleEventKind::activated, 4321},
+         {LifecycleEventKind::workload_exited, 6},
+         {LifecycleEventKind::stop_requested},
+         {LifecycleEventKind::terminal_interrupt},
+         {LifecycleEventKind::cleanup_succeeded}}};
+
+    const SessionOutcome outcome{run_session_lifecycle(adapter)};
+
+    ASSERT_TRUE(outcome.workload.has_value());
+    EXPECT_EQ(outcome.workload->value, 6);
+    EXPECT_TRUE(outcome.infrastructure_succeeded());
+    EXPECT_TRUE(adapter.stop_requests.empty());
+}
+
+TEST(SessionLifecycleTest, WorkloadResultEndsAnActiveStopDeadline)
+{
+    ScriptedLifecycleAdapter adapter{
+        {{LifecycleEventKind::activated, 4321},
+         {LifecycleEventKind::terminal_interrupt},
+         {LifecycleEventKind::workload_signaled, 2},
+         {LifecycleEventKind::cleanup_succeeded}}};
+
+    const SessionOutcome outcome{run_session_lifecycle(adapter)};
+
+    ASSERT_TRUE(outcome.infrastructure_succeeded());
+    ASSERT_GE(adapter.waits.size(), 4U);
+    EXPECT_EQ(adapter.waits.back(), LifecycleWait::indefinitely);
+}
+
+TEST(SessionPresentationTest, ReportsEveryInfrastructureFailureAndWorkloadResult)
+{
+    const SessionOutcome outcome{
+        .workload = WorkloadResult{WorkloadResultKind::exited, 7},
+        .infrastructure_failures = {
+            InfrastructureFailure::conversation,
+            InfrastructureFailure::cleanup,
+        },
+    };
+    std::ostringstream error;
+
+    report_session_outcome(outcome, error);
+
+    EXPECT_EQ(session_exit_status(outcome), 125);
+    EXPECT_NE(error.str().find("helper conversation"), std::string::npos);
+    EXPECT_NE(error.str().find("privileged cleanup"), std::string::npos);
+    EXPECT_NE(error.str().find("Workload result was 7"), std::string::npos);
 }
 
 } // namespace

@@ -184,6 +184,14 @@ std::string helper_conversation_event_message(
     return {};
 }
 
+std::string helper_error_message(const std::string_view safe_message)
+{
+    std::string message{helper_error_prefix};
+    message.append(safe_message);
+    message.push_back('\n');
+    return message;
+}
+
 std::vector<HelperConversationEvent> SupervisorHelperConversation::receive_bytes(
     const std::string_view bytes)
 {

@@ -17,7 +17,9 @@ the [runtime call map](../runtime_call_map.md).
   terminal/closed-descriptor preservation;
 - mutual `SO_PEERCRED` checks, launcher-process-tree binding, a root-owned
   `/run/netlaglab/host.lock`, and publication of `control.sock` only after
-  explicit activation;
+  explicit activation; while waiting for the initial connection, the helper
+  also watches a `pidfd` bound to the launching Supervisor and verifies its
+  `/proc` start time to reject PID reuse before `pidfd_open()`;
 - helper-owned `fork`/`execve`, exact UID/GID/supplementary-group restoration,
   `PR_SET_PDEATHSIG(SIGKILL)`, `PR_SET_NO_NEW_PRIVS`, direct-PID signalling,
   Workload reaping, and exec-success evidence through a close-on-exec pipe;
@@ -25,7 +27,8 @@ the [runtime call map](../runtime_call_map.md).
   activation/start-failure/Workload-result/cleanup events, and terminal EOF
   handling;
 - non-blocking self-pipe signal integration, Controller `stop`, first/second
-  Ctrl-C escalation, helper-loss handling, and bounded launcher reaping;
+  Ctrl-C escalation, terminal-event cancellation of queued Controller/signal
+  events, helper-loss handling, and bounded launcher reaping;
 - focused lifecycle, protocol, context, and local-process tests.
 
 ## Not implemented in this checkpoint

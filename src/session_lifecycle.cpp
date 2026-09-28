@@ -2,27 +2,9 @@
 
 namespace netlaglab {
 
-int WorkloadResult::exit_code() const noexcept
-{
-    if (kind == WorkloadResultKind::signaled) {
-        return 128 + value;
-    }
-
-    return value;
-}
-
 bool SessionOutcome::infrastructure_succeeded() const noexcept
 {
     return infrastructure_failures.empty();
-}
-
-int SessionOutcome::exit_code() const noexcept
-{
-    if (!infrastructure_succeeded() || !workload.has_value()) {
-        return 125;
-    }
-
-    return workload->exit_code();
 }
 
 SessionOutcome run_session_lifecycle(LifecycleAdapter& adapter)
@@ -54,6 +36,12 @@ SessionOutcome run_session_lifecycle(LifecycleAdapter& adapter)
                                 : LifecycleWait::indefinitely)};
 
             if (event.kind == LifecycleEventKind::controller_lost) {
+                continue;
+            }
+
+            if (state == State::waiting_for_cleanup
+                && (event.kind == LifecycleEventKind::terminal_interrupt
+                    || event.kind == LifecycleEventKind::stop_requested)) {
                 continue;
             }
 
@@ -147,6 +135,7 @@ SessionOutcome run_session_lifecycle(LifecycleAdapter& adapter)
                     outcome.workload = WorkloadResult{
                         WorkloadResultKind::exited, event.value};
                     state = State::waiting_for_cleanup;
+                    stop_stage = StopStage::none;
                     continue;
                 }
 
@@ -154,6 +143,7 @@ SessionOutcome run_session_lifecycle(LifecycleAdapter& adapter)
                     outcome.workload = WorkloadResult{
                         WorkloadResultKind::signaled, event.value};
                     state = State::waiting_for_cleanup;
+                    stop_stage = StopStage::none;
                     continue;
                 }
             } else if (event.kind == LifecycleEventKind::cleanup_succeeded) {

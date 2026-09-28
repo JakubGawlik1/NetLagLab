@@ -82,6 +82,7 @@ TEST(HelperProtocolTest, ParsesOnlyAllowlistedRuntimeCommands)
         parse_helper_runtime_command("SHUTDOWN"),
         HelperRuntimeCommand::shutdown);
     EXPECT_FALSE(parse_helper_runtime_command("STOP 9").has_value());
+    EXPECT_EQ(helper_error_message("Safe failure."), "ERROR Safe failure.\n");
 }
 
 TEST(HelperProtocolTest, HelperFramesPartialAndCoalescedStartBlock)

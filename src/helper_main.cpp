@@ -1,5 +1,6 @@
 #include "file_descriptor.hpp"
 #include "helper_protocol.hpp"
+#include "process_status.hpp"
 #include "session_paths.hpp"
 #include "session_socket.hpp"
 #include "session_validation.hpp"
@@ -10,6 +11,7 @@
 #include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
@@ -22,6 +24,7 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <system_error>
 #include <unistd.h>
@@ -35,19 +38,24 @@ namespace {
 using namespace std::chrono_literals;
 
 constexpr std::string_view usage{
-    "Usage: netlaglab-helper --runtime-dir <absolute-path>\n"};
+    "Usage: netlaglab-helper --runtime-dir <absolute-path> "
+    "--supervisor-pid <pid> --supervisor-start-time <ticks>\n"};
 constexpr int usage_error_exit_code{2};
 constexpr std::string_view global_runtime_directory{"/run/netlaglab"};
 constexpr std::string_view global_lock_name{"host.lock"};
+constexpr int supervisor_connection_poll_timeout_ms{100};
+
+struct ValidatedSession {
+    netlaglab::FileDescriptor directory;
+    netlaglab::FileDescriptor supervisor_lock;
+};
 
 [[nodiscard]] bool send_helper_error(
     const int supervisor_descriptor,
     const std::string_view message)
 {
-    std::string response{netlaglab::helper_error_prefix};
-    response.append(message);
-    response.push_back('\n');
-    return netlaglab::send_socket_text(supervisor_descriptor, response);
+    return netlaglab::send_socket_text(
+        supervisor_descriptor, netlaglab::helper_error_message(message));
 }
 
 [[nodiscard]] bool cleanup_helper_listener(
@@ -65,7 +73,7 @@ constexpr std::string_view global_lock_name{"host.lock"};
     return false;
 }
 
-[[nodiscard]] std::optional<netlaglab::FileDescriptor> validate_session(
+[[nodiscard]] std::optional<ValidatedSession> validate_session(
     const netlaglab::SessionPaths& paths,
     const uid_t expected_owner,
     std::ostream& error)
@@ -109,7 +117,82 @@ constexpr std::string_view global_lock_name{"host.lock"};
               << std::strerror(errno) << '\n';
         return std::nullopt;
     }
-    return session_directory;
+    return ValidatedSession{
+        std::move(*session_directory),
+        std::move(session_lock),
+    };
+}
+
+[[nodiscard]] std::optional<netlaglab::FileDescriptor> accept_supervisor(
+    const int listening_descriptor,
+    const int supervisor_process_descriptor,
+    std::ostream& error)
+{
+    while (true) {
+        std::array<struct pollfd, 2> descriptors{{
+            {listening_descriptor, POLLIN, 0},
+            {supervisor_process_descriptor, POLLIN, 0},
+        }};
+        int poll_result{};
+        do {
+            poll_result = poll(
+                descriptors.data(), descriptors.size(),
+                supervisor_connection_poll_timeout_ms);
+        } while (poll_result == -1 && errno == EINTR);
+
+        if (poll_result == -1
+            || (descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
+            || (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            error << "NetLagLab helper: failed while waiting for Supervisor connection\n";
+            return std::nullopt;
+        }
+
+        if ((descriptors[1].revents & POLLIN) != 0) {
+            error << "NetLagLab helper: Supervisor exited before connecting\n";
+            return std::nullopt;
+        }
+        if (poll_result == 0) {
+            continue;
+        }
+
+        int supervisor_descriptor{};
+        do {
+            supervisor_descriptor = accept4(
+                listening_descriptor, nullptr, nullptr, SOCK_CLOEXEC);
+        } while (supervisor_descriptor == -1 && errno == EINTR);
+        if (supervisor_descriptor == -1) {
+            error << "NetLagLab helper: failed to accept Supervisor: "
+                  << std::strerror(errno) << '\n';
+            return std::nullopt;
+        }
+
+        return netlaglab::FileDescriptor{supervisor_descriptor};
+    }
+}
+
+[[nodiscard]] std::optional<pid_t> parse_supervisor_pid(
+    const std::string_view text)
+{
+    pid_t pid{};
+    const auto result{std::from_chars(text.data(), text.data() + text.size(), pid)};
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()
+        || pid <= 1) {
+        return std::nullopt;
+    }
+    return pid;
+}
+
+[[nodiscard]] std::optional<std::uint64_t> parse_supervisor_start_time(
+    const std::string_view text)
+{
+    std::uint64_t start_time{};
+    const auto result{
+        std::from_chars(text.data(), text.data() + text.size(), start_time)};
+    if (result.ec != std::errc{} || result.ptr != text.data() + text.size()
+        || start_time == 0) {
+        return std::nullopt;
+    }
+    return start_time;
 }
 
 template<typename Id>
@@ -441,16 +524,43 @@ int usage_error(const std::string_view message)
 
 int run_helper(const int argc, char* argv[])
 {
-    if (argc != 3 || std::string_view{argv[1]} != "--runtime-dir") {
-        return usage_error("expected '--runtime-dir' followed by a path");
+    if (argc != 7 || std::string_view{argv[1]} != "--runtime-dir"
+        || std::string_view{argv[3]} != "--supervisor-pid"
+        || std::string_view{argv[5]} != "--supervisor-start-time") {
+        return usage_error("expected runtime directory and Supervisor identity");
     }
     const std::string_view runtime_directory{argv[2]};
     if (runtime_directory.empty() || runtime_directory.front() != '/') {
         return usage_error("runtime directory must be an absolute path");
     }
+    const std::optional<pid_t> supervisor_pid{parse_supervisor_pid(argv[4])};
+    if (!supervisor_pid.has_value()) {
+        return usage_error("Supervisor PID must be a positive process ID");
+    }
+    const std::optional<std::uint64_t> supervisor_start_time{
+        parse_supervisor_start_time(argv[6])};
+    if (!supervisor_start_time.has_value()) {
+        return usage_error("Supervisor start time must be positive");
+    }
     if (geteuid() != 0) {
         std::cerr << "NetLagLab helper: root privileges are required\n";
         return EXIT_FAILURE;
+    }
+
+    const int supervisor_process_descriptor{
+        static_cast<int>(syscall(SYS_pidfd_open, *supervisor_pid, 0))};
+    if (supervisor_process_descriptor == -1) {
+        std::cerr << "NetLagLab helper: failed to monitor the launching Supervisor: "
+                  << std::strerror(errno) << '\n';
+        return 125;
+    }
+    netlaglab::FileDescriptor supervisor_process{supervisor_process_descriptor};
+    const std::optional<netlaglab::ProcessStatus> supervisor_status{
+        netlaglab::read_process_status(*supervisor_pid)};
+    if (!supervisor_status.has_value()
+        || supervisor_status->start_time_ticks != *supervisor_start_time) {
+        std::cerr << "NetLagLab helper: launching Supervisor identity changed\n";
+        return 125;
     }
 
     const auto invoking_ids{read_invoking_ids(std::cerr)};
@@ -458,13 +568,13 @@ int run_helper(const int argc, char* argv[])
         return 125;
     }
     const netlaglab::SessionPaths paths{std::string{runtime_directory}};
-    const auto session_directory{validate_session(paths, invoking_ids->uid, std::cerr)};
-    if (!session_directory.has_value()) {
+    auto session{validate_session(paths, invoking_ids->uid, std::cerr)};
+    if (!session.has_value()) {
         return 125;
     }
 
     netlaglab::SocketPathOwner helper_socket_path_owner{
-        session_directory->get(), netlaglab::SessionPaths::helper_socket_name,
+        session->directory.get(), netlaglab::SessionPaths::helper_socket_name,
         paths.helper_socket(), invoking_ids->uid};
     if (!helper_socket_path_owner.remove_stale(std::cerr)) {
         return 125;
@@ -477,25 +587,21 @@ int run_helper(const int argc, char* argv[])
     }
     netlaglab::FileDescriptor listening_socket{listening_descriptor};
 
-    int supervisor_descriptor{};
-    do {
-        supervisor_descriptor = accept4(
-            listening_socket.get(), nullptr, nullptr, SOCK_CLOEXEC);
-    } while (supervisor_descriptor == -1 && errno == EINTR);
-    if (supervisor_descriptor == -1) {
-        std::cerr << "NetLagLab helper: failed to accept supervisor: "
-                  << std::strerror(errno) << '\n';
+    std::optional<netlaglab::FileDescriptor> supervisor_socket{
+        accept_supervisor(
+            listening_socket.get(), supervisor_process.get(), std::cerr)};
+    if (!supervisor_socket.has_value()) {
         (void)cleanup_helper_listener(listening_socket, helper_socket_path_owner, std::cerr);
         return 125;
     }
-    const netlaglab::FileDescriptor supervisor_socket{supervisor_descriptor};
 
     struct ucred peer_credentials {};
     socklen_t credentials_size{sizeof(peer_credentials)};
     if (getsockopt(
-            supervisor_socket.get(), SOL_SOCKET, SO_PEERCRED,
+            supervisor_socket->get(), SOL_SOCKET, SO_PEERCRED,
             &peer_credentials, &credentials_size) == -1
         || credentials_size != static_cast<socklen_t>(sizeof(peer_credentials))
+        || peer_credentials.pid != *supervisor_pid
         || peer_credentials.uid != invoking_ids->uid
         || peer_credentials.gid != invoking_ids->gid) {
         std::cerr << "NetLagLab helper: rejected connection from an unexpected user\n";
@@ -513,7 +619,7 @@ int run_helper(const int argc, char* argv[])
 
     auto global_lock{acquire_global_lock(std::cerr)};
     if (!global_lock.has_value()) {
-        (void)send_helper_error(supervisor_socket.get(), "Host-wide Session lock unavailable.");
+        (void)send_helper_error(supervisor_socket->get(), "Host-wide Session lock unavailable.");
         (void)cleanup_helper_listener(listening_socket, helper_socket_path_owner, std::cerr);
         return 125;
     }
@@ -525,25 +631,25 @@ int run_helper(const int argc, char* argv[])
     ignore_interrupt.sa_handler = SIG_IGN;
     sigemptyset(&ignore_interrupt.sa_mask);
     if (sigaction(SIGINT, &ignore_interrupt, nullptr) == -1) {
-        (void)send_helper_error(supervisor_socket.get(), "Failed to install signal policy.");
+        (void)send_helper_error(supervisor_socket->get(), "Failed to install signal policy.");
         return 125;
     }
     if (!netlaglab::send_socket_text(
-            supervisor_socket.get(),
+            supervisor_socket->get(),
             netlaglab::helper_conversation_event_message(
                 netlaglab::HelperConversationEventKind::ready))) {
         return 125;
     }
 
     const auto received_standard_descriptors{
-        netlaglab::receive_standard_descriptors(supervisor_socket.get())};
+        netlaglab::receive_standard_descriptors(supervisor_socket->get())};
     if (!received_standard_descriptors.has_value()) {
         (void)send_helper_error(
-            supervisor_socket.get(), "Invalid standard-descriptor transfer.");
+            supervisor_socket->get(), "Invalid standard-descriptor transfer.");
         return 125;
     }
 
-    const auto context{read_start_block(supervisor_socket.get(), std::cerr)};
+    const auto context{read_start_block(supervisor_socket->get(), std::cerr)};
     if (!context.has_value()) {
         return 125;
     }
@@ -562,20 +668,20 @@ int run_helper(const int argc, char* argv[])
         netlaglab::launch_workload(*context, identity, standard_descriptors)};
     if (!launch.process.has_value()) {
         const bool failure_reported{netlaglab::send_socket_text(
-            supervisor_socket.get(),
+            supervisor_socket->get(),
             netlaglab::helper_conversation_event_message(
                 netlaglab::HelperConversationEventKind::activation_failed,
                 launch.failure_exit_code))};
         global_lock->reset();
         const bool reported{failure_reported
             && netlaglab::send_socket_text(
-                   supervisor_socket.get(),
+                   supervisor_socket->get(),
                    netlaglab::helper_conversation_event_message(
                        netlaglab::HelperConversationEventKind::cleanup_succeeded))};
         return reported ? 0 : 125;
     }
     if (!netlaglab::send_socket_text(
-            supervisor_socket.get(),
+            supervisor_socket->get(),
             netlaglab::helper_conversation_event_message(
                 netlaglab::HelperConversationEventKind::activated,
                 launch.process->pid()))) {
@@ -583,7 +689,7 @@ int run_helper(const int argc, char* argv[])
         return 125;
     }
     return supervise_workload(
-        supervisor_socket.get(), std::move(*launch.process), *global_lock, std::cerr);
+        supervisor_socket->get(), std::move(*launch.process), *global_lock, std::cerr);
 }
 
 } // namespace

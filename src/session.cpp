@@ -1,16 +1,16 @@
 #include "session.hpp"
 
+#include "controller_control_plane.hpp"
 #include "file_descriptor.hpp"
 #include "helper_process.hpp"
 #include "helper_protocol.hpp"
 #include "session_lifecycle.hpp"
 #include "session_paths.hpp"
+#include "session_presentation.hpp"
 #include "session_socket.hpp"
 #include "session_validation.hpp"
 #include "socket_io.hpp"
 #include "workload_context.hpp"
-
-#include "netlaglab/network_profile.hpp"
 
 #include <array>
 #include <cerrno>
@@ -23,9 +23,7 @@
 #include <optional>
 #include <ostream>
 #include <poll.h>
-#include <sstream>
 #include <string>
-#include <string_view>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -37,9 +35,6 @@ namespace netlaglab {
 namespace {
 
 using namespace std::chrono_literals;
-
-constexpr std::size_t maximum_command_size{1024};
-constexpr std::size_t maximum_status_size{8 * 1024};
 
 volatile std::sig_atomic_t signal_pipe_write_descriptor{-1};
 
@@ -147,218 +142,12 @@ private:
     bool installed_{true};
 };
 
-[[nodiscard]] bool append_escaped_limited(
-    std::string& output,
-    const std::string_view input,
-    const std::size_t limit)
-{
-    constexpr std::string_view hex_digits{"0123456789ABCDEF"};
-    const auto append_piece = [&output, limit](const std::string_view piece) {
-        if (output.size() > limit || piece.size() > limit - output.size()) {
-            return false;
-        }
-        output.append(piece);
-        return true;
-    };
-
-    for (const unsigned char byte : input) {
-        if (byte == '\\') {
-            if (!append_piece("\\\\")) {
-                return false;
-            }
-        } else if (byte == '\t') {
-            if (!append_piece("\\t")) {
-                return false;
-            }
-        } else if (byte == '\n') {
-            if (!append_piece("\\n")) {
-                return false;
-            }
-        } else if (byte == '\r') {
-            if (!append_piece("\\r")) {
-                return false;
-            }
-        } else if (byte < 0x20 || byte == 0x7F) {
-            const std::array<char, 4> escaped{
-                '\\', 'x', hex_digits[byte >> 4], hex_digits[byte & 0x0F]};
-            if (!append_piece(std::string_view{escaped.data(), escaped.size()})) {
-                return false;
-            }
-        } else {
-            const char character{static_cast<char>(byte)};
-            if (!append_piece(std::string_view{&character, 1})) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-[[nodiscard]] std::string escape_command(const std::string_view command)
-{
-    std::string escaped;
-    escaped.reserve(command.size());
-    (void)append_escaped_limited(escaped, command, maximum_command_size * 4);
-    return escaped;
-}
-
-void append_direction_status(
-    std::ostringstream& output,
-    const std::string_view name,
-    const DirectionSettings& settings)
-{
-    output << name << ":\n"
-           << "  delay: " << settings.delay.count() << " ms\n"
-           << "  jitter: " << settings.jitter.count() << " ms\n"
-           << "  packet loss: " << settings.packet_loss_percent << "%\n"
-           << "  bandwidth: ";
-    if (settings.bandwidth_kbps.has_value()) {
-        output << *settings.bandwidth_kbps << " kbps\n";
-    } else {
-        output << "unlimited\n";
-    }
-}
-
-[[nodiscard]] std::string build_status(
-    const pid_t workload_pid,
-    char* const child_arguments[])
-{
-    const NetworkProfile profile{};
-    std::ostringstream tail_stream;
-    tail_stream << "shaping: not applied\n";
-    append_direction_status(tail_stream, "outbound", profile.outbound);
-    append_direction_status(tail_stream, "inbound", profile.inbound);
-    tail_stream << "STATUS_END\n";
-    const std::string tail{tail_stream.str()};
-
-    constexpr std::string_view truncated_notice{"arguments: truncated\n"};
-    const std::size_t content_limit{
-        maximum_status_size - tail.size() - truncated_notice.size()};
-    std::ostringstream header_stream;
-    header_stream << "STATUS_BEGIN\nstate: running\npid: " << workload_pid
-                  << "\nprogram: ";
-    std::string response{header_stream.str()};
-
-    bool truncated{false};
-    if (!append_escaped_limited(response, child_arguments[0], content_limit - 1)) {
-        truncated = true;
-    }
-    response.push_back('\n');
-    if (!truncated) {
-        for (std::size_t source_index{1}; child_arguments[source_index] != nullptr;
-             ++source_index) {
-            const std::string prefix{
-                "argument[" + std::to_string(source_index - 1) + "]: "};
-            if (response.size() + prefix.size() + 1 > content_limit) {
-                truncated = true;
-                break;
-            }
-            response.append(prefix);
-            if (!append_escaped_limited(
-                    response, child_arguments[source_index], content_limit - 1)) {
-                truncated = true;
-                response.push_back('\n');
-                break;
-            }
-            response.push_back('\n');
-        }
-    }
-    if (truncated) {
-        response.append(truncated_notice);
-    }
-    response.append(tail);
-    return response;
-}
-
-enum class CommandResult {
-    keep_connected,
-    disconnect,
-    stop_requested,
-};
-
-[[nodiscard]] CommandResult handle_command(
-    const int client_descriptor,
-    const std::string_view command,
-    const pid_t workload_pid,
-    char* const child_arguments[])
-{
-    if (command == "help") {
-        constexpr std::string_view help_response{
-            "HELP_BEGIN\n"
-            "help - Show controller commands\n"
-            "status - Show the active session\n"
-            "stop - Stop the active Workload\n"
-            "detach - Disconnect this controller\n"
-            "HELP_END\n"};
-        return send_socket_text(client_descriptor, help_response)
-            ? CommandResult::keep_connected : CommandResult::disconnect;
-    }
-    if (command == "status") {
-        const std::string status{build_status(workload_pid, child_arguments)};
-        return send_socket_text(client_descriptor, status)
-            ? CommandResult::keep_connected : CommandResult::disconnect;
-    }
-    if (command == "stop") {
-        return send_socket_text(client_descriptor, "STOPPING\n")
-            ? CommandResult::stop_requested : CommandResult::disconnect;
-    }
-    if (command == "detach") {
-        (void)send_socket_text(client_descriptor, "DETACHED\n");
-        return CommandResult::disconnect;
-    }
-    const std::string response{"ERROR Unknown command: " + escape_command(command) + '\n'};
-    return send_socket_text(client_descriptor, response)
-        ? CommandResult::keep_connected : CommandResult::disconnect;
-}
-
-enum class ClientReadResult {
-    connected,
-    disconnected,
-    stop_requested,
-};
-
-[[nodiscard]] ClientReadResult read_client_commands(
-    const int client_descriptor,
-    std::string& command_buffer,
-    const pid_t workload_pid,
-    char* const child_arguments[])
-{
-    const SocketReadResult read_result{read_socket_data(client_descriptor, command_buffer)};
-    if (read_result.status != SocketReadStatus::data_received) {
-        return ClientReadResult::disconnected;
-    }
-    while (true) {
-        const std::optional<std::string> command{take_next_line(command_buffer)};
-        if (!command.has_value()) {
-            break;
-        }
-        if (command->size() > maximum_command_size) {
-            (void)send_socket_text(client_descriptor, "ERROR Command exceeds 1024 bytes.\n");
-            return ClientReadResult::disconnected;
-        }
-        if (command->empty()) {
-            continue;
-        }
-        const CommandResult result{
-            handle_command(client_descriptor, *command, workload_pid, child_arguments)};
-        if (result == CommandResult::disconnect) {
-            return ClientReadResult::disconnected;
-        }
-        if (result == CommandResult::stop_requested) {
-            return ClientReadResult::stop_requested;
-        }
-    }
-    if (command_buffer.size() > maximum_command_size) {
-        (void)send_socket_text(client_descriptor, "ERROR Command exceeds 1024 bytes.\n");
-        return ClientReadResult::disconnected;
-    }
-    return ClientReadResult::connected;
-}
-
 [[nodiscard]] bool accept_controller(
     const int listening_descriptor,
     std::optional<FileDescriptor>& client,
-    std::string& command_buffer,
+    std::optional<ControllerConversation>& conversation,
+    const pid_t workload_pid,
+    char* const child_arguments[],
     std::ostream& error)
 {
     int accepted_descriptor{};
@@ -373,14 +162,14 @@ enum class ClientReadResult {
     }
     if (client.has_value()) {
         FileDescriptor rejected_client{accepted_descriptor};
-        (void)send_socket_text(
-            rejected_client.get(), "ERROR Another controller is already attached.\n");
+        reject_additional_controller(rejected_client.get());
         return true;
     }
     client.emplace(accepted_descriptor);
-    command_buffer.clear();
-    if (!send_socket_text(client->get(), "ATTACHED\n")) {
+    conversation.emplace(workload_pid, child_arguments);
+    if (!send_controller_attached(client->get())) {
         client.reset();
+        conversation.reset();
     }
     return true;
 }
@@ -444,24 +233,26 @@ public:
                 return false;
             }
 
-            for (const HelperConversationEvent event : events) {
-                if (event.kind == HelperConversationEventKind::ready) {
-                    if (!send_standard_descriptors(
-                            helper_socket_.get(),
-                            {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO})) {
-                        error_ << "NetLagLab: failed to transfer standard descriptors "
-                                  "to helper\n";
-                        return false;
-                    }
-                    if (!send_socket_text(helper_socket_.get(), start_block_)) {
-                        error_ << "NetLagLab: failed to send Workload context to helper\n";
-                        return false;
-                    }
-                    return true;
-                }
+            if (events.empty()) {
+                continue;
+            }
+            if (events.size() != 1
+                || events.front().kind != HelperConversationEventKind::ready) {
                 error_ << "NetLagLab: invalid helper event before READY\n";
                 return false;
             }
+
+            if (!send_standard_descriptors(
+                    helper_socket_.get(),
+                    {STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO})) {
+                error_ << "NetLagLab: failed to transfer standard descriptors to helper\n";
+                return false;
+            }
+            if (!send_socket_text(helper_socket_.get(), start_block_)) {
+                error_ << "NetLagLab: failed to send Workload context to helper\n";
+                return false;
+            }
+            return true;
         }
     }
 
@@ -510,12 +301,6 @@ public:
                 return {LifecycleEventKind::conversation_lost};
             }
 
-            if ((descriptors[3].revents & POLLIN) != 0) {
-                const std::size_t count{signal_pipe_.take_interrupt_count()};
-                for (std::size_t index{}; index < count; ++index) {
-                    pending_events_.push_back({LifecycleEventKind::terminal_interrupt});
-                }
-            }
             if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0) {
                 read_helper_events();
             }
@@ -524,9 +309,24 @@ public:
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
             }
 
+            if ((descriptors[3].revents & POLLIN) != 0) {
+                const std::size_t count{signal_pipe_.take_interrupt_count()};
+                if (!workload_finished_) {
+                    for (std::size_t index{}; index < count; ++index) {
+                        pending_events_.push_back(
+                            {LifecycleEventKind::terminal_interrupt});
+                    }
+                }
+            }
+
             if (activated_ && (descriptors[1].revents & POLLIN) != 0
                 && !accept_controller(
-                    listening_socket_->get(), client_, command_buffer_, error_)) {
+                    listening_socket_->get(),
+                    client_,
+                    controller_conversation_,
+                    workload_pid_,
+                    child_arguments_,
+                    error_)) {
                 conversation_failed_ = true;
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
             }
@@ -535,21 +335,22 @@ public:
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
             }
 
-            if (client_.has_value() && (descriptors[2].revents & POLLIN) != 0) {
-                const ClientReadResult result{read_client_commands(
-                    client_->get(), command_buffer_, workload_pid_, child_arguments_)};
-                if (result == ClientReadResult::disconnected) {
+            if (!workload_finished_ && client_.has_value()
+                && (descriptors[2].revents & POLLIN) != 0) {
+                const ControllerReadResult result{
+                    controller_conversation_->receive(client_->get())};
+                if (result == ControllerReadResult::disconnected) {
                     client_.reset();
-                    command_buffer_.clear();
+                    controller_conversation_.reset();
                     pending_events_.push_back({LifecycleEventKind::controller_lost});
-                } else if (result == ClientReadResult::stop_requested) {
+                } else if (result == ControllerReadResult::stop_requested) {
                     pending_events_.push_back({LifecycleEventKind::stop_requested});
                 }
             }
             if (client_.has_value()
                 && (descriptors[2].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
                 client_.reset();
-                command_buffer_.clear();
+                controller_conversation_.reset();
                 pending_events_.push_back({LifecycleEventKind::controller_lost});
             }
 
@@ -588,11 +389,10 @@ public:
             session_succeeded && launcher_clean_ && cleanup_error == 0
             && final_cleanup_succeeded_ && !conversation_failed_};
         if (client_.has_value()) {
-            (void)send_socket_text(
-                client_->get(),
-                session_clean ? "SESSION_ENDED\n" : "SESSION_FAILED\n");
+            send_controller_session_result(client_->get(), session_clean);
         }
         client_.reset();
+        controller_conversation_.reset();
         return cleanup_error == 0;
     }
 
@@ -629,6 +429,11 @@ private:
                 }
                 listening_socket_.emplace(descriptor);
                 activated_ = true;
+            } else if (event.kind == HelperConversationEventKind::workload_exited
+                       || event.kind
+                           == HelperConversationEventKind::workload_signaled) {
+                workload_finished_ = true;
+                activated_ = false;
             } else if (event.kind == HelperConversationEventKind::cleanup_succeeded) {
                 final_cleanup_succeeded_ = true;
             } else if (event.kind == HelperConversationEventKind::cleanup_failed
@@ -657,35 +462,15 @@ private:
     SupervisorHelperConversation conversation_;
     std::deque<LifecycleEvent> pending_events_;
     std::optional<FileDescriptor> client_;
-    std::string command_buffer_;
+    std::optional<ControllerConversation> controller_conversation_;
     std::optional<std::chrono::steady_clock::time_point> deadline_;
     pid_t workload_pid_{};
     bool activated_{false};
+    bool workload_finished_{false};
     bool final_cleanup_succeeded_{false};
     bool conversation_failed_{false};
     bool launcher_clean_{false};
 };
-
-void report_outcome(const SessionOutcome& outcome, std::ostream& error)
-{
-    if (!outcome.infrastructure_succeeded()) {
-        error << "NetLagLab: Session infrastructure failed";
-        if (outcome.workload.has_value()) {
-            error << "; Workload result was " << outcome.workload->exit_code();
-        }
-        error << '\n';
-        return;
-    }
-    if (isatty(STDERR_FILENO) == 1 && outcome.workload.has_value()) {
-        if (outcome.workload->kind == WorkloadResultKind::signaled) {
-            error << "NetLagLab: Session ended; Workload terminated by signal "
-                  << outcome.workload->value << '\n';
-        } else if (outcome.workload->kind == WorkloadResultKind::exited) {
-            error << "NetLagLab: Session ended; Workload exit code: "
-                  << outcome.workload->value << '\n';
-        }
-    }
-}
 
 } // namespace
 
@@ -798,8 +583,8 @@ int run_session(char* const child_arguments[], std::ostream& error)
         *signal_pipe,
         error};
     const SessionOutcome outcome{run_session_lifecycle(adapter)};
-    report_outcome(outcome, error);
-    return outcome.exit_code();
+    report_session_outcome(outcome, error);
+    return session_exit_status(outcome);
 }
 
 } // namespace netlaglab

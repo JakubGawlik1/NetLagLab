@@ -14,8 +14,6 @@ enum class WorkloadResultKind {
 struct WorkloadResult {
     WorkloadResultKind kind;
     int value;
-
-    [[nodiscard]] int exit_code() const noexcept;
 };
 
 enum class InfrastructureFailure {
@@ -33,7 +31,6 @@ struct SessionOutcome {
     std::vector<InfrastructureFailure> infrastructure_failures;
 
     [[nodiscard]] bool infrastructure_succeeded() const noexcept;
-    [[nodiscard]] int exit_code() const noexcept;
 };
 
 enum class LifecycleEventKind {

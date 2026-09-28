@@ -1,25 +1,24 @@
 #include "helper_process.hpp"
 
+#include "process_status.hpp"
 #include "session_paths.hpp"
 #include "socket_io.hpp"
 
 #include <array>
 #include <cerrno>
-#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <limits.h>
 #include <ostream>
 #include <spawn.h>
 #include <sys/socket.h>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <csignal>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
 #include <utility>
@@ -31,36 +30,6 @@ namespace {
 
 constexpr std::chrono::milliseconds helper_connection_retry_delay{50};
 
-[[nodiscard]] std::optional<pid_t> read_parent_pid(const pid_t pid)
-{
-    std::ifstream stat{"/proc/" + std::to_string(pid) + "/stat"};
-    std::string line;
-    if (!std::getline(stat, line)) {
-        return std::nullopt;
-    }
-    const std::size_t closing_parenthesis{line.rfind(')')};
-    if (closing_parenthesis == std::string::npos
-        || closing_parenthesis + 4 >= line.size()) {
-        return std::nullopt;
-    }
-    std::string_view remainder{line};
-    remainder.remove_prefix(closing_parenthesis + 2);
-    const std::size_t state_separator{remainder.find(' ')};
-    if (state_separator == std::string_view::npos) {
-        return std::nullopt;
-    }
-    remainder.remove_prefix(state_separator + 1);
-    const std::size_t parent_end{remainder.find(' ')};
-    const std::string_view parent_text{remainder.substr(0, parent_end)};
-    pid_t parent{};
-    const auto parsed{std::from_chars(
-        parent_text.data(), parent_text.data() + parent_text.size(), parent)};
-    if (parsed.ec != std::errc{} || parsed.ptr != parent_text.data() + parent_text.size()) {
-        return std::nullopt;
-    }
-    return parent;
-}
-
 [[nodiscard]] bool belongs_to_helper_launcher(
     const pid_t peer_pid,
     const pid_t helper_launcher_pid)
@@ -70,11 +39,11 @@ constexpr std::chrono::milliseconds helper_connection_retry_delay{50};
         if (current == helper_launcher_pid) {
             return true;
         }
-        const std::optional<pid_t> parent{read_parent_pid(current)};
-        if (!parent.has_value() || *parent == current) {
+        const std::optional<ProcessStatus> status{read_process_status(current)};
+        if (!status.has_value() || status->parent_pid == current) {
             return false;
         }
-        current = *parent;
+        current = status->parent_pid;
     }
     return current == helper_launcher_pid;
 }
@@ -134,15 +103,29 @@ std::optional<pid_t> spawn_helper(
         return std::nullopt;
     }
 
-    std::array<std::string, 5> arguments{
+    const pid_t current_pid{getpid()};
+    const std::optional<ProcessStatus> supervisor_status{
+        read_process_status(current_pid)};
+    if (!supervisor_status.has_value()) {
+        error << "NetLagLab: failed to read Supervisor process identity\n";
+        return std::nullopt;
+    }
+    const std::string supervisor_pid{std::to_string(current_pid)};
+    const std::string supervisor_start_time{
+        std::to_string(supervisor_status->start_time_ticks)};
+    std::array<std::string, 9> arguments{
         "sudo",
         "--",
         *helper_path,
         "--runtime-dir",
         paths.xdg_runtime_directory(),
+        "--supervisor-pid",
+        supervisor_pid,
+        "--supervisor-start-time",
+        supervisor_start_time,
     };
 
-    std::array<char*, 6> argument_pointers{};
+    std::array<char*, 10> argument_pointers{};
     for (std::size_t index{}; index < arguments.size(); ++index) {
         argument_pointers[index] = arguments[index].data();
     }
@@ -174,6 +157,15 @@ std::optional<FileDescriptor> wait_for_helper_connection(
         UnixSocketConnectResult connection{
             connect_to_unix_socket(paths.helper_socket())};
         if (connection.socket.has_value()) {
+            struct stat socket_status {};
+            if (lstat(paths.helper_socket().c_str(), &socket_status) == -1
+                || !S_ISSOCK(socket_status.st_mode)
+                || socket_status.st_uid != geteuid()
+                || (socket_status.st_mode & 0777) != 0600) {
+                error << "NetLagLab: helper.sock has invalid type, owner, or permissions\n";
+                return std::nullopt;
+            }
+
             struct ucred credentials {};
             socklen_t credentials_size{sizeof(credentials)};
             if (getsockopt(

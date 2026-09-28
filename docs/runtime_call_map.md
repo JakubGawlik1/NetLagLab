@@ -15,6 +15,7 @@ flow. It does not treat accepted target architecture as implemented behavior.
 | `netlaglab_core_tests` | Network-profile validation tests. |
 | `netlaglab_lifecycle_tests` | Scripted tests through the blocking lifecycle seam. |
 | `netlaglab_protocol_tests` | Start-block and helper-conversation tests. |
+| `netlaglab_controller_protocol_tests` | Controller framing, escaping, and typed-command tests. |
 | `netlaglab_process_tests` | Local unprivileged Workload-launch tests using `netlaglab-workload-probe`. |
 
 ## Process and IPC topology
@@ -50,9 +51,12 @@ main
       -> open, validate, and flock session.lock
       -> SignalPipe::create
       -> spawn_helper
-         -> posix_spawnp("sudo", ["sudo", "--", helper, "--runtime-dir", ...])
+         -> posix_spawnp("sudo", ["sudo", "--", helper, "--runtime-dir", ...,
+            "--supervisor-pid", getpid(), "--supervisor-start-time",
+            /proc/self/stat.starttime])
       -> wait_for_helper_connection
          -> connect_to_unix_socket(helper.sock)
+         -> validate helper.sock type, owner, and mode
          -> authenticate root peer with SO_PEERCRED and bind its PID to the
             launched sudo process tree
       -> remove stale control.sock; do not publish a new listener yet
@@ -64,7 +68,7 @@ main
          -> adapter.request_stop(): send STOP TERM or STOP KILL
          -> adapter.reap_launcher(): close helper channel and reap sudo
          -> adapter.finalize(): remove control.sock and notify the Controller
-      -> map SessionOutcome to the CLI exit status
+      -> session_presentation maps SessionOutcome to diagnostics and CLI status
 ```
 
 `control.sock` is created only after the explicit `ACTIVE <pid>` event. Before
@@ -75,10 +79,12 @@ that event there is no public active-Session endpoint.
 ```text
 netlaglab-helper main
   -> run_helper
-    -> validate --runtime-dir, eUID 0, SUDO_UID, and SUDO_GID
+    -> validate --runtime-dir, Supervisor PID/starttime, eUID 0, SUDO_UID,
+       and SUDO_GID
+    -> open a pidfd and verify the launching Supervisor's /proc starttime
     -> validate the user runtime directory and held session.lock
-    -> create helper.sock and accept one Supervisor
-    -> authenticate Supervisor UID and GID with SO_PEERCRED
+    -> create helper.sock and poll it together with the Supervisor pidfd
+    -> authenticate the exact Supervisor PID, UID, and GID with SO_PEERCRED
     -> read the authenticated Supervisor's supplementary groups from
        /proc/<peer-pid>/status
     -> acquire /run/netlaglab/host.lock
@@ -179,6 +185,8 @@ and launcher reaping. Tests supply a scripted adapter at the same seam.
 An infrastructure failure maps the CLI result to `125` without discarding an
 already known Workload result. Otherwise a start failure returns `126`/`127`,
 a normal exit returns its code, and a signal returns `128 + signal`.
+That mapping and the per-stage diagnostic text live in the CLI presentation
+module rather than in the lifecycle domain types.
 
 The stop state is:
 
@@ -196,6 +204,8 @@ events instead of restarting a grace period.
 
 `netlaglab attach` validates and connects to `control.sock`, then polls stdin
 and the Supervisor connection. The Supervisor accepts at most one Controller.
+`ControllerConversation` owns command framing, escaping, and response text;
+the lifecycle adapter consumes only its typed disconnect/stop outcomes.
 
 | Command | Supervisor action |
 |---|---|
@@ -224,10 +234,11 @@ failure sends `SESSION_FAILED`.
 ## Implemented tests
 
 - lifecycle: clean completion, pre-activation failure, fast exit,
-  infrastructure precedence, helper loss, Controller loss, and both Ctrl-C
-  paths;
+  infrastructure precedence, helper loss, Controller loss, both Ctrl-C paths,
+  terminal-event cancellation, and stop-deadline completion;
 - conversation: partial and coalesced frames, early EOF, oversize, illegal
   ordering, and allowlisted runtime commands;
+- Controller: partial command framing, typed stop delivery, and safe escaping;
 - context: byte-preserving round trip, duplicates/order, malformed input,
   invalid ordering, and bounds;
 - process: exec-success handshake, first `PATH=`, missing/non-executable
