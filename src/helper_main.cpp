@@ -28,6 +28,7 @@
 #include <sys/types.h>
 #include <system_error>
 #include <unistd.h>
+#include <variant>
 #include <vector>
 
 #include <cstdlib>
@@ -410,13 +411,15 @@ struct InvokingIds {
     const int supervisor_descriptor,
     const netlaglab::WorkloadStatus status)
 {
+    const netlaglab::HelperConversationEvent event{
+        status.exited
+            ? netlaglab::HelperConversationEvent{
+                  netlaglab::WorkloadExitedEvent{status.value}}
+            : netlaglab::HelperConversationEvent{
+                  netlaglab::WorkloadSignaledEvent{status.value}}};
     return netlaglab::send_socket_text(
         supervisor_descriptor,
-        netlaglab::helper_conversation_event_message(
-            status.exited
-                ? netlaglab::HelperConversationEventKind::workload_exited
-                : netlaglab::HelperConversationEventKind::workload_signaled,
-            status.value));
+        netlaglab::helper_conversation_event_message(event));
 }
 
 [[nodiscard]] bool stop_after_supervisor_loss(netlaglab::WorkloadProcess& workload)
@@ -453,11 +456,12 @@ struct InvokingIds {
             (void)netlaglab::send_socket_text(
                 supervisor_descriptor,
                 netlaglab::helper_conversation_event_message(
-                    netlaglab::HelperConversationEventKind::cleanup_failed));
+                    netlaglab::CleanupFailedEvent{}));
             error << "NetLagLab helper: failed to reap Workload\n";
             return 125;
         }
         if (workload_result.state == netlaglab::WorkloadPollState::finished) {
+            conversation.workload_finished();
             if (!send_workload_status(supervisor_descriptor, *workload_result.status)) {
                 global_lock.reset();
                 error << "NetLagLab helper: failed to report Workload completion\n";
@@ -467,7 +471,7 @@ struct InvokingIds {
             if (!netlaglab::send_socket_text(
                     supervisor_descriptor,
                     netlaglab::helper_conversation_event_message(
-                        netlaglab::HelperConversationEventKind::cleanup_succeeded))) {
+                        netlaglab::CleanupSucceededEvent{}))) {
                 error << "NetLagLab helper: failed to report Workload completion\n";
                 return 125;
             }
@@ -499,13 +503,20 @@ struct InvokingIds {
         const netlaglab::RuntimeCommandFeedResult commands{
             conversation.receive_bytes(bytes)};
         if (!commands.valid) {
-            (void)send_helper_error(supervisor_descriptor, "Invalid command frame.");
+            if (commands.response.has_value()) {
+                (void)netlaglab::send_socket_text(
+                    supervisor_descriptor, *commands.response);
+            }
             (void)stop_after_supervisor_loss(workload);
             return 125;
         }
-        for (const netlaglab::HelperRuntimeCommand command : commands.commands) {
+        for (const netlaglab::HelperRuntimeCommand& command : commands.commands) {
+            if (std::holds_alternative<netlaglab::ProfileChange>(command)) {
+                // The protocol checkpoint deliberately has no shaping adapter yet.
+                continue;
+            }
             const int signal_number{
-                command == netlaglab::HelperRuntimeCommand::stop_kill
+                std::holds_alternative<netlaglab::StopKillCommand>(command)
                     ? SIGKILL : SIGTERM};
             if (!workload.send_signal(signal_number)) {
                 (void)send_helper_error(supervisor_descriptor, "Failed to stop Workload.");
@@ -637,7 +648,7 @@ int run_helper(const int argc, char* argv[])
     if (!netlaglab::send_socket_text(
             supervisor_socket->get(),
             netlaglab::helper_conversation_event_message(
-                netlaglab::HelperConversationEventKind::ready))) {
+                netlaglab::ReadyEvent{}))) {
         return 125;
     }
 
@@ -670,21 +681,19 @@ int run_helper(const int argc, char* argv[])
         const bool failure_reported{netlaglab::send_socket_text(
             supervisor_socket->get(),
             netlaglab::helper_conversation_event_message(
-                netlaglab::HelperConversationEventKind::activation_failed,
-                launch.failure_exit_code))};
+                netlaglab::ActivationFailedEvent{launch.failure_exit_code}))};
         global_lock->reset();
         const bool reported{failure_reported
             && netlaglab::send_socket_text(
                    supervisor_socket->get(),
                    netlaglab::helper_conversation_event_message(
-                       netlaglab::HelperConversationEventKind::cleanup_succeeded))};
+                       netlaglab::CleanupSucceededEvent{}))};
         return reported ? 0 : 125;
     }
     if (!netlaglab::send_socket_text(
             supervisor_socket->get(),
             netlaglab::helper_conversation_event_message(
-                netlaglab::HelperConversationEventKind::activated,
-                launch.process->pid()))) {
+                netlaglab::ActivatedEvent{launch.process->pid()}))) {
         (void)stop_after_supervisor_loss(*launch.process);
         return 125;
     }

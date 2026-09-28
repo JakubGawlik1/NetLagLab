@@ -28,8 +28,10 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace netlaglab {
@@ -177,25 +179,26 @@ private:
 
 [[nodiscard]] LifecycleEvent map_helper_event(const HelperConversationEvent event)
 {
-    switch (event.kind) {
-    case HelperConversationEventKind::activated:
-        return {LifecycleEventKind::activated, event.value};
-    case HelperConversationEventKind::activation_failed:
-        return {LifecycleEventKind::activation_failed, event.value};
-    case HelperConversationEventKind::workload_exited:
-        return {LifecycleEventKind::workload_exited, event.value};
-    case HelperConversationEventKind::workload_signaled:
-        return {LifecycleEventKind::workload_signaled, event.value};
-    case HelperConversationEventKind::cleanup_succeeded:
-        return {LifecycleEventKind::cleanup_succeeded};
-    case HelperConversationEventKind::cleanup_failed:
-        return {LifecycleEventKind::cleanup_failed};
-    case HelperConversationEventKind::conversation_lost:
-        return {LifecycleEventKind::conversation_lost};
-    case HelperConversationEventKind::ready:
-        break;
-    }
-    return {LifecycleEventKind::conversation_lost};
+    return std::visit(
+        [](const auto& value) -> LifecycleEvent {
+            using Event = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Event, ActivatedEvent>) {
+                return {LifecycleEventKind::activated, value.workload_pid};
+            } else if constexpr (std::is_same_v<Event, ActivationFailedEvent>) {
+                return {LifecycleEventKind::activation_failed, value.result};
+            } else if constexpr (std::is_same_v<Event, WorkloadExitedEvent>) {
+                return {LifecycleEventKind::workload_exited, value.result};
+            } else if constexpr (std::is_same_v<Event, WorkloadSignaledEvent>) {
+                return {LifecycleEventKind::workload_signaled, value.signal};
+            } else if constexpr (std::is_same_v<Event, CleanupSucceededEvent>) {
+                return {LifecycleEventKind::cleanup_succeeded};
+            } else if constexpr (std::is_same_v<Event, CleanupFailedEvent>) {
+                return {LifecycleEventKind::cleanup_failed};
+            } else {
+                return {LifecycleEventKind::conversation_lost};
+            }
+        },
+        event);
 }
 
 class ProductionLifecycleAdapter final : public LifecycleAdapter {
@@ -238,7 +241,7 @@ public:
                 continue;
             }
             if (events.size() != 1
-                || events.front().kind != HelperConversationEventKind::ready) {
+                || !std::holds_alternative<ReadyEvent>(events.front())) {
                 error_ << "NetLagLab: invalid helper event before READY\n";
                 return false;
             }
@@ -363,8 +366,8 @@ public:
             helper_socket_.get(),
             helper_runtime_command_message(
                 request == StopRequest::terminate
-                    ? HelperRuntimeCommand::stop_terminate
-                    : HelperRuntimeCommand::stop_kill));
+                    ? HelperRuntimeCommand{StopTerminateCommand{}}
+                    : HelperRuntimeCommand{StopKillCommand{}}));
     }
 
     bool reap_launcher() override
@@ -412,13 +415,13 @@ private:
             return;
         }
 
-        for (const HelperConversationEvent event : helper_events) {
-            if (event.kind == HelperConversationEventKind::ready) {
+        for (const HelperConversationEvent& event : helper_events) {
+            if (std::holds_alternative<ReadyEvent>(event)) {
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
                 continue;
             }
-            if (event.kind == HelperConversationEventKind::activated) {
-                workload_pid_ = static_cast<pid_t>(event.value);
+            if (const auto* activated{std::get_if<ActivatedEvent>(&event)}) {
+                workload_pid_ = static_cast<pid_t>(activated->workload_pid);
                 const int descriptor{
                     control_socket_owner_.create_listening_socket(error_)};
                 if (descriptor == -1) {
@@ -427,9 +430,8 @@ private:
                 }
                 listening_socket_.emplace(descriptor);
                 activated_ = true;
-            } else if (event.kind == HelperConversationEventKind::workload_exited
-                       || event.kind
-                           == HelperConversationEventKind::workload_signaled) {
+            } else if (std::holds_alternative<WorkloadExitedEvent>(event)
+                       || std::holds_alternative<WorkloadSignaledEvent>(event)) {
                 workload_finished_ = true;
                 activated_ = false;
             }

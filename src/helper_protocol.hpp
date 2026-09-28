@@ -1,36 +1,97 @@
 #pragma once
 
+#include "netlaglab/network_profile.hpp"
 #include "workload_context.hpp"
 
 #include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace netlaglab {
 
-enum class HelperRuntimeCommand {
-    stop_terminate,
-    stop_kill,
-    shutdown,
+struct StopTerminateCommand {
+    bool operator==(const StopTerminateCommand&) const = default;
 };
 
-enum class HelperConversationEventKind {
-    ready,
-    activated,
-    activation_failed,
-    workload_exited,
-    workload_signaled,
-    cleanup_succeeded,
-    cleanup_failed,
-    conversation_lost,
+struct StopKillCommand {
+    bool operator==(const StopKillCommand&) const = default;
 };
 
-struct HelperConversationEvent {
-    HelperConversationEventKind kind;
-    int value{};
+struct CompatibilityShutdownCommand {
+    bool operator==(const CompatibilityShutdownCommand&) const = default;
 };
+
+using HelperRuntimeCommand = std::variant<
+    StopTerminateCommand,
+    StopKillCommand,
+    CompatibilityShutdownCommand,
+    ProfileChange>;
+
+struct ReadyEvent {
+    bool operator==(const ReadyEvent&) const = default;
+};
+
+struct ActivatedEvent {
+    int workload_pid;
+    bool operator==(const ActivatedEvent&) const = default;
+};
+
+struct ActivationFailedEvent {
+    int result;
+    bool operator==(const ActivationFailedEvent&) const = default;
+};
+
+struct WorkloadExitedEvent {
+    int result;
+    bool operator==(const WorkloadExitedEvent&) const = default;
+};
+
+struct WorkloadSignaledEvent {
+    int signal;
+    bool operator==(const WorkloadSignaledEvent&) const = default;
+};
+
+struct CleanupSucceededEvent {
+    bool operator==(const CleanupSucceededEvent&) const = default;
+};
+
+struct CleanupFailedEvent {
+    bool operator==(const CleanupFailedEvent&) const = default;
+};
+
+struct ConversationLostEvent {
+    bool operator==(const ConversationLostEvent&) const = default;
+};
+
+enum class ProfileChangeResult {
+    applied,
+    restored_after_failure,
+};
+
+struct ProfileChangeResultEvent {
+    ProfileChangeResult result;
+    ProfileChange change;
+    bool operator==(const ProfileChangeResultEvent&) const = default;
+};
+
+struct ProfileStateUnknownEvent {
+    bool operator==(const ProfileStateUnknownEvent&) const = default;
+};
+
+using HelperConversationEvent = std::variant<
+    ReadyEvent,
+    ActivatedEvent,
+    ActivationFailedEvent,
+    WorkloadExitedEvent,
+    WorkloadSignaledEvent,
+    CleanupSucceededEvent,
+    CleanupFailedEvent,
+    ConversationLostEvent,
+    ProfileChangeResultEvent,
+    ProfileStateUnknownEvent>;
 
 enum class StartBlockState {
     incomplete,
@@ -59,19 +120,33 @@ private:
 struct RuntimeCommandFeedResult {
     bool valid;
     std::vector<HelperRuntimeCommand> commands;
+    std::optional<std::string> response;
+};
+
+enum class ProfileChangeCompletion {
+    applied,
+    restored_after_failure,
+    state_unknown,
 };
 
 class HelperRuntimeConversation {
 public:
     [[nodiscard]] RuntimeCommandFeedResult receive_bytes(std::string_view bytes);
+    [[nodiscard]] std::optional<std::string> complete_profile_change(
+        ProfileChangeCompletion completion);
+    void workload_finished() noexcept;
 
 private:
     std::string buffer_;
+    std::optional<ProfileChange> pending_profile_change_;
     bool valid_{true};
+    bool workload_finished_{};
 };
 
 class SupervisorHelperConversation {
 public:
+    [[nodiscard]] std::optional<std::string> begin_profile_change(
+        const ProfileChange& change);
     [[nodiscard]] std::vector<HelperConversationEvent> receive_bytes(
         std::string_view bytes);
     [[nodiscard]] std::vector<HelperConversationEvent> peer_closed();
@@ -87,20 +162,22 @@ private:
     };
 
     std::string buffer_;
+    std::optional<ProfileChange> pending_profile_change_;
     State state_{State::waiting_for_ready};
 };
 
 inline constexpr std::size_t maximum_helper_message_size{1024};
 inline constexpr std::string_view helper_error_prefix{"ERROR "};
+inline constexpr std::string_view invalid_runtime_command_message{
+    "ERROR INVALID_RUNTIME_COMMAND\n"};
 
 [[nodiscard]] std::optional<HelperRuntimeCommand> parse_helper_runtime_command(
     std::string_view line);
-[[nodiscard]] std::string_view helper_runtime_command_message(
-    HelperRuntimeCommand command);
+[[nodiscard]] std::string helper_runtime_command_message(
+    const HelperRuntimeCommand& command);
 
 [[nodiscard]] std::string helper_conversation_event_message(
-    HelperConversationEventKind event,
-    int value = 0);
+    const HelperConversationEvent& event);
 [[nodiscard]] std::string helper_error_message(std::string_view safe_message);
 
 } // namespace netlaglab

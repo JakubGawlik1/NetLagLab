@@ -34,8 +34,11 @@ cross-platform support are not current goals.
 - One Supervisor owns the per-user Session, lock, `control.sock`, and at most
   one attached Controller. `attach` supports `help`, `status`, `stop`, and
   `detach`; Controller loss does not stop the application. Its pure typed
-  parser also validates and normalizes `set`/`reset` Profile Changes, which are
-  reported as unavailable until helper dispatch exists. An attached Controller
+  parser also validates and normalizes `set`/`reset` Profile Changes. Profile
+  Changes belong to the shared domain model, apply atomically to Network
+  Profiles, and round-trip through stateful, independently validating
+  Supervisor/helper conversations. They remain reported as unavailable until
+  Controller dispatch and a shaping adapter exist. An attached Controller
   receives the complete typed Session Outcome after Supervisor cleanup and
   reports the Workload result independently from infrastructure failures.
 - Session paths and Unix sockets are validated for ownership, type, permissions,

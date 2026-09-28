@@ -54,6 +54,7 @@ add_executable(
 )
 
 target_compile_features(netlaglab-helper PRIVATE cxx_std_20)
+target_link_libraries(netlaglab-helper PRIVATE netlaglab_core)
 set_target_properties(netlaglab-helper PROPERTIES CXX_EXTENSIONS OFF)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -120,7 +121,12 @@ if(BUILD_TESTING)
         tests/workload_context_test.cpp
     )
     target_include_directories(netlaglab_protocol_tests PRIVATE src)
-    target_link_libraries(netlaglab_protocol_tests PRIVATE GTest::gtest_main)
+    target_link_libraries(
+        netlaglab_protocol_tests
+        PRIVATE
+            netlaglab_core
+            GTest::gtest_main
+    )
     target_compile_features(netlaglab_protocol_tests PRIVATE cxx_std_20)
     set_target_properties(netlaglab_protocol_tests PROPERTIES CXX_EXTENSIONS OFF)
 

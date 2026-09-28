@@ -2,9 +2,7 @@
 
 #include "netlaglab/network_profile.hpp"
 
-#include <chrono>
 #include <cstddef>
-#include <cstdint>
 #include <string>
 #include <string_view>
 #include <sys/types.h>
@@ -26,38 +24,6 @@ struct DetachControllerCommand {
 
 struct IgnoredControllerCommand {
 };
-
-struct SetDelay {
-    TrafficDirection direction;
-    std::chrono::milliseconds value;
-};
-
-struct SetJitter {
-    TrafficDirection direction;
-    std::chrono::milliseconds value;
-};
-
-struct SetPacketLoss {
-    TrafficDirection direction;
-    double percent;
-};
-
-struct SetBandwidth {
-    TrafficDirection direction;
-    std::uint64_t kbps;
-};
-
-struct ResetSetting {
-    TrafficDirection direction;
-    NetworkSetting setting;
-};
-
-using ProfileChange = std::variant<
-    SetDelay,
-    SetJitter,
-    SetPacketLoss,
-    SetBandwidth,
-    ResetSetting>;
 
 enum class ControllerParseError {
     command_too_long,
