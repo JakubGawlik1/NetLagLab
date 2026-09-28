@@ -1,20 +1,16 @@
 # NetLagLab agent guidance
 
-## Project
+## Project records
 
-- NetLagLab is a Linux application that runs a local application in an isolated
-  network environment and changes its network conditions live.
-- This is an educational C++ portfolio project for internship preparation.
-  Prefer code the owner can understand and explain over clever abstractions.
-- The MVP targets Linux and IPv4, one local process, and one active session.
-  Build a CLI first; add Qt only after the same operations work without a GUI.
-- Use a network namespace and veth pair as the initial isolation backend. The
-  veth pair is an implementation detail, not a user-facing choice.
-- The product should support separate outbound and inbound latency, jitter,
-  packet loss, and bandwidth settings with live updates. Persistence should
-  record the timestamped settings timeline in JSON Lines for later replay.
-- The current task defines the scope. Do not prepare later features unless the
-  task explicitly requires them.
+- Read `PROJECT.md` before non-trivial planning, implementation, or review. It
+  is a concise description of the product, verified capabilities, stable
+  constraints, and possible future capabilities.
+- Treat code, tests, and configuration as the source of truth for implemented
+  behavior. Treat future items and their order as planning prompts, not task
+  boundaries or reasons to defer coherent work requested by the user.
+- Define the exact scope and implementation order with the user when starting
+  the work. Keep detailed technical explanations in focused documents and link
+  them from the project context when useful.
 
 ## Architecture and safety
 
@@ -36,14 +32,17 @@
 ## C++ and build conventions
 
 - Use C++20 without compiler-specific extensions.
-- Follow nearby code. If two solutions are equally correct, choose the one
-  requiring fewer concepts to understand.
-- Prefer explicit control flow, concrete types, and small functions over clever
-  ranges pipelines, metaprogramming, concepts, traits, or functional
-  composition when a straightforward implementation is equally correct.
-- Add an abstraction only when it solves a current correctness or meaningful
-  duplication problem. Do not add wrappers, factories, extension points, or
-  generic helpers for hypothetical future reuse.
+- Prefer the simplest design that keeps responsibilities, ownership, lifetime,
+  and boundaries clear.
+- A class, file, function, or abstraction is justified when it provides a
+  concrete current benefit for correctness, clarity, cohesion, ownership,
+  meaningful duplication, or testability. Their count is a consequence of the
+  design, not a goal.
+- When two designs are similarly correct and clear, follow nearby code and
+  choose the one requiring fewer concepts to understand.
+- Prefer explicit control flow and concrete types over clever ranges pipelines,
+  metaprogramming, traits, or functional composition when both designs express
+  the same responsibility equally well.
 - A non-obvious standard-library type or function is allowed when it provides a
   concrete correctness, lifetime, ownership, or clarity benefit. Explain that
   benefit and compare it briefly with the simplest familiar alternative.
@@ -56,8 +55,6 @@
 - Keep `-Wall -Wextra -Wpedantic` clean. Support GCC and Clang, but validate
   with either one unless the task requires both.
 - Prefer Ninja when available; otherwise use CMake's default generator.
-- Keep the repository small. Add a directory, library, abstraction, or
-  dependency only when the current task needs it.
 - Prefer the standard library and ask before adding a production dependency.
 - Use GoogleTest for unit tests and CTest as the test runner when tests are
   introduced.
@@ -65,7 +62,6 @@
 
 ## Workflow
 
-- Inspect Git status and relevant files before editing. Preserve user changes.
 - For a small, isolated task with explicit acceptance criteria, make routine
   implementation decisions autonomously.
 - For non-trivial work, first present the proposed design, affected boundaries,
@@ -76,14 +72,10 @@
   features, premature generalization, and large code dumps.
 - If the expected scope must materially expand, explain why before editing
   additional components.
-- After a clearly bounded stage is complete and its required validation passes,
-  create a local commit without asking for separate confirmation. Do not commit
-  incomplete work or changes with known failing validation.
-- Never push unless the user explicitly requests it.
 - Do not install packages or change persistent host networking unless the user
   explicitly requests it.
-- Explain changed files, important C++ choices, ownership or lifetime concerns,
-  and failure handling for a learner.
+- After implementation, briefly explain only non-obvious C++ choices,
+  ownership or lifetime constraints, and meaningful failure paths.
 - Do not paste complete source files unless asked.
 
 ## Test scope
@@ -104,15 +96,14 @@
 - Run the full CTest suite when shared core behavior, public headers, CMake,
   compiler options, or dependencies changed; when focused validation fails or
   reveals coupling; before a release; or when explicitly requested.
-- Report every executed command, result, exit code where relevant, and any
-  broader validation deliberately skipped.
 
 ## Code review rules
 
 ### Scope and complexity
 
-- Flag files, abstractions, configuration, dependencies, or tests added without
-  a concrete requirement from the current task.
+- Flag a file, abstraction, configuration change, dependency, or test only when
+  it lacks a concrete requirement, useful responsibility, or useful boundary;
+  do not flag it merely because it increases the count.
 - Distinguish correctness issues from optional simplification or style
   suggestions. Do not apply optional suggestions automatically.
 
@@ -169,3 +160,15 @@ git diff --check
 ```
 
 If Ninja is unavailable, omit `-G Ninja`.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are tracked in this repository's GitHub Issues. See
+`docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+This repository uses a single-context domain-doc layout. See
+`docs/agents/domain.md`.
