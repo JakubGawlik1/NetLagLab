@@ -8,7 +8,7 @@ an unrestricted default profile and reports `shaping: not applied`. Delay,
 jitter, and loss were exercised manually with `tc/netem`; bandwidth limiting
 was not established by that experiment.
 
-The semantics and mutation rules below are accepted target design. Runtime
+The semantics and Profile Change rules below are accepted target design. Runtime
 qdisc application and live updates are not implemented.
 
 ## Network Profile meaning
@@ -59,7 +59,7 @@ Each direction has:
   a limit.
 
 Delay and jitter cannot be negative. The Controller accepts human-facing units
-and normalizes them before it creates a typed profile delta; see
+and normalizes them before it creates a typed Profile Change; see
 [Controller control plane](controller-control-plane.md#values-and-normalization).
 
 ### Jitter with zero base delay
@@ -107,10 +107,10 @@ cleanup.
 ## Workload exit race
 
 When the helper recognizes Workload exit, it sends the terminal event. An
-acknowledgement for an in-flight mutation may already have been sent; if not,
-it is no longer required. The terminal event cancels the Supervisor's pending
-reply and queued Controller commands, and no operation reply may be emitted
-after it.
+acknowledgement for an in-flight Profile Change may already have been sent; if
+not, it is no longer required. The terminal event cancels the Supervisor's
+pending reply and queued Controller commands, and no operation reply may be
+emitted after it.
 
 ## Experiment evidence and limits
 
@@ -123,7 +123,7 @@ cleanup.
 ## Open implementation design
 
 - The exact fixed C++ operations and qdisc command/netlink realization behind
-  each typed delta.
+  each typed Profile Change.
 - How bandwidth limiting composes with netem while preserving transactional
   replacement and rollback.
 - Focused privileged verification for each direction and each supported

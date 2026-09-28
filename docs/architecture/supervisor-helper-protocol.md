@@ -5,7 +5,7 @@
 The lifecycle conversation, start block, explicit standard-descriptor
 transfer, stop commands, terminal events, and final cleanup result are
 implemented. The conversation module owns stream framing and legal ordering on
-both sides. Profile-mutation operations and privileged network-resource events
+both sides. Profile Change operations and privileged network-resource events
 remain unimplemented.
 
 ## Boundary and responsibilities
@@ -22,7 +22,7 @@ small, high-level, stateful, and allowlisted.
 - Linux, namespace, route, firewall, `tc`, ownership, and rollback details stay
   behind the helper boundary.
 
-The protocol transports per-setting profile deltas rather than CLI text or a
+The protocol transports per-setting Profile Changes rather than CLI text or a
 complete Network Profile. A semantic operation can resemble
 `SET_OUTBOUND_DELAY 10`, but the complete final wire vocabulary is not yet
 settled.
@@ -177,7 +177,7 @@ Workload terminal frame followed by the cleanup frame.
 
 ## Open implementation design
 
-- Exact wire names and encodings for future Network Profile mutations and
+- Exact wire names and encodings for future Profile Changes and
   acknowledgements.
 - Safe error-reason vocabulary exposed to the Controller without leaking
   environment or privileged host details.
