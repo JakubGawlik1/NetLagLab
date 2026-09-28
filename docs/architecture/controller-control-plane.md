@@ -3,10 +3,12 @@
 ## Status
 
 The current Controller supports `help`, `status`, `stop`, and `detach` over
-`control.sock`. `stop` enters the implemented helper-owned termination policy.
-Status always shows an unrestricted default profile and `shaping: not
-applied`. The accepted target still adds typed Profile Changes while
-preserving the existing one-Controller, line-oriented model.
+`control.sock`. Its pure typed parser also recognizes, validates, and
+normalizes `set` and `reset` Profile Changes. Until helper dispatch exists,
+valid Profile Changes receive `ERROR Profile changes are not available yet.`
+and do not alter status. `stop` enters the implemented helper-owned termination
+policy. Status always shows an unrestricted default profile and `shaping: not
+applied`.
 
 ## Role and ownership
 
@@ -261,15 +263,14 @@ lifecycle, not by the Controller client.
 
 ## Current-to-target gap
 
-The current Supervisor handles Controller commands immediately and recognizes
-`help`, `status`, `stop`, and `detach`. It has no typed parser for settings, no
-operation queue, no helper Profile Change request, no public stopping state,
-and only the terminal messages `SESSION_ENDED` and `SESSION_FAILED` without the
-target result detail.
+The current Supervisor parses all six command families immediately, but it has
+no operation queue, helper Profile Change request, confirmed Network Profile
+updates, public stopping state, or detailed terminal result. It still emits only
+`SESSION_ENDED` and `SESSION_FAILED` without the target result detail.
 
-## Parser checkpoint acceptance
+## Implemented parser checkpoint
 
-The parser checkpoint is complete only when:
+The parser checkpoint provides:
 
 - parser tests cover every command type, both directions, every setting,
   `set` and `reset`, whitespace, units, normalization, and every parse error;
@@ -282,10 +283,7 @@ The parser checkpoint is complete only when:
   unavailable until helper dispatch exists;
 - existing `help`, `status`, `stop`, and `detach` behavior remains unchanged;
 - `docs/cli.md`, the runtime call map, and the dated MVP audit are updated after
-  implementation so their current-state claims remain accurate;
-- validation builds `netlaglab` and the Controller test target, runs the focused
-  CTest selection, and runs `git diff --check`. The isolated change does not by
-  itself require the unrelated full CTest suite.
+  implementation so their current-state claims remain accurate.
 
 ## Open implementation design
 

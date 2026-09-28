@@ -33,7 +33,9 @@ cross-platform support are not current goals.
   it, and reports its exit result.
 - One Supervisor owns the per-user Session, lock, `control.sock`, and at most
   one attached Controller. `attach` supports `help`, `status`, `stop`, and
-  `detach`; Controller loss does not stop the application.
+  `detach`; Controller loss does not stop the application. Its pure typed
+  parser also validates and normalizes `set`/`reset` Profile Changes, which are
+  reported as unavailable until helper dispatch exists.
 - Session paths and Unix sockets are validated for ownership, type, permissions,
   stale entries, peer credentials, and descriptor inheritance.
 - The Supervisor starts the helper through `sudo`, authenticates the root peer

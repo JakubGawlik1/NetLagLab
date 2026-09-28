@@ -204,13 +204,19 @@ events instead of restarting a grace period.
 
 `netlaglab attach` validates and connects to `control.sock`, then polls stdin
 and the Supervisor connection. The Supervisor accepts at most one Controller.
-`ControllerConversation` owns command framing, escaping, and response text;
-the lifecycle adapter consumes only its typed disconnect/stop outcomes.
+`ControllerConversation` owns command framing and response text. The pure
+`parse_controller_command()` seam validates printable-ASCII/tab input, the
+1024-byte raw-line limit, command grammar, units, bounds, and exact integer
+normalization. It returns typed commands, an ignored-line marker, or a
+structured error; raw Controller text never crosses into the helper. The
+lifecycle adapter consumes only typed disconnect/stop outcomes.
 
 | Command | Supervisor action |
 |---|---|
 | `help` | Send the current command list. |
 | `status` | Report active helper-owned Workload PID/argv and the unchanged default profile. |
+| `set <direction> <setting> <value>` | Validate and normalize one typed Profile Change, then report `ERROR Profile changes are not available yet.` because helper dispatch is not implemented. |
+| `reset <direction> <setting>` | Validate one typed reset, then report the same unavailable response. |
 | `stop` | Send `STOPPING`, generate a typed lifecycle stop request, and keep the Controller attached for the terminal Session message. |
 | `detach` | Send `DETACHED` and close only this Controller. |
 
@@ -238,7 +244,10 @@ failure sends `SESSION_FAILED`.
   terminal-event cancellation, and stop-deadline completion;
 - conversation: partial and coalesced frames, early EOF, oversize, illegal
   ordering, and allowlisted runtime commands;
-- Controller: partial command framing, typed stop delivery, and safe escaping;
+- Controller: all command families, typed Profile Changes, whitespace and
+  units, numeric bounds and normalization, every structured parser error,
+  partial/oversized framing, fixed responses, connection policy, status,
+  stop, and detach;
 - context: byte-preserving round trip, duplicates/order, malformed input,
   invalid ordering, and bounds;
 - process: exec-success handshake, first `PATH=`, missing/non-executable

@@ -42,6 +42,24 @@ The controller accepts newline-terminated commands:
   not exited;
 - `detach` disconnects the controller without stopping the application or its supervisor.
 
+The Controller also validates the future Profile Change syntax:
+
+```text
+set <outbound|inbound> <delay|jitter|loss|bandwidth> <value>
+reset <outbound|inbound> <delay|jitter|loss|bandwidth>
+```
+
+Delay and jitter use milliseconds by default and accept `ms` or `s`. Bandwidth uses `kbps`
+by default and accepts `kbps` or `mbps`; it must be greater than zero. Loss uses percent by
+default, accepts `%`, and must be between 0 and 100 inclusive. Units may be attached or
+separated. Commands and names are lowercase; spaces and tabs may surround and separate tokens.
+These commands currently respond with `ERROR Profile changes are not available yet.` and do
+not change the profile. `help` therefore does not advertise them yet.
+
+Controller lines are limited to 1024 raw bytes before trimming. Ordinary syntax errors return
+a fixed `ERROR` response and keep the Controller connected. An oversized command reports the
+limit error and disconnects the Controller.
+
 The status output says `shaping: not applied`. NetLagLab does not apply the displayed network
 profile in this stage of the project.
 

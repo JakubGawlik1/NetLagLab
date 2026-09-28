@@ -1,5 +1,18 @@
 # MVP implementation audit — 2026-09-25
 
+## Implementation update — 2026-09-28
+
+The Controller parser checkpoint from issue #1 is now implemented in the
+current working tree. A pure `parse_controller_command()` seam recognizes all
+six command families and returns typed commands, an ignored-line marker, or a
+structured error. It validates the 1024-byte raw-line limit, ASCII/tab input,
+directions, settings, numeric grammar, units, ranges, overflow, and loss
+underflow. `ControllerConversation` now maps those results to fixed responses;
+valid `set`/`reset` requests truthfully remain unavailable until helper
+dispatch exists. This completes only the parser portion of slice 3. Queuing,
+helper acknowledgement, confirmed-profile state, stopping status, and detailed
+terminal frames remain unimplemented.
+
 ## Executive conclusion
 
 The current working tree is **not yet the NetLagLab MVP**. It has a substantial
@@ -83,9 +96,10 @@ and cross-platform support are also outside this count (`PROJECT.md:23-25`,
 The public issue tracker is not a complete MVP backlog. On 2026-09-25 it had
 one open issue, [#1 — Add a typed parser for Controller
 commands](https://github.com/JakubGawlik1/NetLagLab/issues/1), covering only the
-parser part of slice 3. The missing privileged backend responsibilities below
-do not yet have one issue each, so issue count cannot be used as the remaining
-MVP count.
+parser part of slice 3. That checkpoint is implemented by the 2026-09-28 update
+above, but the issue remains open until repository workflow closes it. The
+missing privileged backend responsibilities below do not yet have one issue
+each, so issue count cannot be used as the remaining MVP count.
 
 ## Current-state classification
 
@@ -94,7 +108,7 @@ MVP count.
 | Build, typed profile, and scope constraints | **Implemented foundation** | CMake builds the CLI, helper, core library, and five test executables (`CMakeLists.txt:3-59,61-208`). The profile types and validation cover both directions and all four settings (`include/netlaglab/network_profile.hpp:11-41`, `src/network_profile.cpp:8-43`, `tests/network_profile_test.cpp:26-135`). |
 | Supervisor/helper/Workload lifecycle | **Implemented in code; unprivileged tests passed** | `run_session()` captures context, locks the user runtime, starts and connects to the helper, then enters the typed lifecycle (`src/session.cpp:477-587`). The lifecycle owns activation, stop escalation, result precedence, cleanup, and launcher reaping (`src/session_lifecycle.cpp:10-167`). Tests cover clean and failing outcomes, Controller loss, and both Ctrl-C paths (`tests/session_lifecycle_test.cpp:73-297`). |
 | Helper-owned Workload execution | **Partial** | The helper authenticates the Supervisor, acquires `/run/netlaglab/host.lock`, launches, signals, and reaps the Workload (`src/helper_main.cpp:525-692`). The child restores groups/GID/UID, standard descriptors, cwd, argv/environment, and executes without a shell (`src/workload_process.cpp:189-329`). There is no namespace or mount entry before the identity drop; the accepted target requires both (`docs/architecture/workload-execution.md:40-69`). |
-| Base Controller | **Partial** | `help`, `status`, `stop`, and `detach` exist (`src/controller_control_plane.cpp:148-184`), and `stop` reaches the lifecycle (`src/session.cpp:338-348`). Status constructs a fresh unrestricted profile and explicitly says shaping is not applied (`src/controller_control_plane.cpp:91-100`). There is no `set`/`reset` parser, mutation queue, confirmed-profile state, or detailed terminal result (`docs/architecture/controller-control-plane.md:116-130`). |
+| Base Controller | **Partial** | `help`, `status`, `stop`, and `detach` retain their behavior. The pure parser recognizes typed `set`/`reset` Profile Changes, normalizes their values, and produces structured errors; the conversation reports valid changes as unavailable. Status still constructs a fresh unrestricted profile and says shaping is not applied. There is no Profile Change queue, helper dispatch, helper-confirmed profile state, or detailed terminal result. |
 | Supervisor-helper protocol | **Partial** | Byte-stream framing, start block, activation, stop, Workload result, and cleanup frames exist (`src/helper_protocol.cpp:46-184,195-290`). Runtime commands are restricted to `STOP TERM`, `STOP KILL`, and compatibility `SHUTDOWN` (`src/helper_protocol.cpp:102-159`). Profile delta and acknowledgement vocabulary is absent (`docs/architecture/supervisor-helper-protocol.md:3-9,178-185`). |
 | Network and mount environment | **Manual experiment only; missing from production** | The manual commands created a namespace, veth, addresses, loopback, route, NAT, and DNS file (`docs/experiment_01.md:37-61,66-100`). The current target document states that production creates none of these (`docs/architecture/network-environment.md:3-9`). Source search found no production implementation. |
 | Host routing/NAT/firewall | **Manual experiment only; missing from production** | Experiment 01 demonstrated scoped NAT and a UFW forwarding problem/fix (`docs/experiment_01.md:66-100,133-148`). Production currently performs no routing, forwarding, NAT, or firewall mutation (`docs/architecture/host-networking-and-firewall.md:3-10`). |
@@ -123,11 +137,12 @@ These are responsibility slices, not a mandatory commit sequence.
    fragmented/coalesced stream tests prove that status changes only after a
    successful helper acknowledgement and impossible ordering fails safely.
 
-3. **Controller profile control plane.** Implement the accepted `set`/`reset`
-   grammar, units, exact normalization/overflow checks, serialized queue,
+3. **Controller profile control plane.** The `set`/`reset` parser, units, exact
+   normalization/overflow checks, fixed error presentation, and command-size
+   policy are implemented. Add the serialized queue, helper dispatch,
    stopping state, confirmed-profile status, and target terminal result detail.
-   Acceptance: parser and conversation tests cover whitespace, units, bounds,
-   queue ordering, disconnects, and Workload-exit races.
+   Acceptance for the remainder: conversation tests cover queue ordering,
+   acknowledgements, disconnects, and Workload-exit races.
 
 4. **Transactional network/mount environment.** Implement semantic preflight,
    collision refusal, an ownership ledger, namespace/veth creation, addresses,
