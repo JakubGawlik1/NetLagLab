@@ -129,6 +129,13 @@ enum class ProfileChangeCompletion {
     state_unknown,
 };
 
+class ProfileChangeAdapter {
+public:
+    virtual ~ProfileChangeAdapter() = default;
+    [[nodiscard]] virtual ProfileChangeCompletion apply(
+        const ProfileChange& change) = 0;
+};
+
 class HelperRuntimeConversation {
 public:
     [[nodiscard]] RuntimeCommandFeedResult receive_bytes(std::string_view bytes);
@@ -141,7 +148,14 @@ private:
     std::optional<ProfileChange> pending_profile_change_;
     bool valid_{true};
     bool workload_finished_{};
+    bool stopping_{};
+    bool profile_state_unknown_{};
 };
+
+[[nodiscard]] std::optional<std::string> complete_profile_change(
+    HelperRuntimeConversation& conversation,
+    const ProfileChange& change,
+    ProfileChangeAdapter& adapter);
 
 class SupervisorHelperConversation {
 public:
@@ -156,6 +170,7 @@ private:
         waiting_for_ready,
         waiting_for_activation,
         active,
+        profile_state_unknown,
         waiting_for_cleanup,
         finished,
         failed,

@@ -369,9 +369,14 @@ RuntimeCommandFeedResult HelperRuntimeConversation::receive_bytes(
         buffer_.erase(0, newline + 1);
         const std::optional<HelperRuntimeCommand> command{
             parse_helper_runtime_command(line)};
+        if (command.has_value() && profile_state_unknown_
+            && std::holds_alternative<ProfileChange>(*command)) {
+            continue;
+        }
         if (!command.has_value() || workload_finished_
             || (std::holds_alternative<ProfileChange>(*command)
-                && pending_profile_change_.has_value())) {
+                && (pending_profile_change_.has_value() || stopping_
+                    || profile_state_unknown_))) {
             valid_ = false;
             buffer_.clear();
             return {false, std::move(commands),
@@ -379,6 +384,8 @@ RuntimeCommandFeedResult HelperRuntimeConversation::receive_bytes(
         }
         if (const auto* change{std::get_if<ProfileChange>(&*command)}) {
             pending_profile_change_ = *change;
+        } else {
+            stopping_ = true;
         }
         commands.push_back(*command);
     }
@@ -397,8 +404,7 @@ std::optional<std::string> HelperRuntimeConversation::complete_profile_change(
     case ProfileChangeCompletion::restored_after_failure:
         return "PROFILE_FAILED APPLY_FAILED\n";
     case ProfileChangeCompletion::state_unknown:
-        valid_ = false;
-        buffer_.clear();
+        profile_state_unknown_ = true;
         return "ERROR PROFILE_STATE_UNKNOWN\n";
     }
     return std::nullopt;
@@ -409,6 +415,14 @@ void HelperRuntimeConversation::workload_finished() noexcept
     workload_finished_ = true;
     pending_profile_change_.reset();
     buffer_.clear();
+}
+
+std::optional<std::string> complete_profile_change(
+    HelperRuntimeConversation& conversation,
+    const ProfileChange& change,
+    ProfileChangeAdapter& adapter)
+{
+    return conversation.complete_profile_change(adapter.apply(change));
 }
 
 std::optional<HelperRuntimeCommand> parse_helper_runtime_command(
@@ -553,7 +567,7 @@ std::vector<HelperConversationEvent> SupervisorHelperConversation::receive_bytes
         } else if (state_ == State::active && pending_profile_change_.has_value()
                    && line == "ERROR PROFILE_STATE_UNKNOWN") {
             pending_profile_change_.reset();
-            state_ = State::failed;
+            state_ = State::profile_state_unknown;
             event = ProfileStateUnknownEvent{};
         } else if (line.starts_with(helper_error_prefix)) {
             pending_profile_change_.reset();
@@ -571,7 +585,8 @@ std::vector<HelperConversationEvent> SupervisorHelperConversation::receive_bytes
                 event = ActivationFailedEvent{*result};
                 state_ = State::waiting_for_cleanup;
             }
-        } else if (state_ == State::active) {
+        } else if (state_ == State::active
+                   || state_ == State::profile_state_unknown) {
             if (const auto result{
                     parse_value_after(line, "WORKLOAD_EXITED ", 0, 255)}) {
                 event = WorkloadExitedEvent{*result};

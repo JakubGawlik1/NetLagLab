@@ -1,6 +1,6 @@
 # Current runtime call map
 
-Last verified against the working-tree code: 2026-09-25.
+Last verified against the working-tree code: 2026-09-29.
 
 This document maps the implemented process, socket, ownership, and cleanup
 flow. It does not treat accepted target architecture as implemented behavior.
@@ -9,9 +9,9 @@ flow. It does not treat accepted target architecture as implemented behavior.
 
 | Target | Responsibility |
 |---|---|
-| `netlaglab_core` | `NetworkProfile` validation. Runtime shaping is not connected. |
+| `netlaglab_core` | `NetworkProfile` validation and atomic typed Profile Change application. |
 | `netlaglab` | CLI, user-scoped Supervisor, Controller client, lifecycle coordination, signal self-pipe, and `sudo` launcher ownership. |
-| `netlaglab-helper` | Authenticated root helper, host lock, Workload launch/reaping, stop commands, and final helper events. |
+| `netlaglab-helper` | Authenticated root helper, host lock, Workload launch/reaping, stop/Profile Change commands, and final helper events. |
 | `netlaglab_core_tests` | Network-profile validation tests. |
 | `netlaglab_lifecycle_tests` | Scripted tests through the blocking lifecycle seam. |
 | `netlaglab_protocol_tests` | Start-block and helper-conversation tests. |
@@ -112,6 +112,7 @@ netlaglab-helper main
     -> send ACTIVE <pid> or START_FAILED <125|126|127>
     -> supervise_workload
        -> poll helper.sock and waitpid(Workload, WNOHANG)
+       -> complete each Profile Change as restored-after-failure until a real shaping adapter exists
        -> apply STOP TERM / STOP KILL to the directly managed PID only
        -> send WORKLOAD_EXITED or WORKLOAD_SIGNALED after reaping
        -> release /run/netlaglab/host.lock
@@ -165,10 +166,14 @@ frames, size limits, and legal ordering for their respective phases.
 | Helper -> Supervisor | `CLEANUP_OK` | All resources owned by this checkpoint were cleaned. |
 | Helper -> Supervisor | `CLEANUP_FAILED` | Cleanup or reaping failed. |
 | Helper -> Supervisor | `ERROR <safe reason>` | Fatal helper/conversation failure. |
+| Helper -> Supervisor | `PROFILE_OK` | The requested Profile Change was applied. |
+| Helper -> Supervisor | `PROFILE_FAILED APPLY_FAILED` | Apply failed and the preceding confirmed profile was restored. |
+| Helper -> Supervisor | `ERROR PROFILE_STATE_UNKNOWN` | Profile state is unknown; only lifecycle completion remains legal. |
 | Supervisor -> Helper | START block | One-time Workload execution context. |
 | Supervisor -> Helper | `STOP TERM` | Signal the directly managed Workload with SIGTERM. |
 | Supervisor -> Helper | `STOP KILL` | Signal the directly managed Workload with SIGKILL. |
 | Supervisor -> Helper | `SHUTDOWN` | Compatibility command; currently treated as a SIGTERM stop request. |
+| Supervisor -> Helper | `PROFILE_SET_*` / `PROFILE_RESET` | One normalized, allowlisted typed Profile Change. |
 
 EOF, malformed input, an oversized frame, or impossible ordering becomes a
 typed conversation-loss event.
@@ -182,7 +187,7 @@ and launcher reaping. Tests supply a scripted adapter at the same seam.
 `SessionOutcome` preserves two independent facts:
 
 - optional Workload result: start failure, normal exit, or signal;
-- zero or more infrastructure failures: start, conversation, stop request,
+- zero or more infrastructure failures: start, conversation, profile state, stop request,
   cleanup, launcher reaping/finalization, or impossible event.
 
 An infrastructure failure maps the CLI result to `125` without discarding an
@@ -207,19 +212,22 @@ events instead of restarting a grace period.
 
 `netlaglab attach` validates and connects to `control.sock`, then polls stdin
 and the Supervisor connection. The Supervisor accepts at most one Controller.
-`ControllerConversation` owns command framing and response text. The pure
+`ControllerControlPlane` owns command framing, bounded queueing, response text,
+reply ownership, confirmed profile, and public state through one event/action
+interface. The pure
 `parse_controller_command()` seam validates printable-ASCII/tab input, the
 1024-byte raw-line limit, command grammar, units, bounds, and exact integer
 normalization. It returns typed commands, an ignored-line marker, or a
 structured error; raw Controller text never crosses into the helper. The
-lifecycle adapter consumes only typed disconnect/stop outcomes.
+production adapter executes typed actions synchronously and feeds write failure
+back before executing any later dispatch action.
 
 | Command | Supervisor action |
 |---|---|
 | `help` | Send the current command list. |
-| `status` | Report active helper-owned Workload PID/argv and the unchanged default profile. |
-| `set <direction> <setting> <value>` | Validate and normalize one typed Profile Change, then report `ERROR Profile changes are not available yet.` because helper dispatch is not implemented. |
-| `reset <direction> <setting>` | Validate one typed reset, then report the same unavailable response. |
+| `status` | Report active helper-owned Workload PID/argv, public state, and the last helper-confirmed profile. |
+| `set <direction> <setting> <value>` | Validate, normalize, queue, and dispatch one typed Profile Change; production currently reports restored-after-failure. |
+| `reset <direction> <setting>` | Queue and dispatch a typed reset through the same serialized path. |
 | `stop` | Send `STOPPING`, generate a typed lifecycle stop request, and keep the Controller attached for the terminal Session message. |
 | `detach` | Send `DETACHED` and close only this Controller. |
 
@@ -266,8 +274,8 @@ Supervisor. New Supervisors do not emit the legacy lines.
   ordering, and allowlisted runtime commands;
 - Controller: all command families, typed Profile Changes, whitespace and
   units, numeric bounds and normalization, every structured parser error,
-  partial/oversized framing, fixed responses, connection policy, status,
-  stop, and detach;
+  partial/oversized framing, bounded queueing, reply ownership, confirmed
+  status, stopping, disconnect/replacement, action failure, and detach;
 - terminal Session Outcome: clean exit/signal, all allowlisted infrastructure
   failures, known/unknown Workload results, fragmentation/coalescing, malformed
   and impossible blocks, bounds, legacy input, attach presentation, cleanup
@@ -282,8 +290,8 @@ Supervisor. New Supervisors do not emit the legacy lines.
 
 1. No network or mount namespace, veth, routes, DNS view, NAT, firewall
    adapter, qdisc, or live Network Profile mutation is created.
-2. The unrestricted initial profile is semantic documentation only; status
-   still says `shaping: not applied`.
+2. The typed Profile Change path is integrated, but the production restore-only
+   adapter performs no shaping; status therefore still says `shaping: not applied`.
 3. No durable firewall recovery journal exists. Q47 remains open.
 4. DNS contents (Q64) and host-route/NAT policy (Q65) remain open, so Internet
    connectivity setup must not be implemented implicitly.

@@ -327,9 +327,90 @@ TEST(HelperProtocolTest, MapsEveryHelperCompletionOutcome)
     EXPECT_EQ(
         unknown.complete_profile_change(ProfileChangeCompletion::state_unknown),
         "ERROR PROFILE_STATE_UNKNOWN\n");
-    EXPECT_FALSE(unknown.receive_bytes("STOP TERM\n").valid);
+    const auto stops{unknown.receive_bytes("STOP TERM\nSTOP KILL\n")};
+    ASSERT_TRUE(stops.valid);
+    ASSERT_EQ(stops.commands.size(), 2U);
+    EXPECT_NE(std::get_if<StopTerminateCommand>(&stops.commands[0]), nullptr);
+    EXPECT_NE(std::get_if<StopKillCommand>(&stops.commands[1]), nullptr);
+    const auto refused_change{
+        unknown.receive_bytes("PROFILE_SET_DELAY OUTBOUND 20\n")};
+    EXPECT_TRUE(refused_change.valid);
+    EXPECT_TRUE(refused_change.commands.empty());
+    const auto later_stop{unknown.receive_bytes("STOP KILL\n")};
+    EXPECT_TRUE(later_stop.valid);
+    ASSERT_EQ(later_stop.commands.size(), 1U);
+    EXPECT_NE(std::get_if<StopKillCommand>(&later_stop.commands[0]), nullptr);
     EXPECT_FALSE(
         unknown.complete_profile_change(ProfileChangeCompletion::applied).has_value());
+}
+
+class InMemoryProfileChangeAdapter final : public ProfileChangeAdapter {
+public:
+    ProfileChangeCompletion apply(const ProfileChange& change) override
+    {
+        const ProfileChangeApplication application{
+            apply_profile_change(profile, change)};
+        const auto* applied{std::get_if<NetworkProfile>(&application)};
+        if (applied == nullptr) {
+            return ProfileChangeCompletion::state_unknown;
+        }
+        profile = *applied;
+        return ProfileChangeCompletion::applied;
+    }
+
+    NetworkProfile profile;
+};
+
+TEST(HelperProtocolTest, ExercisesSuccessfulPathThroughInjectedAdapter)
+{
+    HelperRuntimeConversation helper;
+    const auto request{
+        helper.receive_bytes("PROFILE_SET_DELAY OUTBOUND 10\n")};
+    ASSERT_TRUE(request.valid);
+    ASSERT_EQ(request.commands.size(), 1U);
+    const auto* change{std::get_if<ProfileChange>(&request.commands[0])};
+    ASSERT_NE(change, nullptr);
+    InMemoryProfileChangeAdapter adapter;
+
+    EXPECT_EQ(
+        complete_profile_change(helper, *change, adapter),
+        "PROFILE_OK\n");
+    EXPECT_EQ(adapter.profile.outbound.delay, 10ms);
+}
+
+TEST(HelperProtocolTest, StopRejectsLaterProfileChangesButAllowsEscalation)
+{
+    HelperRuntimeConversation helper;
+    const auto stop{helper.receive_bytes("STOP TERM\n")};
+    ASSERT_TRUE(stop.valid);
+    ASSERT_EQ(stop.commands.size(), 1U);
+
+    const auto repeated{helper.receive_bytes("STOP KILL\n")};
+    ASSERT_TRUE(repeated.valid);
+    ASSERT_EQ(repeated.commands.size(), 1U);
+
+    const auto change{
+        helper.receive_bytes("PROFILE_SET_DELAY OUTBOUND 10\n")};
+    EXPECT_FALSE(change.valid);
+    EXPECT_EQ(change.response, "ERROR INVALID_RUNTIME_COMMAND\n");
+}
+
+TEST(HelperProtocolTest, UnknownProfileStatePreservesLifecycleEventFraming)
+{
+    const ProfileChange change{SetDelay{TrafficDirection::outbound, 10ms}};
+    SupervisorHelperConversation supervisor;
+    ASSERT_EQ(supervisor.receive_bytes("READY\nACTIVE 123\n").size(), 2U);
+    ASSERT_TRUE(supervisor.begin_profile_change(change).has_value());
+
+    const auto events{supervisor.receive_bytes(
+        "ERROR PROFILE_STATE_UNKNOWN\n"
+        "WORKLOAD_EXITED 7\n"
+        "CLEANUP_FAILED\n")};
+
+    ASSERT_EQ(events.size(), 3U);
+    EXPECT_NE(std::get_if<ProfileStateUnknownEvent>(&events[0]), nullptr);
+    EXPECT_NE(std::get_if<WorkloadExitedEvent>(&events[1]), nullptr);
+    EXPECT_NE(std::get_if<CleanupFailedEvent>(&events[2]), nullptr);
 }
 
 TEST(HelperProtocolTest, TerminalWorkloadEventCancelsPendingProfileState)

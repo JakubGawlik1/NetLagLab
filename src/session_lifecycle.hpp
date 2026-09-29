@@ -19,6 +19,7 @@ struct WorkloadResult {
 enum class InfrastructureFailure {
     start,
     conversation,
+    profile_state,
     stop_request,
     cleanup,
     launcher_reaping,
@@ -41,6 +42,7 @@ enum class LifecycleEventKind {
     cleanup_succeeded,
     cleanup_failed,
     conversation_lost,
+    profile_state_unknown,
     controller_lost,
     terminal_interrupt,
     stop_requested,

@@ -36,13 +36,13 @@ error streams of the terminal in which `netlaglab run` was started.
 The controller accepts newline-terminated commands:
 
 - `help` lists the controller commands;
-- `status` shows the application PID and arguments, followed by the default outbound and inbound
-  profiles;
+- `status` shows the application PID and arguments, public running/stopping state, and the last
+  helper-confirmed outbound and inbound profiles;
 - `stop` requests `SIGTERM`, waits five seconds, then requests `SIGKILL` if the application has
   not exited;
 - `detach` disconnects the controller without stopping the application or its supervisor.
 
-The Controller also validates the future Profile Change syntax:
+The Controller validates and dispatches Profile Changes with this syntax:
 
 ```text
 set <outbound|inbound> <delay|jitter|loss|bandwidth> <value>
@@ -53,12 +53,16 @@ Delay and jitter use milliseconds by default and accept `ms` or `s`. Bandwidth u
 by default and accepts `kbps` or `mbps`; it must be greater than zero. Loss uses percent by
 default, accepts `%`, and must be between 0 and 100 inclusive. Units may be attached or
 separated. Commands and names are lowercase; spaces and tabs may surround and separate tokens.
-These commands currently respond with `ERROR Profile changes are not available yet.` and do
-not change the profile. `help` therefore does not advertise them yet.
+The production helper currently responds with
+`ERROR Profile change could not be applied; previous profile remains active.` because the real
+traffic-shaping adapter is not implemented. The request still crosses the typed privilege
+boundary and completes deterministically. `help` does not advertise these commands until the
+production backend can apply them successfully.
 
-Controller lines are limited to 1024 raw bytes before trimming. Ordinary syntax errors return
-a fixed `ERROR` response and keep the Controller connected. An oversized command reports the
-limit error and disconnects the Controller.
+Controller lines are limited to 1024 raw bytes before trimming. At most 32 parsed commands may
+wait behind the operation in flight. Ordinary syntax errors return a fixed `ERROR` response and
+do not consume queue capacity. An oversized command or queue overflow reports a fixed error and
+disconnects the Controller without cancelling an already dispatched Profile Change.
 
 The status output says `shaping: not applied`. NetLagLab does not apply the displayed network
 profile in this stage of the project.

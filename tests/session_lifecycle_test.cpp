@@ -351,12 +351,55 @@ TEST(SessionLifecycleTest, WorkloadResultEndsAnActiveStopDeadline)
     EXPECT_EQ(adapter.waits.back(), LifecycleWait::indefinitely);
 }
 
+TEST(SessionLifecycleTest, ProfileStateFailureStopsAndPreservesLaterOutcomes)
+{
+    ScriptedLifecycleAdapter adapter{
+        {{LifecycleEventKind::activated, 4321},
+         {LifecycleEventKind::profile_state_unknown},
+         {LifecycleEventKind::workload_exited, 17},
+         {LifecycleEventKind::cleanup_failed}}};
+
+    const SessionOutcome outcome{run_session_lifecycle(adapter)};
+
+    EXPECT_EQ(adapter.stop_requests, (std::vector{StopRequest::terminate}));
+    ASSERT_TRUE(outcome.workload.has_value());
+    EXPECT_EQ(outcome.workload->value, 17);
+    EXPECT_EQ(
+        outcome.infrastructure_failures,
+        (std::vector{
+            InfrastructureFailure::profile_state,
+            InfrastructureFailure::cleanup}));
+}
+
+TEST(SessionLifecycleTest, ProfileStateFailurePreservesExistingStopDeadline)
+{
+    ScriptedLifecycleAdapter adapter{
+        {{LifecycleEventKind::activated, 4321},
+         {LifecycleEventKind::stop_requested},
+         {LifecycleEventKind::profile_state_unknown},
+         {LifecycleEventKind::deadline_expired},
+         {LifecycleEventKind::workload_signaled, 9},
+         {LifecycleEventKind::cleanup_succeeded}}};
+
+    const SessionOutcome outcome{run_session_lifecycle(adapter)};
+
+    EXPECT_EQ(
+        adapter.stop_requests,
+        (std::vector{StopRequest::terminate, StopRequest::kill}));
+    ASSERT_TRUE(outcome.workload.has_value());
+    EXPECT_EQ(outcome.workload->value, 9);
+    EXPECT_EQ(
+        outcome.infrastructure_failures,
+        (std::vector{InfrastructureFailure::profile_state}));
+}
+
 TEST(SessionPresentationTest, ReportsEveryInfrastructureFailureAndWorkloadResult)
 {
     const SessionOutcome outcome{
         .workload = WorkloadResult{WorkloadResultKind::exited, 7},
         .infrastructure_failures = {
             InfrastructureFailure::conversation,
+            InfrastructureFailure::profile_state,
             InfrastructureFailure::cleanup,
         },
     };
@@ -366,6 +409,7 @@ TEST(SessionPresentationTest, ReportsEveryInfrastructureFailureAndWorkloadResult
 
     EXPECT_EQ(session_exit_status(outcome), 125);
     EXPECT_NE(error.str().find("helper conversation"), std::string::npos);
+    EXPECT_NE(error.str().find("unknown network profile state"), std::string::npos);
     EXPECT_NE(error.str().find("privileged cleanup"), std::string::npos);
     EXPECT_NE(error.str().find("Workload result was 7"), std::string::npos);
 }

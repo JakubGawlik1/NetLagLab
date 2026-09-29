@@ -100,6 +100,9 @@ it send `ACTIVE <pid>`. `START_FAILED 126|127` remains a pre-activation result.
   the Session.
 - Only one Controller operation is in flight at a time. Profile status changes
   only after helper acknowledgement.
+- Unknown or internally inconsistent profile state ends profile mutation but
+  keeps the helper conversation available for stop escalation, the Workload
+  terminal result, and cleanup.
 - Natural Workload exit, a terminal signal handled by `netlaglab run`, and a
   Controller `stop` request all converge on reaping followed by cleanup.
 
@@ -118,6 +121,13 @@ lifecycle events and launcher outcomes. Deterministic tests provide scripted
 events and outcomes at those same seams; the design does not introduce one
 general-purpose mock of Linux system calls.
 
+When several descriptors are ready in one poll cycle, the production adapter
+handles helper frames, terminal self-pipe markers, a new Controller connection,
+and active Controller bytes in that order. It executes each control-plane
+action batch before moving to the next source. On the first terminal marker it
+updates the control plane to public `stopping` before returning the interrupt
+to the blocking lifecycle.
+
 ### Stop policy
 
 - Controller `stop` or Supervisor loss sends `SIGTERM` to the directly managed
@@ -133,6 +143,11 @@ general-purpose mock of Linux system calls.
   not a descendant process group.
 - The Workload child uses `PR_SET_PDEATHSIG(SIGKILL)` so unexpected helper
   death does not leave that directly managed process without its owner.
+- A `profile_state` failure records that infrastructure failure and starts the
+  same TERM-to-KILL path if no stop is active. If stopping is already active,
+  the failure neither sends a duplicate initial request nor restarts its
+  deadline. In both cases the lifecycle continues through Workload reaping and
+  privileged cleanup.
 
 ### Result precedence
 
@@ -144,6 +159,10 @@ general-purpose mock of Linux system calls.
 - Infrastructure failure, unknown privileged state, reaping failure, or
   cleanup failure overrides the Workload result with `125`. Diagnostics should
   still preserve both the Workload outcome and the infrastructure failure.
+- Unknown or internally inconsistent profile state is recorded as the
+  dedicated `profile_state` infrastructure failure and serialized to a
+  Controller as `FAILURE PROFILE_STATE`; it is not collapsed into a generic
+  helper-conversation failure.
 - A requested stop returns the Workload's actual final status; it is not
   converted to unconditional success.
 - `netlaglab attach` returns `0` after correctly observing a clean Session end,
@@ -183,6 +202,8 @@ contracts:
    outcome;
 5. Controller loss does not stop the Session, the first terminal Ctrl-C starts
    the grace period, and the second requests immediate `SIGKILL`.
+6. unknown profile state records `profile_state`, preserves an existing stop
+   deadline, and still preserves the Workload result plus any cleanup failure.
 
 Conversation framing and malformed-input behavior belong to focused tests of
 the conversation module rather than being duplicated here. Local unprivileged

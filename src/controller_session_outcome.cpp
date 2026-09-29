@@ -22,9 +22,10 @@ struct FailureWireMapping {
     std::string_view code;
 };
 
-constexpr std::array<FailureWireMapping, 7> failure_wire_mappings{{
+constexpr std::array<FailureWireMapping, 8> failure_wire_mappings{{
     {InfrastructureFailure::start, "STARTUP"},
     {InfrastructureFailure::conversation, "HELPER_CONVERSATION"},
+    {InfrastructureFailure::profile_state, "PROFILE_STATE"},
     {InfrastructureFailure::stop_request, "STOP_REQUEST"},
     {InfrastructureFailure::cleanup, "PRIVILEGED_CLEANUP"},
     {InfrastructureFailure::launcher_reaping, "LAUNCHER_REAPING"},

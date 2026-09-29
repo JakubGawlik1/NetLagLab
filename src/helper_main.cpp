@@ -442,6 +442,16 @@ struct InvokingIds {
     return workload.wait().has_value();
 }
 
+class RestoreOnlyProfileChangeAdapter final
+    : public netlaglab::ProfileChangeAdapter {
+public:
+    netlaglab::ProfileChangeCompletion apply(
+        const netlaglab::ProfileChange&) override
+    {
+        return netlaglab::ProfileChangeCompletion::restored_after_failure;
+    }
+};
+
 [[nodiscard]] int supervise_workload(
     const int supervisor_descriptor,
     netlaglab::WorkloadProcess workload,
@@ -449,6 +459,7 @@ struct InvokingIds {
     std::ostream& error)
 {
     netlaglab::HelperRuntimeConversation conversation;
+    RestoreOnlyProfileChangeAdapter profile_change_adapter;
     while (true) {
         const netlaglab::WorkloadPollResult workload_result{workload.poll()};
         if (workload_result.state == netlaglab::WorkloadPollState::error) {
@@ -512,7 +523,17 @@ struct InvokingIds {
         }
         for (const netlaglab::HelperRuntimeCommand& command : commands.commands) {
             if (std::holds_alternative<netlaglab::ProfileChange>(command)) {
-                // The protocol checkpoint deliberately has no shaping adapter yet.
+                const auto& change{std::get<netlaglab::ProfileChange>(command)};
+                const std::optional<std::string> response{
+                    netlaglab::complete_profile_change(
+                        conversation, change, profile_change_adapter)};
+                if (!response.has_value()
+                    || !netlaglab::send_socket_text(
+                        supervisor_descriptor, *response)) {
+                    error << "NetLagLab helper: failed to complete Profile Change\n";
+                    (void)stop_after_supervisor_loss(workload);
+                    return 125;
+                }
                 continue;
             }
             const int signal_number{

@@ -39,8 +39,8 @@ and accepted feature documents before its interface is designed.
 |---|---|---|
 | [Session lifecycle](session-lifecycle.md) | Session scope, startup, termination, result precedence, and host-wide exclusivity | Lifecycle checkpoint implemented; privileged network resources remain absent |
 | [Workload execution](workload-execution.md) | Workload parentage, namespace entry, user identity, execution context, and descendant ownership | Helper-owned launch and execution context implemented; namespace entry remains absent |
-| [Supervisor-helper protocol](supervisor-helper-protocol.md) | Privilege boundary, authentication, framing, start block, commands, acknowledgements, and events | Lifecycle/start/stop protocol implemented; profile mutation vocabulary remains open |
-| [Controller control plane](controller-control-plane.md) | Attached commands, value grammar, serialization, status, stop, detach, and terminal responses | Typed `set`/`reset` parser and existing commands implemented; helper dispatch, queuing, confirmed Network Profile updates, and detailed terminal results remain target design |
+| [Supervisor-helper protocol](supervisor-helper-protocol.md) | Privilege boundary, authentication, framing, start block, commands, acknowledgements, and events | Lifecycle, typed Profile Change conversations, and production Controller dispatch implemented; real privileged shaping remains absent |
+| [Controller control plane](controller-control-plane.md) | Attached commands, value grammar, serialization, status, stop, detach, and terminal responses | Event/action module, bounded queue, reply ownership, confirmed profile, stopping state, and complete Session Outcome implemented |
 | [Network environment](network-environment.md) | Network namespace, veth pair, addresses, routing, DNS mount, and readiness | Manually verified only; DNS contents and host route policy remain open |
 | [Host networking and firewall](host-networking-and-firewall.md) | Forwarding preflight, NAT, firewall adapters, consent, and host-policy boundaries | Manually verified only; production adapters and recovery are not implemented |
 | [Traffic shaping](traffic-shaping.md) | Network Profile semantics, direction mapping, `tc/netem`, live deltas, and rollback | Typed validation implemented; runtime shaping is not implemented |
@@ -97,6 +97,8 @@ Three decisions are deliberately unresolved:
 3. **Persistent recovery journal (Q47):** the final path, schema, transaction
    protocol, and reconciliation behavior for persistent firewall changes.
 
-The profile-mutation portion of the helper protocol remains implementation
-design work. The implemented lifecycle frames and remaining open vocabulary
-are recorded in [Supervisor-helper protocol](supervisor-helper-protocol.md).
+The profile-mutation path has an implemented typed conversation, Controller
+dispatch, bounded queue, and confirmed-profile update checkpoint. The real
+privileged shaping adapter remains unimplemented; its accepted contracts are
+recorded in [Controller control plane](controller-control-plane.md) and
+[Supervisor-helper protocol](supervisor-helper-protocol.md).

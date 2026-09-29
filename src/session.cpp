@@ -1,6 +1,7 @@
 #include "session.hpp"
 
 #include "controller_control_plane.hpp"
+#include "control_plane_action_executor.hpp"
 #include "controller_session_outcome.hpp"
 #include "file_descriptor.hpp"
 #include "helper_process.hpp"
@@ -148,9 +149,10 @@ private:
 [[nodiscard]] bool accept_controller(
     const int listening_descriptor,
     std::optional<FileDescriptor>& client,
-    std::optional<ControllerConversation>& conversation,
-    const pid_t workload_pid,
-    char* const child_arguments[],
+    ControllerControlPlane& control_plane,
+    SupervisorHelperConversation& helper_conversation,
+    const int helper_descriptor,
+    std::deque<LifecycleEvent>& pending_events,
     std::ostream& error)
 {
     int accepted_descriptor{};
@@ -169,11 +171,13 @@ private:
         return true;
     }
     client.emplace(accepted_descriptor);
-    conversation.emplace(workload_pid, child_arguments);
-    if (!send_controller_attached(client->get())) {
-        client.reset();
-        conversation.reset();
-    }
+    const std::vector<LifecycleEvent> events{execute_control_plane_actions(
+        control_plane.handle(ControllerAttachedEvent{}),
+        control_plane,
+        client,
+        helper_descriptor,
+        helper_conversation)};
+    pending_events.insert(pending_events.end(), events.begin(), events.end());
     return true;
 }
 
@@ -315,6 +319,10 @@ public:
                 const std::size_t count{signal_pipe_.take_interrupt_count()};
                 if (!workload_finished_) {
                     for (std::size_t index{}; index < count; ++index) {
+                        if (control_plane_.has_value()) {
+                            execute_control_actions(
+                                control_plane_->handle(SessionStoppingEvent{}));
+                        }
                         pending_events_.push_back(
                             {LifecycleEventKind::terminal_interrupt});
                     }
@@ -325,9 +333,10 @@ public:
                 && !accept_controller(
                     listening_socket_->get(),
                     client_,
-                    controller_conversation_,
-                    workload_pid_,
-                    child_arguments_,
+                    *control_plane_,
+                    conversation_,
+                    helper_socket_.get(),
+                    pending_events_,
                     error_)) {
                 pending_events_.push_back({LifecycleEventKind::conversation_lost});
             }
@@ -337,20 +346,32 @@ public:
 
             if (!workload_finished_ && client_.has_value()
                 && (descriptors[2].revents & POLLIN) != 0) {
-                const ControllerReadResult result{
-                    controller_conversation_->receive(client_->get())};
-                if (result == ControllerReadResult::disconnected) {
+                const bool drain_to_eof{
+                    (descriptors[2].revents & POLLHUP) != 0};
+                SocketReadStatus status{SocketReadStatus::data_received};
+                do {
+                    std::string bytes;
+                    const SocketReadResult result{
+                        read_socket_data(client_->get(), bytes)};
+                    status = result.status;
+                    if (status == SocketReadStatus::data_received) {
+                        execute_control_actions(control_plane_->handle(
+                            ControllerBytesReceivedEvent{std::move(bytes)}));
+                    }
+                } while (client_.has_value() && drain_to_eof
+                         && status == SocketReadStatus::data_received);
+
+                if (client_.has_value()
+                    && status != SocketReadStatus::data_received) {
+                    (void)control_plane_->handle(ControllerDisconnectedEvent{});
                     client_.reset();
-                    controller_conversation_.reset();
                     pending_events_.push_back({LifecycleEventKind::controller_lost});
-                } else if (result == ControllerReadResult::stop_requested) {
-                    pending_events_.push_back({LifecycleEventKind::stop_requested});
                 }
             }
             if (client_.has_value()
                 && (descriptors[2].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0) {
+                (void)control_plane_->handle(ControllerDisconnectedEvent{});
                 client_.reset();
-                controller_conversation_.reset();
                 pending_events_.push_back({LifecycleEventKind::controller_lost});
             }
 
@@ -397,10 +418,21 @@ public:
             }
         }
         client_.reset();
-        controller_conversation_.reset();
+        control_plane_.reset();
     }
 
 private:
+    void execute_control_actions(const std::vector<ControlPlaneAction>& actions)
+    {
+        const std::vector<LifecycleEvent> events{execute_control_plane_actions(
+            actions,
+            *control_plane_,
+            client_,
+            helper_socket_.get(),
+            conversation_)};
+        pending_events_.insert(pending_events_.end(), events.begin(), events.end());
+    }
+
     void read_helper_events()
     {
         std::string bytes;
@@ -422,6 +454,7 @@ private:
             }
             if (const auto* activated{std::get_if<ActivatedEvent>(&event)}) {
                 workload_pid_ = static_cast<pid_t>(activated->workload_pid);
+                control_plane_.emplace(workload_pid_, child_arguments_);
                 const int descriptor{
                     control_socket_owner_.create_listening_socket(error_)};
                 if (descriptor == -1) {
@@ -430,8 +463,23 @@ private:
                 }
                 listening_socket_.emplace(descriptor);
                 activated_ = true;
+            } else if (const auto* profile_result{
+                           std::get_if<ProfileChangeResultEvent>(&event)}) {
+                execute_control_actions(control_plane_->handle(
+                    HelperProfileChangeResultEvent{
+                        profile_result->result == ProfileChangeResult::applied
+                            ? ControlPlaneProfileChangeResult::applied
+                            : ControlPlaneProfileChangeResult::restored_after_failure,
+                        profile_result->change}));
+                continue;
+            } else if (std::holds_alternative<ProfileStateUnknownEvent>(event)) {
+                execute_control_actions(control_plane_->handle(
+                    HelperProfileStateUnknownEvent{}));
+                continue;
             } else if (std::holds_alternative<WorkloadExitedEvent>(event)
                        || std::holds_alternative<WorkloadSignaledEvent>(event)) {
+                execute_control_actions(
+                    control_plane_->handle(WorkloadTerminalEvent{}));
                 workload_finished_ = true;
                 activated_ = false;
             }
@@ -457,7 +505,7 @@ private:
     SupervisorHelperConversation conversation_;
     std::deque<LifecycleEvent> pending_events_;
     std::optional<FileDescriptor> client_;
-    std::optional<ControllerConversation> controller_conversation_;
+    std::optional<ControllerControlPlane> control_plane_;
     std::optional<std::chrono::steady_clock::time_point> deadline_;
     pid_t workload_pid_{};
     bool activated_{false};

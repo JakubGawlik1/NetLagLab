@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-09-28
+Last verified: 2026-09-29
 
 ## How to use this file
 
@@ -34,11 +34,12 @@ cross-platform support are not current goals.
 - One Supervisor owns the per-user Session, lock, `control.sock`, and at most
   one attached Controller. `attach` supports `help`, `status`, `stop`, and
   `detach`; Controller loss does not stop the application. Its pure typed
-  parser also validates and normalizes `set`/`reset` Profile Changes. Profile
-  Changes belong to the shared domain model, apply atomically to Network
-  Profiles, and round-trip through stateful, independently validating
-  Supervisor/helper conversations. They remain reported as unavailable until
-  Controller dispatch and a shaping adapter exist. An attached Controller
+  `ControllerControlPlane` owns framing, a bounded serialized command queue,
+  reply ownership, public running/stopping state, and the last helper-confirmed
+  Network Profile. Its typed `set`/`reset` Profile Changes are dispatched
+  through independently validating Supervisor/helper conversations. Until a
+  real shaping backend exists, the production helper explicitly reports every
+  change as restored after failure, so status remains truthful. An attached Controller
   receives the complete typed Session Outcome after Supervisor cleanup and
   reports the Workload result independently from infrastructure failures.
 - Session paths and Unix sockets are validated for ownership, type, permissions,

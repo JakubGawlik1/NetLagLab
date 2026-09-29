@@ -16,6 +16,7 @@ add_executable(
     netlaglab
     src/attach_client.cpp
     src/attach_session_presentation.cpp
+    src/control_plane_action_executor.cpp
     src/controller_control_plane.cpp
     src/controller_session_outcome.cpp
     src/helper_process.cpp
@@ -144,8 +145,11 @@ if(BUILD_TESTING)
 
     add_executable(
         netlaglab_controller_protocol_tests
+        src/control_plane_action_executor.cpp
         src/controller_control_plane.cpp
+        src/helper_protocol.cpp
         src/socket_io.cpp
+        src/workload_context.cpp
         tests/controller_control_plane_test.cpp
     )
     target_include_directories(netlaglab_controller_protocol_tests PRIVATE src)

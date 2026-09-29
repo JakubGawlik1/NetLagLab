@@ -4,12 +4,14 @@
 
 #include "netlaglab/network_profile.hpp"
 
+#include <algorithm>
 #include <array>
 #include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -372,11 +374,14 @@ void append_direction_status(
 
 [[nodiscard]] std::string build_status(
     const pid_t workload_pid,
-    char* const child_arguments[])
+    const std::vector<std::string>& child_arguments,
+    const NetworkProfile& profile,
+    const bool stopping,
+    const bool shaping_applied)
 {
-    const NetworkProfile profile{};
     std::ostringstream tail_stream;
-    tail_stream << "shaping: not applied\n";
+    tail_stream << "shaping: "
+                << (shaping_applied ? "applied\n" : "not applied\n");
     append_direction_status(tail_stream, "outbound", profile.outbound);
     append_direction_status(tail_stream, "inbound", profile.inbound);
     tail_stream << "STATUS_END\n";
@@ -386,17 +391,19 @@ void append_direction_status(
     const std::size_t content_limit{
         maximum_status_size - tail.size() - truncated_notice.size()};
     std::ostringstream header_stream;
-    header_stream << "STATUS_BEGIN\nstate: running\npid: " << workload_pid
+    header_stream << "STATUS_BEGIN\nstate: "
+                  << (stopping ? "stopping" : "running")
+                  << "\npid: " << workload_pid
                   << "\nprogram: ";
     std::string response{header_stream.str()};
 
     bool truncated{false};
-    if (!append_escaped_limited(response, child_arguments[0], content_limit - 1)) {
+    if (!append_escaped_limited(response, child_arguments.front(), content_limit - 1)) {
         truncated = true;
     }
     response.push_back('\n');
     if (!truncated) {
-        for (std::size_t source_index{1}; child_arguments[source_index] != nullptr;
+        for (std::size_t source_index{1}; source_index < child_arguments.size();
              ++source_index) {
             const std::string prefix{
                 "argument[" + std::to_string(source_index - 1) + "]: "};
@@ -420,12 +427,6 @@ void append_direction_status(
     response.append(tail);
     return response;
 }
-
-enum class CommandResult {
-    keep_connected,
-    disconnect,
-    stop_requested,
-};
 
 [[nodiscard]] std::string_view controller_parse_error_response(
     const ControllerParseError error) noexcept
@@ -457,65 +458,23 @@ enum class CommandResult {
     return "ERROR Unknown command.\n";
 }
 
-[[nodiscard]] bool send_controller_parse_error(
-    const int socket_descriptor,
-    const ControllerParseError error)
-{
-    return send_socket_text(
-        socket_descriptor, controller_parse_error_response(error));
-}
+constexpr std::string_view help_response{
+    "HELP_BEGIN\n"
+    "help - Show controller commands\n"
+    "status - Show the active session\n"
+    "stop - Stop the active Workload\n"
+    "detach - Disconnect this controller\n"
+    "HELP_END\n"};
 
-[[nodiscard]] CommandResult handle_command(
-    const int socket_descriptor,
-    const std::string_view command,
-    const pid_t workload_pid,
-    char* const child_arguments[])
+void append_before_dispatch(
+    std::vector<ControlPlaneAction>& actions,
+    ControlPlaneAction action)
 {
-    const ControllerParseResult parsed{parse_controller_command(command)};
-    if (std::holds_alternative<IgnoredControllerCommand>(parsed)) {
-        return CommandResult::keep_connected;
-    }
-    if (const auto* error{std::get_if<ControllerParseError>(&parsed)}) {
-        const bool sent{send_controller_parse_error(socket_descriptor, *error)};
-        return sent && *error != ControllerParseError::command_too_long
-            ? CommandResult::keep_connected
-            : CommandResult::disconnect;
-    }
-
-    const ControllerCommand& typed_command{std::get<ControllerCommand>(parsed)};
-    if (std::holds_alternative<HelpControllerCommand>(typed_command)) {
-        constexpr std::string_view response{
-            "HELP_BEGIN\n"
-            "help - Show controller commands\n"
-            "status - Show the active session\n"
-            "stop - Stop the active Workload\n"
-            "detach - Disconnect this controller\n"
-            "HELP_END\n"};
-        return send_socket_text(socket_descriptor, response)
-            ? CommandResult::keep_connected : CommandResult::disconnect;
-    }
-    if (std::holds_alternative<StatusControllerCommand>(typed_command)) {
-        return send_socket_text(
-                   socket_descriptor,
-                   build_status(workload_pid, child_arguments))
-            ? CommandResult::keep_connected : CommandResult::disconnect;
-    }
-    if (std::holds_alternative<ProfileChange>(typed_command)) {
-        return send_socket_text(
-                   socket_descriptor,
-                   "ERROR Profile changes are not available yet.\n")
-            ? CommandResult::keep_connected
-            : CommandResult::disconnect;
-    }
-    if (std::holds_alternative<StopControllerCommand>(typed_command)) {
-        return send_socket_text(socket_descriptor, "STOPPING\n")
-            ? CommandResult::stop_requested : CommandResult::disconnect;
-    }
-    if (std::holds_alternative<DetachControllerCommand>(typed_command)) {
-        (void)send_socket_text(socket_descriptor, "DETACHED\n");
-        return CommandResult::disconnect;
-    }
-    return CommandResult::disconnect;
+    const auto dispatch{std::find_if(
+        actions.begin(), actions.end(), [](const ControlPlaneAction& candidate) {
+            return std::holds_alternative<DispatchProfileChangeAction>(candidate);
+        })};
+    actions.insert(dispatch, std::move(action));
 }
 
 } // namespace
@@ -563,48 +522,260 @@ ControllerParseResult parse_controller_command(std::string_view line)
         : ControllerParseResult{ControllerParseError::unknown_command};
 }
 
-ControllerConversation::ControllerConversation(
+ControllerControlPlane::ControllerControlPlane(
     const pid_t workload_pid,
-    char* const child_arguments[]) noexcept
-    : workload_pid_{workload_pid}, child_arguments_{child_arguments}
+    char* const child_arguments[])
+    : workload_pid_{workload_pid}
 {
+    for (std::size_t index{}; child_arguments[index] != nullptr; ++index) {
+        child_arguments_.emplace_back(child_arguments[index]);
+    }
 }
 
-ControllerReadResult ControllerConversation::receive(
-    const int socket_descriptor)
+void ControllerControlPlane::disconnect_controller() noexcept
 {
-    const SocketReadResult read_result{
-        read_socket_data(socket_descriptor, read_buffer_)};
-    if (read_result.status != SocketReadStatus::data_received) {
-        return ControllerReadResult::disconnected;
+    controller_attached_ = false;
+    read_buffer_.clear();
+    command_queue_.clear();
+    if (in_flight_profile_change_.has_value()) {
+        in_flight_profile_change_->reply_generation.reset();
+    }
+}
+
+void ControllerControlPlane::enter_stopping(
+    std::vector<ControlPlaneAction>& actions)
+{
+    if (!stopping_) {
+        actions.insert(actions.begin(), RequestLifecycleStopAction{});
+        stopping_ = true;
+    }
+    command_queue_.clear();
+    if (in_flight_profile_change_.has_value()) {
+        in_flight_profile_change_->reply_generation.reset();
+        if (in_flight_profile_change_->dispatch_pending_execution) {
+            actions.erase(
+                std::remove_if(
+                    actions.begin(), actions.end(), [](const auto& action) {
+                        return std::holds_alternative<
+                            DispatchProfileChangeAction>(action);
+                    }),
+                actions.end());
+            in_flight_profile_change_.reset();
+        }
+    }
+    append_before_dispatch(
+        actions, SendControllerTextAction{"STOPPING\n"});
+}
+
+void ControllerControlPlane::process_command(
+    ControllerCommand command,
+    std::vector<ControlPlaneAction>& actions)
+{
+    if (std::holds_alternative<StopControllerCommand>(command)) {
+        enter_stopping(actions);
+        return;
     }
 
-    while (true) {
-        const std::optional<std::string> command{take_next_line(read_buffer_)};
-        if (!command.has_value()) {
+    if (std::holds_alternative<ProfileChange>(command) && stopping_) {
+        append_before_dispatch(
+            actions,
+            SendControllerTextAction{"ERROR Session is stopping.\n"});
+        return;
+    }
+
+    if (in_flight_profile_change_.has_value() && !stopping_) {
+        if (command_queue_.size() >= 32) {
+            append_before_dispatch(
+                actions,
+                SendControllerTextAction{"ERROR Too many queued commands.\n"});
+            append_before_dispatch(actions, DisconnectControllerAction{});
+            disconnect_controller();
+            return;
+        }
+        command_queue_.push_back(
+            QueuedCommand{std::move(command), connection_generation_});
+        return;
+    }
+
+    if (std::holds_alternative<HelpControllerCommand>(command)) {
+        append_before_dispatch(
+            actions, SendControllerTextAction{std::string{help_response}});
+        return;
+    }
+    if (std::holds_alternative<StatusControllerCommand>(command)) {
+        append_before_dispatch(
+            actions,
+            SendControllerTextAction{build_status(
+                workload_pid_, child_arguments_, confirmed_profile_, stopping_,
+                shaping_applied_)});
+        return;
+    }
+    if (const auto* change{std::get_if<ProfileChange>(&command)}) {
+        in_flight_profile_change_ = InFlightProfileChange{
+            *change, connection_generation_, true};
+        actions.emplace_back(DispatchProfileChangeAction{*change});
+        return;
+    }
+    if (std::holds_alternative<DetachControllerCommand>(command)) {
+        append_before_dispatch(
+            actions, SendControllerTextAction{"DETACHED\n"});
+        append_before_dispatch(actions, DisconnectControllerAction{});
+        disconnect_controller();
+    }
+}
+
+void ControllerControlPlane::drain_queue(
+    std::vector<ControlPlaneAction>& actions)
+{
+    while (controller_attached_ && !in_flight_profile_change_.has_value()
+           && !command_queue_.empty()) {
+        QueuedCommand queued{std::move(command_queue_.front())};
+        command_queue_.pop_front();
+        if (queued.connection_generation != connection_generation_) {
+            continue;
+        }
+        process_command(std::move(queued.command), actions);
+    }
+}
+
+std::vector<ControlPlaneAction> ControllerControlPlane::handle(
+    const ControlPlaneEvent& event)
+{
+    const bool write_failed{
+        std::holds_alternative<ControllerWriteFailedEvent>(event)};
+    if (!write_failed && in_flight_profile_change_.has_value()) {
+        in_flight_profile_change_->dispatch_pending_execution = false;
+    }
+
+    std::vector<ControlPlaneAction> actions;
+    if (std::holds_alternative<ControllerAttachedEvent>(event)) {
+        ++connection_generation_;
+        controller_attached_ = true;
+        read_buffer_.clear();
+        actions.emplace_back(SendControllerTextAction{"ATTACHED\n"});
+        return actions;
+    }
+    if (std::holds_alternative<ControllerDisconnectedEvent>(event)) {
+        disconnect_controller();
+        return actions;
+    }
+    if (write_failed) {
+        if (in_flight_profile_change_.has_value()
+            && in_flight_profile_change_->dispatch_pending_execution) {
+            in_flight_profile_change_.reset();
+        }
+        disconnect_controller();
+        return actions;
+    }
+    if (std::holds_alternative<SessionStoppingEvent>(event)) {
+        stopping_ = true;
+        command_queue_.clear();
+        if (in_flight_profile_change_.has_value()) {
+            in_flight_profile_change_->reply_generation.reset();
+        }
+        return actions;
+    }
+    if (std::holds_alternative<WorkloadTerminalEvent>(event)) {
+        workload_terminal_ = true;
+        command_queue_.clear();
+        if (in_flight_profile_change_.has_value()) {
+            in_flight_profile_change_->reply_generation.reset();
+        }
+        return actions;
+    }
+    if (std::holds_alternative<HelperProfileStateUnknownEvent>(event)) {
+        if (!profile_state_failed_) {
+            profile_state_failed_ = true;
+            command_queue_.clear();
+            if (in_flight_profile_change_.has_value()) {
+                in_flight_profile_change_->reply_generation.reset();
+            }
+            actions.emplace_back(FailSessionForUnknownProfileStateAction{});
+        }
+        return actions;
+    }
+    if (const auto* result{
+            std::get_if<HelperProfileChangeResultEvent>(&event)}) {
+        if (!in_flight_profile_change_.has_value()
+            || in_flight_profile_change_->change != result->change) {
+            if (!workload_terminal_ && !profile_state_failed_) {
+                profile_state_failed_ = true;
+                command_queue_.clear();
+                actions.emplace_back(FailSessionForUnknownProfileStateAction{});
+            }
+            return actions;
+        }
+
+        const std::optional<std::uint64_t> reply_generation{
+            in_flight_profile_change_->reply_generation};
+        in_flight_profile_change_.reset();
+        if (result->result == ControlPlaneProfileChangeResult::applied) {
+            const ProfileChangeApplication applied{
+                apply_profile_change(confirmed_profile_, result->change)};
+            const auto* profile{std::get_if<NetworkProfile>(&applied)};
+            if (profile == nullptr) {
+                profile_state_failed_ = true;
+                command_queue_.clear();
+                actions.emplace_back(FailSessionForUnknownProfileStateAction{});
+                return actions;
+            }
+            confirmed_profile_ = *profile;
+            shaping_applied_ = true;
+            if (!workload_terminal_ && !stopping_ && controller_attached_
+                && reply_generation == connection_generation_) {
+                actions.emplace_back(
+                    SendControllerTextAction{"PROFILE_CHANGED\n"});
+            }
+        } else if (!workload_terminal_ && !stopping_ && controller_attached_
+                   && reply_generation == connection_generation_) {
+            actions.emplace_back(SendControllerTextAction{
+                "ERROR Profile change could not be applied; previous profile remains active.\n"});
+        }
+        if (!workload_terminal_ && !profile_state_failed_) {
+            drain_queue(actions);
+        }
+        return actions;
+    }
+
+    const auto* received{std::get_if<ControllerBytesReceivedEvent>(&event)};
+    if (received == nullptr || !controller_attached_ || workload_terminal_
+        || profile_state_failed_) {
+        return actions;
+    }
+    read_buffer_.append(received->bytes);
+    while (controller_attached_) {
+        const std::optional<std::string> line{take_next_line(read_buffer_)};
+        if (!line.has_value()) {
             break;
         }
-        const CommandResult result{handle_command(
-            socket_descriptor, *command, workload_pid_, child_arguments_)};
-        if (result == CommandResult::disconnect) {
-            return ControllerReadResult::disconnected;
+        const ControllerParseResult parsed{parse_controller_command(*line)};
+        if (std::holds_alternative<IgnoredControllerCommand>(parsed)) {
+            continue;
         }
-        if (result == CommandResult::stop_requested) {
-            return ControllerReadResult::stop_requested;
+        if (const auto* error{std::get_if<ControllerParseError>(&parsed)}) {
+            append_before_dispatch(
+                actions,
+                SendControllerTextAction{
+                    std::string{controller_parse_error_response(*error)}});
+            if (*error == ControllerParseError::command_too_long) {
+                append_before_dispatch(actions, DisconnectControllerAction{});
+                disconnect_controller();
+            }
+            continue;
         }
+        process_command(std::get<ControllerCommand>(parsed), actions);
     }
-
-    if (read_buffer_.size() > maximum_controller_command_size) {
-        (void)send_controller_parse_error(
-            socket_descriptor, ControllerParseError::command_too_long);
-        return ControllerReadResult::disconnected;
+    if (controller_attached_
+        && read_buffer_.size() > maximum_controller_command_size) {
+        append_before_dispatch(
+            actions,
+            SendControllerTextAction{
+                std::string{controller_parse_error_response(
+                    ControllerParseError::command_too_long)}});
+        append_before_dispatch(actions, DisconnectControllerAction{});
+        disconnect_controller();
     }
-    return ControllerReadResult::connected;
-}
-
-bool send_controller_attached(const int socket_descriptor)
-{
-    return send_socket_text(socket_descriptor, "ATTACHED\n");
+    return actions;
 }
 
 void reject_additional_controller(const int socket_descriptor)

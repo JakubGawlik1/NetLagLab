@@ -2,11 +2,12 @@
 
 ## Status
 
-The code contains typed outbound and inbound profile settings plus validation
-tests, but the profile is not connected to runtime behavior. Status constructs
-an unrestricted default profile and reports `shaping: not applied`. Delay,
-jitter, and loss were exercised manually with `tc/netem`; bandwidth limiting
-was not established by that experiment.
+The code contains typed outbound and inbound profile settings, validation, and
+an integrated Controller-to-helper Profile Change path. Status owns the last
+helper-confirmed profile. The production restore-only adapter cannot confirm a
+change, so status remains unrestricted and reports `shaping: not applied`.
+Delay, jitter, and loss were exercised manually with `tc/netem`; bandwidth
+limiting was not established by that experiment.
 
 The semantics and Profile Change rules below are accepted target design. Runtime
 qdisc application and live updates are not implemented.
@@ -87,6 +88,22 @@ Primary implementation references:
 Controller `set` and `reset` commands become typed, per-setting deltas. The
 Supervisor sends one delta at a time through the helper adapter instead of
 sending CLI text or replacing a full profile.
+
+`ProfileChange` is a shared domain type beside `NetworkProfile`, rather than a
+Controller-owned type or a separate wire DTO. One pure domain operation applies
+a Profile Change to a supplied Network Profile and returns the resulting
+profile. The operation performs no I/O and does not decide whether a change is
+confirmed. The Supervisor calls it only after `PROFILE_OK`; the future shaping
+backend may use the same operation to track the preceding confirmed state it
+must restore after failure.
+
+The operation validates the complete resulting profile and returns
+`std::variant<NetworkProfile, std::vector<ValidationError>>`. The error
+alternative is never empty. It never partially mutates its input and does not
+assume that every caller obtained the Profile Change from the Controller
+parser. Resetting delay, jitter, or loss produces zero; resetting bandwidth
+produces no limit. Parser and helper-boundary validation remain in place even
+though the domain operation also rejects an invalid constructed value.
 
 For every delta:
 
