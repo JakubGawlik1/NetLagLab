@@ -28,12 +28,18 @@ cross-platform support are not current goals.
 
 - CMake defines `netlaglab_core`, `netlaglab`, `netlaglab-helper`, and
   GoogleTest-based network-profile tests.
-- A private standalone Network Environment library contains an unprivileged
-  command runner. It executes one exact path with separate arguments and an
-  empty environment, enforces an absolute deadline, always reaps its child,
-  and retains at most 4 KiB of standard-error diagnostics while draining the
-  remainder. The library is not linked into the helper and does not yet create
-  or configure network resources.
+- A private standalone Network Environment library contains a transactional
+  coordinator and an unprivileged command runner. Through a uniquely owned
+  scripted semantic adapter, one preparation operation exercises the complete
+  fixed local setup sequence and returns either a move-only prepared owner or
+  a typed failure with ordered rollback failures and an optional residual
+  cleanup owner. Explicit cleanup and retry are consuming and bounded; owner
+  destruction makes one no-throw best-effort pass. The command runner executes
+  one exact path with separate arguments and an empty environment, enforces an
+  absolute deadline, always reaps its child, and retains at most 4 KiB of
+  standard-error diagnostics while draining the remainder. The library is not
+  linked into the helper and does not yet contain the production Linux/iproute2
+  adapter or create and configure real network resources.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.

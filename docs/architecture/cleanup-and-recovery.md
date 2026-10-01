@@ -5,12 +5,21 @@
 The implemented helper lifecycle reaps the directly managed Workload, releases
 the root-owned host lock before its final result, and uses RAII for descriptors
 and Unix-socket paths. The Supervisor then reaps its launcher and removes the
-user control socket. There are no privileged namespace, veth, route, NAT,
-firewall, DNS-mount, or qdisc resources to clean up yet.
+user control socket.
 
-The ownership and cleanup rules below are accepted target design. A durable
-recovery journal is accepted in principle for persistent firewall changes, but
-its exact design remains deliberately open.
+The standalone Network Environment library now implements and tests the local
+transaction ownership contract through a scripted semantic adapter. Preparation
+rolls back only its proven prefix; explicit cleanup consumes a prepared or
+residual owner, continues across independent roots, aggregates failures, and
+returns only unresolved state. Identity-unconfirmed state never regains
+deletion authority, and owner destruction performs one bounded no-throw pass.
+There are still no production namespace, veth, route, NAT, firewall, DNS-mount,
+or qdisc resources to clean up, and the standalone library is not integrated
+with the helper.
+
+The remaining production ownership and cleanup rules below are accepted target
+design. A durable recovery journal is accepted in principle for persistent
+firewall changes, but its exact design remains deliberately open.
 
 ## Ownership rule
 

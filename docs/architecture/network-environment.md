@@ -8,12 +8,23 @@ were verified manually in [Experiment 01](../experiment_01.md). The resource
 shape below is accepted target design; DNS contents and host route selection
 remain deliberately open.
 
-The first private production-adapter foundation is implemented and tested
-without privilege: a bounded command runner executes an exact path with
-separate arguments and an empty environment, enforces an absolute deadline,
-captures at most 4 KiB of standard error while draining the remainder, and
-terminates and reaps a timed-out child. It is not yet connected to iproute2,
-the transaction coordinator, the helper, or the active Session.
+The private transaction foundation is implemented and tested without
+privilege. One preparation operation drives the complete fixed semantic setup
+sequence through a uniquely owned scripted adapter and monotonic clock. It
+returns a move-only prepared owner or a typed failure that independently
+preserves the primary failure, ordered rollback failures, and any opaque
+residual cleanup owner. Explicit cleanup and residual retry are consuming,
+dependency-aware, and bounded; destruction makes one no-throw best-effort pass.
+A shared trace keeps semantic calls and absolute deadlines observable after the
+dependencies move into an owner.
+
+The same private library also contains a bounded command runner that executes
+an exact path with separate arguments and an empty environment, enforces an
+absolute deadline, captures at most 4 KiB of standard error while draining the
+remainder, and terminates and reaps a timed-out child. The production
+Linux/iproute2 adapter, host lock, inventory and rtnetlink decoders remain
+unimplemented. The library is not linked into the helper or active Session and
+does not create or configure real network resources.
 
 ## Target topology
 

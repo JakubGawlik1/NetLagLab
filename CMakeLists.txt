@@ -16,6 +16,7 @@ add_library(
     netlaglab_network_environment
     STATIC
         src/network_environment/command_runner.cpp
+        src/network_environment/network_environment.cpp
 )
 
 target_include_directories(netlaglab_network_environment PRIVATE src)
@@ -137,6 +138,7 @@ if(BUILD_TESTING)
     add_executable(
         netlaglab_network_environment_tests
         tests/network_command_runner_test.cpp
+        tests/network_environment_transaction_test.cpp
     )
     target_include_directories(
         netlaglab_network_environment_tests
