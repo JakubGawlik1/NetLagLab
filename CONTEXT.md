@@ -23,6 +23,11 @@ one exists, and any infrastructure failure. It is not reduced to a single
 process exit code.
 _Avoid_: Session exit code, Workload result when referring to the whole Session
 
+**Network Environment**:
+The Session-owned network and resolver context in which the Workload
+communicates, together with the host-side resources needed to connect it.
+_Avoid_: Namespace, network setup when referring to the complete environment
+
 **Network Profile**:
 The outbound and inbound network conditions most recently confirmed by the
 privileged helper as current for a Session. A pending or failed change is not a
