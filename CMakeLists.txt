@@ -12,6 +12,29 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(netlaglab_core PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_library(
+    netlaglab_network_environment
+    STATIC
+        src/network_environment/command_runner.cpp
+)
+
+target_include_directories(netlaglab_network_environment PRIVATE src)
+target_compile_features(netlaglab_network_environment PUBLIC cxx_std_20)
+set_target_properties(
+    netlaglab_network_environment
+    PROPERTIES CXX_EXTENSIONS OFF
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(
+        netlaglab_network_environment
+        PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+    )
+endif()
+
 add_executable(
     netlaglab
     src/attach_client.cpp
@@ -88,6 +111,71 @@ if(BUILD_TESTING)
 
     include(GoogleTest)
     gtest_discover_tests(netlaglab_core_tests)
+
+    add_executable(
+        netlaglab-network-command-probe
+        tests/network_command_probe.cpp
+    )
+    target_compile_features(
+        netlaglab-network-command-probe
+        PRIVATE cxx_std_20
+    )
+    set_target_properties(
+        netlaglab-network-command-probe
+        PROPERTIES CXX_EXTENSIONS OFF
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab-network-command-probe
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    add_executable(
+        netlaglab_network_environment_tests
+        tests/network_command_runner_test.cpp
+    )
+    target_include_directories(
+        netlaglab_network_environment_tests
+        PRIVATE src
+    )
+    target_link_libraries(
+        netlaglab_network_environment_tests
+        PRIVATE
+            netlaglab_network_environment
+            GTest::gtest_main
+    )
+    target_compile_definitions(
+        netlaglab_network_environment_tests
+        PRIVATE
+            NETWORK_COMMAND_PROBE_PATH="$<TARGET_FILE:netlaglab-network-command-probe>"
+    )
+    add_dependencies(
+        netlaglab_network_environment_tests
+        netlaglab-network-command-probe
+    )
+    target_compile_features(
+        netlaglab_network_environment_tests
+        PRIVATE cxx_std_20
+    )
+    set_target_properties(
+        netlaglab_network_environment_tests
+        PROPERTIES CXX_EXTENSIONS OFF
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_network_environment_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+
+    gtest_discover_tests(netlaglab_network_environment_tests)
 
     add_executable(
         netlaglab_lifecycle_tests

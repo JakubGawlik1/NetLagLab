@@ -8,6 +8,13 @@ were verified manually in [Experiment 01](../experiment_01.md). The resource
 shape below is accepted target design; DNS contents and host route selection
 remain deliberately open.
 
+The first private production-adapter foundation is implemented and tested
+without privilege: a bounded command runner executes an exact path with
+separate arguments and an empty environment, enforces an absolute deadline,
+captures at most 4 KiB of standard error while draining the remainder, and
+terminates and reaps a timed-out child. It is not yet connected to iproute2,
+the transaction coordinator, the helper, or the active Session.
+
 ## Target topology
 
 ```text
