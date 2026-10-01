@@ -1,8 +1,8 @@
-# MVP implementation audit — 2026-09-25
+# MVP implementation audit — updated 2026-09-29
 
 ## Implementation update — 2026-09-29
 
-Issue #4 is implemented in the current working tree. The Session-scoped
+Issue #4 is implemented in commit `808e779`. The Session-scoped
 `ControllerControlPlane` replaces `ControllerConversation` and owns framing,
 the 32-command queue, reply generations, the confirmed Network Profile, and
 public running/stopping state through one event/action interface. Production
@@ -13,34 +13,36 @@ and an injected in-memory successful adapter path are covered by focused tests.
 
 ## Implementation update — 2026-09-28
 
-The Controller parser checkpoint from issue #1 is now implemented in the
-current working tree. A pure `parse_controller_command()` seam recognizes all
+At the 2026-09-28 checkpoint, the Controller parser from issue #1 had been
+implemented. A pure `parse_controller_command()` seam recognizes all
 six command families and returns typed commands, an ignored-line marker, or a
 structured error. It validates the 1024-byte raw-line limit, ASCII/tab input,
 directions, settings, numeric grammar, units, ranges, overflow, and loss
-underflow. `ControllerConversation` now maps those results to fixed responses;
-valid `set`/`reset` requests truthfully remain unavailable until helper
-dispatch exists.
+underflow. `ControllerConversation` then mapped those results to fixed
+responses; valid `set`/`reset` requests truthfully remained unavailable until
+helper dispatch existed.
 
-Issue #2 is also implemented in the current working tree. A shared bounded
+At the same checkpoint, issue #2 had also been implemented. A shared bounded
 terminal protocol preserves the typed Workload result and every infrastructure
 failure for an attached Controller. Supervisor cleanup finishes before the
 outcome is published, send failure cannot mutate the result, and the attach
-client retains legacy terminal-input compatibility. These changes complete the
-parser and terminal-result portions of slice 2. Controller queuing, dispatch
-and consumption of helper acknowledgements, confirmed-profile state, and
-stopping status remain unimplemented.
+client retains legacy terminal-input compatibility. These changes completed the
+parser and terminal-result portions of the former Controller slice. At that
+point, Controller queuing, dispatch and consumption of helper acknowledgements,
+confirmed-profile state, and stopping status remained unimplemented; the
+2026-09-29 update above records their later integration.
 
-Issue #3 is now implemented in commit `743b702`. `ProfileChange` and all set/reset
+Issue #3 was implemented in commit `743b702`. `ProfileChange` and all set/reset
 alternatives belong to the shared domain model, and `apply_profile_change()`
 validates and applies one change without partial mutation. The typed
 Supervisor/helper conversations now round-trip the fixed Profile Change
 vocabulary, validate canonical values independently at the helper boundary,
 enforce one operation in flight, preserve stop priority and stream framing, and
 distinguish applied, restored-after-failure, and terminal unknown-state results.
-This completes the former protocol slice. Controller dispatch and queuing,
-confirmed public profile updates, and the privileged shaping adapter remain
-unimplemented.
+This completed the former protocol slice. At that checkpoint, Controller
+dispatch and queuing, confirmed public profile updates, and the privileged
+shaping adapter remained unimplemented. Commit `808e779` later integrated the
+Controller responsibilities; the privileged shaping adapter is still absent.
 
 ## Executive conclusion
 
@@ -48,9 +50,10 @@ The current working tree is **not yet the NetLagLab MVP**. It has a substantial
 and tested process-control foundation: the Supervisor starts and authenticates
 the privileged helper, the helper launches and reaps the Workload under the
 invoking identity, the lifecycle preserves execution and infrastructure
-outcomes, and the Controller supports the non-profile commands. However, the
-Workload still runs in the host namespaces and no production code creates the
-network environment or applies a Network Profile.
+outcomes, and the Controller handles the complete public command set and
+dispatches typed Profile Changes. However, the Workload still runs in the host
+namespaces and no production code creates the network environment or applies a
+Network Profile; the current production adapter reports reversible failure.
 
 Using the accepted architecture responsibilities as the unit of counting, **5
 coherent implementation slices remain**. After those slices, **1 privileged
@@ -66,10 +69,10 @@ does not pretend that all five slices have equal size.
 
 - Original snapshot: branch `main`, commit `633207b`, including every staged,
   unstaged, and untracked file visible on 2026-09-25.
-- Update evidence: branch `main` through commit `743b702` on 2026-09-28. The
-  branch was 9 commits ahead of `origin/main`, and the architecture documents
-  had uncommitted edits, so this remains a working-tree audit rather than a
-  released-version assessment.
+- Update evidence: branch `main` through implementation commit `808e779` on
+  2026-09-29. The branch is 10 commits ahead of `origin/main`; this refreshed
+  document is an uncommitted working-tree edit, so the result remains a local
+  assessment rather than a released-version assessment.
 - Primary sources only: production code, tests, CMake configuration, repository
   architecture/product documents, the recorded manual experiment, and Git.
 - Documentation claims were accepted only when corroborated by current code or
@@ -108,7 +111,7 @@ The smallest repository-supported definition of MVP is:
    (`docs/architecture/traffic-shaping.md:14-31,33-59`).
 6. An attached Controller can apply live `set`/`reset` deltas; the visible
    profile changes only after helper acknowledgement, with one operation in
-   flight (`docs/architecture/controller-control-plane.md:21-47,73-98`).
+   flight (`docs/architecture/controller-control-plane.md:241-317`).
 7. Startup, mutation, shutdown, rollback, and cleanup are transactional.
    NetLagLab removes only resources it can prove it owns, and unknown or
    unclean state is infrastructure failure 125
@@ -116,7 +119,7 @@ The smallest repository-supported definition of MVP is:
 
 `PROJECT.md` lists JSON Lines recording/replay and a GUI as candidate
 capabilities rather than verified behavior or fixed milestones
-(`PROJECT.md:49-61`). This audit excludes both from the smallest MVP because the
+(`PROJECT.md:57-69`). This audit excludes both from the smallest MVP because the
 product goal and the accepted architecture contract above close without them.
 If settings-history recording is promoted into the MVP, it adds one further
 implementation slice. The GUI is ordered after the CLI/control path in the
@@ -128,7 +131,10 @@ The public issue tracker is not a complete MVP backlog. Issues
 [#1 — Controller parser](https://github.com/JakubGawlik1/NetLagLab/issues/1),
 [#2 — attached Controller Session Outcome](https://github.com/JakubGawlik1/NetLagLab/issues/2),
 and [#3 — typed Profile Change protocol conversations](https://github.com/JakubGawlik1/NetLagLab/issues/3)
-were all closed on 2026-09-28. They cover checkpoints inside the broader
+were all closed on 2026-09-28. [Issue #4 — event-action Controller control
+plane](https://github.com/JakubGawlik1/NetLagLab/issues/4) is implemented in
+local commit `808e779` but remained open in the tracker when this update was
+verified on 2026-09-29. These issues cover checkpoints inside the broader
 responsibilities below; the missing privileged backend responsibilities do not
 yet have one issue each, so issue count cannot be used as the remaining MVP
 count.
@@ -138,14 +144,14 @@ count.
 | MVP area | Classification | Current evidence |
 |---|---|---|
 | Build, typed profile, and scope constraints | **Implemented foundation** | CMake builds the CLI, helper, core library, and six test executables. The shared domain owns every Profile Change alternative, validates complete profiles, and applies changes atomically for both directions and all four settings (`include/netlaglab/network_profile.hpp`, `src/network_profile.cpp`, `tests/network_profile_test.cpp`). |
-| Supervisor/helper/Workload lifecycle | **Implemented in code; unprivileged tests passed** | `run_session()` captures context, locks the user runtime, starts and connects to the helper, then enters the typed lifecycle (`src/session.cpp:477-587`). The lifecycle owns activation, stop escalation, result precedence, cleanup, and launcher reaping (`src/session_lifecycle.cpp:10-167`). Tests cover clean and failing outcomes, Controller loss, and both Ctrl-C paths (`tests/session_lifecycle_test.cpp:73-297`). |
-| Helper-owned Workload execution | **Partial** | The helper authenticates the Supervisor, acquires `/run/netlaglab/host.lock`, launches, signals, and reaps the Workload (`src/helper_main.cpp:525-692`). The child restores groups/GID/UID, standard descriptors, cwd, argv/environment, and executes without a shell (`src/workload_process.cpp:189-329`). There is no namespace or mount entry before the identity drop; the accepted target requires both (`docs/architecture/workload-execution.md:40-69`). |
+| Supervisor/helper/Workload lifecycle | **Implemented in code; unprivileged tests passed** | `run_session()` captures context, locks the user runtime, starts and connects to the helper, then enters the typed lifecycle (`src/session.cpp:517-627`). The lifecycle owns activation, stop escalation, result precedence, cleanup, and launcher reaping (`src/session_lifecycle.cpp`). Tests cover clean and failing outcomes, Controller loss, both Ctrl-C paths, and unknown profile state (`tests/session_lifecycle_test.cpp:100-393`). |
+| Helper-owned Workload execution | **Partial** | The helper authenticates the Supervisor, acquires `/run/netlaglab/host.lock`, launches, signals, and reaps the Workload (`src/helper_main.cpp`). The child restores groups/GID/UID, standard descriptors, cwd, argv/environment, and executes without a shell (`src/workload_process.cpp:189-329`). There is no namespace or mount entry before the identity drop; the accepted target requires both (`docs/architecture/workload-execution.md:40-69`). |
 | Base Controller | **Implemented control-plane checkpoint; shaping pending** | `ControllerControlPlane::handle()` owns framing, the 32-command queue, reply ownership, confirmed profile, shaping flag, and running/stopping state. Typed `set`/`reset` requests dispatch to the helper; production reports reversible failure because real shaping remains absent. Complete Session Outcome delivery and legacy attach compatibility remain implemented. |
 | Supervisor-helper protocol | **Implemented and connected; shaping pending** | Existing lifecycle/start/stop/cleanup behavior is preserved. Typed runtime variants include every Profile Change, exact canonical serialization, independent helper validation, one-operation ordering, fixed success/failure responses, stop priority, terminal cancellation, and byte-stream fragmentation/coalescing coverage. Production Controller dispatch uses this contract. |
 | Network and mount environment | **Manual experiment only; missing from production** | The manual commands created a namespace, veth, addresses, loopback, route, NAT, and DNS file (`docs/experiment_01.md:37-61,66-100`). The current target document states that production creates none of these (`docs/architecture/network-environment.md:3-9`). Source search found no production implementation. |
 | Host routing/NAT/firewall | **Manual experiment only; missing from production** | Experiment 01 demonstrated scoped NAT and a UFW forwarding problem/fix (`docs/experiment_01.md:66-100,133-148`). Production currently performs no routing, forwarding, NAT, or firewall mutation (`docs/architecture/host-networking-and-firewall.md:3-10`). |
-| Traffic shaping | **Implemented domain/protocol model plus manual experiment; runtime missing** | Typed validation and atomic Profile Change application exist, and delay/jitter/loss were manually exercised on both veth endpoints (`docs/experiment_01.md:102-131`). Runtime qdisc application, bandwidth composition, live mutation integration, and privileged rollback are absent (`docs/architecture/traffic-shaping.md`). The manual experiment did not establish bandwidth limiting. |
-| Cleanup and recovery | **Partial** | Current process, descriptor, socket, and lock cleanup exists: the helper releases the lock and reports cleanup after reaping (`src/helper_main.cpp:442-474`), while the Supervisor reaps the launcher and removes `control.sock` (`src/session.cpp:373-397`). Network-resource rollback, persistent firewall recovery, and interrupted-state reconciliation cannot exist yet because those resources are not created (`docs/architecture/cleanup-and-recovery.md:3-13,39-53,106-132`). |
+| Traffic shaping | **Implemented domain/protocol/control-plane model plus manual experiment; runtime missing** | Typed validation, atomic Profile Change application, and live dispatch/result integration exist, and delay/jitter/loss were manually exercised on both veth endpoints (`docs/experiment_01.md:102-131`). Runtime qdisc application, bandwidth composition, and privileged apply/rollback are absent (`docs/architecture/traffic-shaping.md`). The manual experiment did not establish bandwidth limiting. |
+| Cleanup and recovery | **Partial** | Current process, descriptor, socket, and lock cleanup exists: the helper releases the lock and reports cleanup after reaping (`src/helper_main.cpp`), while the Supervisor reaps the launcher and removes `control.sock` (`src/session.cpp:394-408`). Network-resource rollback, persistent firewall recovery, and interrupted-state reconciliation cannot exist yet because those resources are not created (`docs/architecture/cleanup-and-recovery.md:3-13,39-53,106-132`). |
 
 The code-level classification now matches the repository feature map for the
 Controller and protocol checkpoints. Network, firewall, and runtime shaping
@@ -228,7 +234,8 @@ git diff --stat
 rg --files src tests include
 rg -n '<network/runtime terms>' src tests CMakeLists.txt
 cmake --build build -j2
-ctest --test-dir build -R 'NetworkProfileTest|HelperProtocolTest' \
+ctest --test-dir build -R \
+  'ControllerControlPlaneTest|ControlPlaneActionExecutorTest|HelperProtocolTest' \
   --output-on-failure
 ctest --test-dir build --output-on-failure
 git diff --check
@@ -237,8 +244,9 @@ git diff --check
 Results:
 
 - all targets built successfully with the configured warning options;
-- all 26 focused Network Profile and helper-protocol tests passed;
-- all 99 discovered tests passed outside the filesystem/network sandbox;
+- all 33 focused Controller control-plane, action-executor, and helper-protocol
+  tests passed;
+- all 111 discovered tests passed outside the filesystem/network sandbox;
 - `git diff --check` passed;
 - the earlier sandboxed Controller socket failures remained attributable to the
   environment: the complete suite passed outside that restriction.
@@ -251,7 +259,7 @@ permissions, sudo/PTTY stdio behavior, terminal signal escalation, or any future
 namespace/NAT/firewall/DNS/qdisc behavior. The repository records the same
 boundary at `docs/architecture/session-lifecycle-implementation-status.md:61-72`.
 
-This is the **one qualification gate not included in the six implementation
+This is the **one qualification gate not included in the five implementation
 slices**: after the code slices and their focused tests exist, an explicitly
 authorized privileged matrix must verify normal startup, each traffic
 direction/setting, pipes and terminals, partial failures, cleanup, collisions,
@@ -260,15 +268,15 @@ Supervisor/helper loss, and interrupted recovery.
 One current user-facing inconsistency should remain visible during development:
 the CLI help already says that NetLagLab runs an application in an isolated
 network environment (`src/main.cpp:9-16`), while the implemented program still
-uses the host network (`docs/runtime_call_map.md:38-40`). Until slice 3 and
-Workload namespace entry are integrated, that sentence describes the product
-goal rather than current behavior.
+uses the host network (`docs/runtime_call_map.md:39-41`). Until host connectivity
+and Workload namespace entry are integrated, that sentence describes the
+product goal rather than current behavior.
 
 ## Counting limitations
 
-- The six-slice number measures remaining responsibilities, not effort. Host
+- The five-slice number measures remaining responsibilities, not effort. Host
   firewall safety and durable recovery are materially larger and riskier than
-  extending the Controller parser.
+  Workload namespace entry.
 - Manual commands prove mechanism feasibility on one host snapshot, not
   production ownership, rollback, portability across supported firewall states,
   or current host compatibility.
