@@ -1,4 +1,14 @@
-# MVP implementation audit — updated 2026-09-29
+# MVP implementation audit — updated 2026-10-02
+
+## Implementation update — 2026-10-02
+
+The standalone private Network Environment library can now create and prove
+the fixed namespace and veth resource roots, move `nll-app` through the exact
+owned namespace handle, reconcile ambiguous mutation outcomes, and perform
+proof-based rollback. This implementation is covered by controlled
+unprivileged tests only. It is not linked into the helper, has not passed the
+separately authorized privileged qualification, and deliberately fails at the
+first host-configuration operation after rolling the proven roots back.
 
 ## Implementation update — 2026-09-29
 
@@ -52,8 +62,9 @@ the privileged helper, the helper launches and reaps the Workload under the
 invoking identity, the lifecycle preserves execution and infrastructure
 outcomes, and the Controller handles the complete public command set and
 dispatches typed Profile Changes. However, the Workload still runs in the host
-namespaces and no production code creates the network environment or applies a
-Network Profile; the current production adapter reports reversible failure.
+namespaces, the standalone production adapter does not configure a complete
+network environment, and no production code applies a Network Profile. The
+active Session therefore still has no network isolation or shaping.
 
 Using the accepted architecture responsibilities as the unit of counting, **5
 coherent implementation slices remain**. After those slices, **1 privileged
@@ -79,13 +90,14 @@ does not pretend that all five slices have equal size.
   explicitly labelled as target design/manual evidence. The architecture index
   itself defines these evidence categories at
   `docs/architecture/README.md:7-20`.
-- The refreshed absence check searched production and test sources for `setns`,
+- The 2026-09-29 absence check searched production and test sources for `setns`,
   `unshare`, `CLONE_NEWNET`, `CLONE_NEWNS`, `netns`, `veth`, `nll-host`,
   `nll-app`, `nft`, `ufw`, `firewalld`, `qdisc`, `netem`, `resolv.conf`,
   `ip_forward`, and `masquerade`. Profile-mutation frames are now implemented as
-  an unprivileged conversation contract, but no production code performs their
-  privileged network effects. The Workload still uses the host network and
-  Controller status still reports `shaping: not applied`.
+  an unprivileged conversation contract. That result is superseded for
+  standalone namespace/veth root creation by the 2026-10-02 update above;
+  configuration and Session integration remain absent. The Workload still uses
+  the host network and Controller status still reports `shaping: not applied`.
 
 ## MVP criteria recovered from the repository
 

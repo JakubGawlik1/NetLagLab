@@ -65,6 +65,16 @@ int main(const int argc, char* argv[])
         }
         return close(descriptor) == 0 ? 0 : 50;
     }
+    if (argc == 3 && std::string_view{argv[1]} == "fd-open") {
+        int descriptor{};
+        const std::string_view value{argv[2]};
+        const auto result{std::from_chars(
+            value.data(), value.data() + value.size(), descriptor)};
+        if (result.ec != std::errc{}) {
+            return 51;
+        }
+        return fcntl(descriptor, F_GETFD) == -1 ? 52 : 0;
+    }
     if (argc != 4 || std::string_view{argv[0]} != argv[1]
         || std::string_view{argv[2]} != "first argument"
         || std::string_view{argv[3]} != "second\nargument") {

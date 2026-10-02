@@ -142,9 +142,10 @@ struct ChildFailureMessage {
 
 } // namespace
 
-CommandResult run_command(
+[[nodiscard]] static CommandResult run_command_impl(
     const std::string_view executable_path,
     const std::span<const std::string> arguments,
+    const int inherited_descriptor,
     const std::chrono::steady_clock::time_point deadline)
 {
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -207,6 +208,20 @@ CommandResult run_command(
                     errno);
             }
             standard_error_writer.reset();
+        }
+        if (inherited_descriptor >= 0) {
+            const int descriptor_flags{fcntl(inherited_descriptor, F_GETFD)};
+            if (descriptor_flags == -1
+                || fcntl(
+                       inherited_descriptor,
+                       F_SETFD,
+                       descriptor_flags & ~FD_CLOEXEC)
+                    == -1) {
+                report_child_failure_and_exit(
+                    child_failure_writer.get(),
+                    ChildFailureKind::system_failure,
+                    errno);
+            }
         }
         execve(executable.c_str(), argument_pointers.data(), environment);
         report_child_failure_and_exit(
@@ -367,6 +382,27 @@ CommandResult run_command(
         exit_code,
         std::move(diagnostic),
     };
+}
+
+CommandResult run_command(
+    const std::string_view executable_path,
+    const std::span<const std::string> arguments,
+    const std::chrono::steady_clock::time_point deadline)
+{
+    return run_command_impl(executable_path, arguments, -1, deadline);
+}
+
+CommandResult run_command_with_inherited_descriptor(
+    const std::string_view executable_path,
+    const std::span<const std::string> arguments,
+    const int inherited_descriptor,
+    const std::chrono::steady_clock::time_point deadline)
+{
+    if (inherited_descriptor < 0) {
+        return {CommandResultKind::system_failure, EINVAL, {}};
+    }
+    return run_command_impl(
+        executable_path, arguments, inherited_descriptor, deadline);
 }
 
 } // namespace netlaglab::network_environment

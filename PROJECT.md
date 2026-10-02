@@ -42,7 +42,12 @@ cross-platform support are not current goals.
   executes one exact path with separate arguments and an empty environment,
   enforces an absolute deadline, always reaps its child, and retains at most
   4 KiB of standard-error diagnostics while draining the remainder. The
-  library is not linked into the helper; namespace/veth mutations and all real
+  production adapter can create the fixed namespace and veth roots, retain an
+  exact `nsfs` handle, prove the veth identities with validated `RTM_GETLINK`
+  replies on both sides of that handle, and reconcile ambiguous mutation and
+  proof-based cleanup outcomes. This path is covered only by controlled
+  unprivileged tests and has not passed privileged qualification. The library
+  is not linked into the helper; addresses, link state, routes, and later
   Network Environment configuration remain unimplemented.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises

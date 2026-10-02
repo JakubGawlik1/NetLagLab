@@ -1,6 +1,7 @@
 #include "network_environment.hpp"
 
 #include "preflight.hpp"
+#include "production_adapter.hpp"
 #include "production_test_support.hpp"
 #include "transaction_test_support.hpp"
 
@@ -30,7 +31,7 @@ struct IdentityUnconfirmed {
 
 class NamespaceProof {
 public:
-    explicit NamespaceProof(std::unique_ptr<std::size_t> exact_handle)
+    explicit NamespaceProof(std::unique_ptr<detail::NamespaceHandle> exact_handle)
         : exact_handle_{std::move(exact_handle)}
     {
     }
@@ -41,12 +42,21 @@ public:
     NamespaceProof& operator=(const NamespaceProof&) = delete;
 
 private:
-    std::unique_ptr<std::size_t> exact_handle_;
+    std::unique_ptr<detail::NamespaceHandle> exact_handle_;
+
+    friend class ProductionAdapter;
+};
+
+struct VethIdentityPair {
+    detail::LinkIdentity host;
+    detail::LinkIdentity session;
+
+    friend bool operator==(const VethIdentityPair&, const VethIdentityPair&) = default;
 };
 
 class HostVethProof {
 public:
-    explicit HostVethProof(std::unique_ptr<std::size_t> identity)
+    explicit HostVethProof(std::unique_ptr<VethIdentityPair> identity)
         : identity_{std::move(identity)}
     {
     }
@@ -56,18 +66,20 @@ public:
     HostVethProof(const HostVethProof&) = delete;
     HostVethProof& operator=(const HostVethProof&) = delete;
 
-    [[nodiscard]] std::unique_ptr<std::size_t> release_identity()
+    [[nodiscard]] std::unique_ptr<VethIdentityPair> release_identity()
     {
         return std::move(identity_);
     }
 
 private:
-    std::unique_ptr<std::size_t> identity_;
+    std::unique_ptr<VethIdentityPair> identity_;
+
+    friend class ProductionAdapter;
 };
 
 class PlacedVethProof {
 public:
-    explicit PlacedVethProof(std::unique_ptr<std::size_t> identity)
+    explicit PlacedVethProof(std::unique_ptr<VethIdentityPair> identity)
         : identity_{std::move(identity)}
     {
     }
@@ -78,7 +90,9 @@ public:
     PlacedVethProof& operator=(const PlacedVethProof&) = delete;
 
 private:
-    std::unique_ptr<std::size_t> identity_;
+    std::unique_ptr<VethIdentityPair> identity_;
+
+    friend class ProductionAdapter;
 };
 
 using NamespaceState =
@@ -166,6 +180,7 @@ public:
         TimePoint deadline) = 0;
     [[nodiscard]] virtual VethRemovalResult remove_veth(
         ProvenVeth proof,
+        const NamespaceProof* namespace_proof,
         TimePoint deadline) = 0;
     [[nodiscard]] virtual NamespaceRemovalResult remove_namespace(
         NamespaceProof proof,
@@ -177,6 +192,22 @@ struct ScriptState {
     std::deque<ScriptStep> steps;
     std::shared_ptr<testing::SharedTrace> trace;
     std::size_t next_identity{1};
+};
+
+class ScriptedNamespaceHandle final : public detail::NamespaceHandle {
+public:
+    explicit ScriptedNamespaceHandle(const std::uint64_t identity)
+        : identity_{identity}
+    {
+    }
+
+    [[nodiscard]] detail::NamespaceIdentity identity() const override
+    {
+        return {1, identity_};
+    }
+
+private:
+    std::uint64_t identity_;
 };
 
 class ScriptedClock final : public MonotonicClock {
@@ -211,7 +242,8 @@ public:
         NamespaceState state;
         if (step.outcome == Outcome::success
             || step.outcome == Outcome::fail_new_state) {
-            state.emplace<NamespaceProof>(identity());
+            state.emplace<NamespaceProof>(std::make_unique<ScriptedNamespaceHandle>(
+                state_->next_identity++));
         } else if (step.outcome == Outcome::fail_identity_unconfirmed) {
             state.emplace<IdentityUnconfirmed>();
         }
@@ -297,6 +329,7 @@ public:
 
     [[nodiscard]] VethRemovalResult remove_veth(
         ProvenVeth proof,
+        const NamespaceProof*,
         const TimePoint deadline) override
     {
         const ScriptStep step{next(Operation::remove_veth, deadline)};
@@ -331,9 +364,16 @@ public:
     }
 
 private:
-    [[nodiscard]] std::unique_ptr<std::size_t> identity()
+    [[nodiscard]] std::unique_ptr<VethIdentityPair> identity()
     {
-        return std::make_unique<std::size_t>(state_->next_identity++);
+        const std::uint32_t host{
+            static_cast<std::uint32_t>(state_->next_identity++)};
+        const std::uint32_t session{
+            static_cast<std::uint32_t>(state_->next_identity++)};
+        return std::make_unique<VethIdentityPair>(VethIdentityPair{
+            {host, session, std::nullopt},
+            {session, host, std::nullopt},
+        });
     }
 
     [[nodiscard]] ScriptStep next(
@@ -366,8 +406,10 @@ class ProductionAdapter final : public SemanticAdapter {
 public:
     explicit ProductionAdapter(
         std::unique_ptr<detail::PreflightPlatform> platform,
+        std::unique_ptr<detail::ProductionPlatform> production,
         std::shared_ptr<testing::ProductionTrace> trace = {})
         : platform_{std::move(platform)}
+        , production_{std::move(production)}
         , trace_{std::move(trace)}
     {
     }
@@ -382,27 +424,127 @@ public:
         return {result.succeeded, result.cause};
     }
 
-    [[nodiscard]] NamespaceMutationResult create_namespace(TimePoint) override
+    [[nodiscard]] NamespaceMutationResult create_namespace(
+        const TimePoint deadline) override
     {
         if (trace_) {
             ++trace_->semantic_mutation_requests;
         }
-        return {false, Cause::system_failure, {}};
+        const std::vector<std::string> arguments{"netns", "add", "netlaglab"};
+        const CommandResult command{production_->run_ip(
+            ip_path_, arguments, nullptr, deadline)};
+        detail::NamespaceQuery query{production_->query_namespace()};
+        NamespaceState state;
+        if (query.status == detail::InventoryStatus::present && query.handle) {
+            state.emplace<NamespaceProof>(std::move(query.handle));
+            return {
+                command.kind == CommandResultKind::success,
+                command_cause(command),
+                std::move(state),
+            };
+        }
+        if (query.status != detail::InventoryStatus::absent) {
+            state.emplace<IdentityUnconfirmed>();
+        }
+        return {
+            false,
+            query.status == detail::InventoryStatus::absent
+                    && command.kind != CommandResultKind::success
+                ? command_cause(command)
+                : Cause::identity_unavailable,
+            std::move(state),
+        };
     }
 
-    [[nodiscard]] VethMutationResult create_veth(TimePoint) override
+    [[nodiscard]] VethMutationResult create_veth(
+        const TimePoint deadline) override
     {
-        return {false, Cause::system_failure, {}};
+        const std::vector<std::string> arguments{
+            "link", "add", "nll-host", "type", "veth", "peer", "name", "nll-app"};
+        const CommandResult command{production_->run_ip(
+            ip_path_, arguments, nullptr, deadline)};
+        const detail::LinkQuery host{
+            production_->query_host_link("nll-host", deadline)};
+        const detail::LinkQuery session{
+            production_->query_host_link("nll-app", deadline)};
+        VethState state;
+        if (valid_host_pair(host, session)) {
+            state.emplace<HostVethProof>(std::make_unique<VethIdentityPair>(
+                VethIdentityPair{*host.identity, *session.identity}));
+            return {
+                command.kind == CommandResultKind::success,
+                command_cause(command),
+                std::move(state),
+            };
+        }
+        if (host.status != detail::InventoryStatus::absent
+            || session.status != detail::InventoryStatus::absent) {
+            state.emplace<IdentityUnconfirmed>();
+        }
+        return {
+            false,
+            host.status == detail::InventoryStatus::absent
+                    && session.status == detail::InventoryStatus::absent
+                    && command.kind != CommandResultKind::success
+                ? command_cause(command)
+                : Cause::identity_unavailable,
+            std::move(state),
+        };
     }
 
     [[nodiscard]] VethMutationResult move_peer(
-        const NamespaceProof&,
+        const NamespaceProof& namespace_proof,
         HostVethProof proof,
-        TimePoint) override
+        const TimePoint deadline) override
     {
+        const std::string namespace_file{
+            production_->namespace_file_argument(*namespace_proof.exact_handle_)};
+        const std::vector<std::string> arguments{
+            "link", "set", "dev", "nll-app", "netns", namespace_file};
+        const CommandResult command{production_->run_ip(
+            ip_path_, arguments, namespace_proof.exact_handle_.get(), deadline)};
+        const detail::LinkQuery host{
+            production_->query_host_link("nll-host", deadline)};
+        const detail::LinkQuery old_session{
+            production_->query_host_link("nll-app", deadline)};
+        const detail::LinkQuery placed_session{
+            production_->query_namespace_link(
+                *namespace_proof.exact_handle_, "nll-app", deadline)};
         VethState state;
-        state.emplace<HostVethProof>(std::move(proof));
-        return {false, Cause::system_failure, std::move(state)};
+        if (valid_placed_pair(host, old_session, placed_session)) {
+            state.emplace<PlacedVethProof>(std::make_unique<VethIdentityPair>(
+                VethIdentityPair{*host.identity, *placed_session.identity}));
+            return {
+                command.kind == CommandResultKind::success,
+                command_cause(command),
+                std::move(state),
+            };
+        }
+        if (valid_host_pair(host, old_session)
+            && placed_session.status == detail::InventoryStatus::absent
+            && proof_matches(proof, host, old_session)) {
+            state.emplace<HostVethProof>(std::move(proof));
+            return {
+                false,
+                command.kind == CommandResultKind::success
+                    ? Cause::identity_mismatch
+                    : command_cause(command),
+                std::move(state),
+            };
+        }
+        if (host.status != detail::InventoryStatus::absent
+            || old_session.status != detail::InventoryStatus::absent
+            || placed_session.status != detail::InventoryStatus::absent) {
+            state.emplace<IdentityUnconfirmed>();
+        }
+        return {
+            false,
+            all_absent(host, old_session, placed_session)
+                    && command.kind != CommandResultKind::success
+                ? command_cause(command)
+                : Cause::identity_unavailable,
+            std::move(state),
+        };
     }
 
     [[nodiscard]] OperationResult assign_host_address(
@@ -452,8 +594,161 @@ public:
 
     [[nodiscard]] VethRemovalResult remove_veth(
         ProvenVeth proof,
-        TimePoint) override
+        const NamespaceProof* namespace_proof,
+        const TimePoint deadline) override
     {
+        return remove_proven_veth(
+            std::move(proof), namespace_proof, deadline);
+    }
+
+    [[nodiscard]] NamespaceRemovalResult remove_namespace(
+        NamespaceProof proof,
+        const TimePoint deadline) override
+    {
+        detail::NamespaceQuery before{production_->query_namespace()};
+        if (before.status == detail::InventoryStatus::absent) {
+            return {Cause::system_failure, {}};
+        }
+        if (before.status != detail::InventoryStatus::present || !before.handle) {
+            NamespaceState state;
+            state.emplace<IdentityUnconfirmed>();
+            return {Cause::identity_unavailable, std::move(state)};
+        }
+        if (before.handle->identity() != proof.exact_handle_->identity()) {
+            NamespaceState state;
+            state.emplace<IdentityUnconfirmed>();
+            return {Cause::identity_mismatch, std::move(state)};
+        }
+
+        const std::vector<std::string> arguments{"netns", "delete", "netlaglab"};
+        const CommandResult command{production_->run_ip(
+            ip_path_, arguments, nullptr, deadline)};
+        detail::NamespaceQuery after{production_->query_namespace()};
+        if (after.status == detail::InventoryStatus::absent) {
+            return {Cause::system_failure, {}};
+        }
+        NamespaceState state;
+        if (after.status == detail::InventoryStatus::present && after.handle
+            && after.handle->identity() == proof.exact_handle_->identity()) {
+            state.emplace<NamespaceProof>(std::move(proof));
+            return {
+                command.kind == CommandResultKind::success
+                    ? Cause::identity_mismatch
+                    : command_cause(command),
+                std::move(state),
+            };
+        }
+        state.emplace<IdentityUnconfirmed>();
+        return {
+            after.status == detail::InventoryStatus::present
+                ? Cause::identity_mismatch
+                : Cause::identity_unavailable,
+            std::move(state),
+        };
+    }
+
+private:
+    [[nodiscard]] static Cause command_cause(const CommandResult& result)
+    {
+        switch (result.kind) {
+        case CommandResultKind::success:
+            return Cause::system_failure;
+        case CommandResultKind::nonzero_exit:
+            return Cause::command_exit;
+        case CommandResultKind::signal:
+            return Cause::command_signal;
+        case CommandResultKind::timeout:
+            return Cause::timeout;
+        case CommandResultKind::exec_failure:
+            return Cause::unavailable_or_invalid_tool;
+        case CommandResultKind::system_failure:
+            return Cause::system_failure;
+        }
+        return Cause::system_failure;
+    }
+
+    [[nodiscard]] static bool valid_host_pair(
+        const detail::LinkQuery& host,
+        const detail::LinkQuery& session)
+    {
+        return host.status == detail::InventoryStatus::present
+            && session.status == detail::InventoryStatus::present
+            && host.identity && session.identity
+            && host.identity->peer_index == session.identity->index
+            && session.identity->peer_index == host.identity->index
+            && !host.identity->peer_namespace_id
+            && !session.identity->peer_namespace_id;
+    }
+
+    [[nodiscard]] static bool valid_placed_pair(
+        const detail::LinkQuery& host,
+        const detail::LinkQuery& old_session,
+        const detail::LinkQuery& placed_session)
+    {
+        return old_session.status == detail::InventoryStatus::absent
+            && host.status == detail::InventoryStatus::present
+            && placed_session.status == detail::InventoryStatus::present
+            && host.identity && placed_session.identity
+            && host.identity->peer_index == placed_session.identity->index
+            && placed_session.identity->peer_index == host.identity->index
+            && host.identity->peer_namespace_id
+            && placed_session.identity->peer_namespace_id
+            && *host.identity->peer_namespace_id >= 0
+            && *placed_session.identity->peer_namespace_id >= 0;
+    }
+
+    [[nodiscard]] static bool proof_matches(
+        const HostVethProof& proof,
+        const detail::LinkQuery& host,
+        const detail::LinkQuery& session)
+    {
+        return proof.identity_ && host.identity && session.identity
+            && proof.identity_->host == *host.identity
+            && proof.identity_->session == *session.identity;
+    }
+
+    [[nodiscard]] VethRemovalResult remove_proven_veth(
+        ProvenVeth proof,
+        const NamespaceProof* namespace_proof,
+        const TimePoint deadline)
+    {
+        const bool placed{std::holds_alternative<PlacedVethProof>(proof)};
+        if (placed && namespace_proof == nullptr) {
+            const detail::LinkQuery host{
+                production_->query_host_link("nll-host", deadline)};
+            const detail::LinkQuery session{
+                production_->query_host_link("nll-app", deadline)};
+            if (all_absent(host, session)) {
+                return {Cause::system_failure, {}};
+            }
+            return unconfirmed_veth(inventory_cause(host, session));
+        }
+        VethObservation before{observe_veth(placed, namespace_proof, deadline)};
+        if (before.absent) {
+            return {Cause::system_failure, {}};
+        }
+        if (!before.complete) {
+            return unconfirmed_veth(before.cause);
+        }
+        if (!matches_proof(proof, before)) {
+            return unconfirmed_veth(Cause::identity_mismatch);
+        }
+
+        const std::vector<std::string> arguments{
+            "link", "delete", "dev", "nll-host"};
+        const CommandResult command{production_->run_ip(
+            ip_path_, arguments, nullptr, deadline)};
+        VethObservation after{observe_veth(placed, namespace_proof, deadline)};
+        if (after.absent) {
+            return {Cause::system_failure, {}};
+        }
+        if (!after.complete) {
+            return unconfirmed_veth(after.cause);
+        }
+        if (!matches_proof(proof, after)) {
+            return unconfirmed_veth(Cause::identity_mismatch);
+        }
+
         VethState state;
         std::visit(
             [&state](auto retained) {
@@ -461,22 +756,153 @@ public:
                     std::move(retained));
             },
             std::move(proof));
-        return {Cause::system_failure, std::move(state)};
+        return {
+            command.kind == CommandResultKind::success
+                ? Cause::identity_mismatch
+                : command_cause(command),
+            std::move(state),
+        };
     }
 
-    [[nodiscard]] NamespaceRemovalResult remove_namespace(
-        NamespaceProof proof,
-        TimePoint) override
+    struct VethObservation {
+        bool absent;
+        bool complete;
+        Cause cause;
+        std::optional<VethIdentityPair> identity;
+    };
+
+    [[nodiscard]] VethObservation observe_veth(
+        const bool placed,
+        const NamespaceProof* namespace_proof,
+        const TimePoint deadline)
     {
-        NamespaceState state;
-        state.emplace<NamespaceProof>(std::move(proof));
-        return {Cause::system_failure, std::move(state)};
+        const detail::LinkQuery host{
+            production_->query_host_link("nll-host", deadline)};
+        const detail::LinkQuery host_session{
+            production_->query_host_link("nll-app", deadline)};
+        if (!placed) {
+            if (all_absent(host, host_session)) {
+                return {true, true, Cause::system_failure, std::nullopt};
+            }
+            if (valid_host_pair(host, host_session)) {
+                return {
+                    false,
+                    true,
+                    Cause::system_failure,
+                    VethIdentityPair{*host.identity, *host_session.identity},
+                };
+            }
+            return {
+                false,
+                false,
+                inventory_cause(host, host_session),
+                std::nullopt,
+            };
+        }
+
+        const detail::LinkQuery session{production_->query_namespace_link(
+            *namespace_proof->exact_handle_, "nll-app", deadline)};
+        if (all_absent(host, host_session, session)) {
+            return {true, true, Cause::system_failure, std::nullopt};
+        }
+        if (valid_placed_pair(host, host_session, session)) {
+            return {
+                false,
+                true,
+                Cause::system_failure,
+                VethIdentityPair{*host.identity, *session.identity},
+            };
+        }
+        return {
+            false,
+            false,
+            inventory_cause(host, host_session, session),
+            std::nullopt,
+        };
     }
 
-private:
+    template<typename... Queries>
+    [[nodiscard]] static Cause inventory_cause(const Queries&... queries)
+    {
+        const bool unavailable{
+            ((queries.status == detail::InventoryStatus::failure
+              || queries.status == detail::InventoryStatus::timeout
+              || queries.status == detail::InventoryStatus::malformed)
+             || ...)};
+        return unavailable ? Cause::identity_unavailable
+                           : Cause::identity_mismatch;
+    }
+
+    [[nodiscard]] static bool matches_proof(
+        const ProvenVeth& proof,
+        const VethObservation& observation)
+    {
+        if (!observation.identity) {
+            return false;
+        }
+        return std::visit(
+            [&](const auto& value) {
+                return value.identity_
+                    && *value.identity_ == *observation.identity;
+            },
+            proof);
+    }
+
+    [[nodiscard]] static VethRemovalResult unconfirmed_veth(const Cause cause)
+    {
+        VethState state;
+        state.emplace<IdentityUnconfirmed>();
+        return {cause, std::move(state)};
+    }
+
+    template<typename... Queries>
+    [[nodiscard]] static bool all_absent(const Queries&... queries)
+    {
+        return ((queries.status == detail::InventoryStatus::absent) && ...);
+    }
+
     std::unique_ptr<detail::PreflightPlatform> platform_;
+    std::unique_ptr<detail::ProductionPlatform> production_;
     std::shared_ptr<testing::ProductionTrace> trace_;
     std::string ip_path_;
+};
+
+class UnavailableProductionPlatform final : public detail::ProductionPlatform {
+public:
+    [[nodiscard]] CommandResult run_ip(
+        std::string_view,
+        std::span<const std::string>,
+        const detail::NamespaceHandle*,
+        TimePoint) override
+    {
+        return {CommandResultKind::system_failure, 0, {}};
+    }
+
+    [[nodiscard]] detail::NamespaceQuery query_namespace() override
+    {
+        return {detail::InventoryStatus::absent, nullptr};
+    }
+
+    [[nodiscard]] std::string namespace_file_argument(
+        const detail::NamespaceHandle&) const override
+    {
+        return {};
+    }
+
+    [[nodiscard]] detail::LinkQuery query_host_link(
+        std::string_view,
+        TimePoint) override
+    {
+        return {detail::InventoryStatus::absent, std::nullopt};
+    }
+
+    [[nodiscard]] detail::LinkQuery query_namespace_link(
+        const detail::NamespaceHandle&,
+        std::string_view,
+        TimePoint) override
+    {
+        return {detail::InventoryStatus::absent, std::nullopt};
+    }
 };
 
 class TrackedHostLock final : public detail::HostLock {
@@ -619,6 +1045,9 @@ namespace {
         }
         VethRemovalResult removal{state->runtime->adapter->remove_veth(
             take_proven_veth(state->veth_root),
+            is_proven(state->namespace_root)
+                ? &std::get<NamespaceProof>(state->namespace_root)
+                : nullptr,
             operation_deadline(
                 state->runtime->clock->now(), transaction_deadline))};
         state->veth_root = std::move(removal.state);
@@ -878,6 +1307,7 @@ namespace {
 
 [[nodiscard]] PreparationResult prepare_production_network_environment(
     std::unique_ptr<detail::PreflightPlatform> platform,
+    std::unique_ptr<detail::ProductionPlatform> production,
     std::shared_ptr<testing::ProductionTrace> trace = {})
 {
     detail::HostLockResult lock{platform->acquire_host_lock()};
@@ -891,7 +1321,7 @@ namespace {
     auto runtime{std::make_unique<detail::PreparationRuntime>(
         detail::PreparationRuntime{
             std::make_unique<ProductionAdapter>(
-                std::move(platform), std::move(trace)),
+                std::move(platform), std::move(production), std::move(trace)),
             std::make_unique<SystemClock>(),
             std::move(lock.lock),
         })};
@@ -904,7 +1334,8 @@ namespace {
 PreparationResult prepare_network_environment()
 {
     return prepare_production_network_environment(
-        detail::make_linux_preflight_platform());
+        detail::make_linux_preflight_platform(),
+        detail::make_linux_production_platform());
 }
 
 namespace testing {
@@ -937,7 +1368,17 @@ PreparationResult prepare_with_preflight_platform(
     std::shared_ptr<ProductionTrace> trace)
 {
     return prepare_production_network_environment(
-        std::move(platform), std::move(trace));
+        std::move(platform),
+        std::make_unique<UnavailableProductionPlatform>(),
+        std::move(trace));
+}
+
+PreparationResult prepare_with_production_platform(
+    std::unique_ptr<detail::PreflightPlatform> preflight,
+    std::unique_ptr<detail::ProductionPlatform> production)
+{
+    return prepare_production_network_environment(
+        std::move(preflight), std::move(production));
 }
 
 } // namespace testing

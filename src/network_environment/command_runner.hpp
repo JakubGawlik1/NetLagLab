@@ -28,4 +28,10 @@ struct CommandResult {
     std::span<const std::string> arguments,
     std::chrono::steady_clock::time_point deadline);
 
+[[nodiscard]] CommandResult run_command_with_inherited_descriptor(
+    std::string_view executable_path,
+    std::span<const std::string> arguments,
+    int inherited_descriptor,
+    std::chrono::steady_clock::time_point deadline);
+
 } // namespace netlaglab::network_environment

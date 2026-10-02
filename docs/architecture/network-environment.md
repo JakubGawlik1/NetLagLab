@@ -2,11 +2,14 @@
 
 ## Status
 
-NetLagLab does not currently create a network or mount namespace, veth pair,
-routes, DNS view, NAT rules, or qdiscs. The topology and basic connectivity
-were verified manually in [Experiment 01](../experiment_01.md). The resource
-shape below is accepted target design; DNS contents and host route selection
-remain deliberately open.
+The active NetLagLab Session does not currently create a network or mount
+namespace, veth pair, routes, DNS view, NAT rules, or qdiscs. The standalone
+private library now implements creation and cleanup of the namespace and veth
+resource roots, but it is not linked into the helper and has not been
+privileged-qualified. The topology and basic connectivity were verified
+manually in [Experiment 01](../experiment_01.md). The resource shape below is
+accepted target design; DNS contents and host route selection remain
+deliberately open.
 
 The private transaction foundation is implemented and tested without
 privilege. One preparation operation drives the complete fixed semantic setup
@@ -30,11 +33,23 @@ typed failures, and the absence of later mutation after rejection.
 The same private library contains a bounded command runner that executes an
 exact path with separate arguments and an empty environment, enforces an
 absolute deadline, captures at most 4 KiB of standard error while draining the
-remainder, and terminates and reaps a timed-out child. The production adapter's
-resource-changing operations remain deliberately unavailable: after a
-successful preflight the first namespace-creation stage reports a typed system
-failure without starting a command. The library is not linked into the helper
-or active Session and does not create or configure real network resources.
+remainder, and terminates and reaps a timed-out child. Its production adapter
+creates `netlaglab`, retains and identifies the exact `nsfs` object, creates the
+veth pair, and moves `nll-app` through the inherited namespace-file descriptor.
+Validated `RTM_GETLINK` replies prove both endpoints before and after placement;
+namespace-side queries run in bounded short-lived children that enter the exact
+handle. Ambiguous mutations are reconciled before ownership is recorded, and
+cleanup verifies the retained identities before deleting veth then namespace.
+An identity mismatch or unavailable proof is retained without name-based
+deletion authority.
+
+Controlled tests cover exact arguments, runner-result mapping, ownership
+transitions, exact-handle reuse, ambiguous effects, cleanup ordering, mismatch
+refusal, and the post-namespace-removal veth recheck. The first host-address
+operation remains deliberately unavailable, so standalone preparation rolls
+back after proving the resource roots. The adapter is therefore
+unprivileged-tested, not privileged-qualified. The library remains unlinked
+from the helper and active Session.
 
 ## Target topology
 

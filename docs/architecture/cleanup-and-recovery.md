@@ -147,6 +147,11 @@ idempotent success, a matching remaining identity stays eligible for retry, and
 a different identity is left untouched. After successful namespace removal,
 cleanup rechecks a previously unresolved veth once because destroying the
 namespace may also have removed its peer and therefore the pair.
+The descriptor close is the last namespace-ownership action. When named
+namespace removal succeeds with a veth proof still unresolved, consuming the
+namespace proof closes that descriptor before the one read-only veth recheck;
+dropping the final owned namespace reference is what allows kernel namespace
+destruction to remove the peer. The recheck grants no new deletion authority.
 
 The same principle applies to a live Network Profile mutation: restore the
 last confirmed state after a partial failure. If the helper cannot establish

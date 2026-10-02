@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cerrno>
 #include <csignal>
+#include <fcntl.h>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -131,6 +132,23 @@ TEST(NetworkCommandRunnerTest, TimeoutTerminatesAndReapsTheChild)
     errno = 0;
     EXPECT_EQ(waitpid(child_pid, &status, WNOHANG), -1);
     EXPECT_EQ(errno, ECHILD);
+}
+
+TEST(NetworkCommandRunnerTest, InheritsTheExplicitNamespaceDescriptor)
+{
+    const int descriptor{open("/dev/null", O_RDONLY | O_CLOEXEC)};
+    ASSERT_NE(descriptor, -1);
+    const std::vector<std::string> arguments{
+        "fd-open", std::to_string(descriptor)};
+
+    const CommandResult result{run_command_with_inherited_descriptor(
+        NETWORK_COMMAND_PROBE_PATH,
+        arguments,
+        descriptor,
+        std::chrono::steady_clock::now() + std::chrono::seconds{2})};
+
+    EXPECT_EQ(result.kind, CommandResultKind::success);
+    EXPECT_EQ(close(descriptor), 0);
 }
 
 } // namespace
