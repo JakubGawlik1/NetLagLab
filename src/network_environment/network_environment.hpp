@@ -114,4 +114,6 @@ using PreparationResult =
 [[nodiscard]] PreparationResult prepare_network_environment(
     PreparationInput input);
 
+[[nodiscard]] PreparationResult prepare_network_environment();
+
 } // namespace netlaglab::network_environment

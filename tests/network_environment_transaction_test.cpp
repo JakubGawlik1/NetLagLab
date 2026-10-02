@@ -88,6 +88,51 @@ TEST(NetworkEnvironmentTransactionTest, PreparesAndExplicitlyCleansCompleteEnvir
         }));
 }
 
+TEST(NetworkEnvironmentTransactionTest, PreparedOwnerRetainsHostLockUntilCleanup)
+{
+    auto trace{std::make_shared<testing::SharedTrace>()};
+    auto script{successful_setup()};
+    script.push_back({Operation::remove_veth, Outcome::removed});
+    script.push_back({Operation::remove_namespace, Outcome::removed});
+    PreparationResult result{testing::prepare_scripted_network_environment(
+        std::move(script), trace, {}, true)};
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    EXPECT_TRUE(trace->host_lock_alive);
+
+    CleanupResult cleanup{std::move(
+        std::get<PreparedNetworkEnvironment>(result))
+                              .cleanup()};
+
+    EXPECT_TRUE(cleanup.failures.empty());
+    EXPECT_FALSE(cleanup.residual.has_value());
+    EXPECT_FALSE(trace->host_lock_alive);
+}
+
+TEST(NetworkEnvironmentTransactionTest, ResidualOwnerRetainsHostLockUntilRetry)
+{
+    auto trace{std::make_shared<testing::SharedTrace>()};
+    PreparationResult result{testing::prepare_scripted_network_environment(
+        {
+            {Operation::preflight},
+            {Operation::create_namespace, Outcome::fail_new_state},
+            {Operation::remove_namespace, Outcome::cleanup_retained},
+            {Operation::remove_namespace, Outcome::removed},
+        },
+        trace,
+        {},
+        true)};
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    auto& failure{std::get<PreparationFailure>(result)};
+    ASSERT_TRUE(failure.residual.has_value());
+    EXPECT_TRUE(trace->host_lock_alive);
+
+    CleanupResult retry{std::move(*failure.residual).retry()};
+
+    EXPECT_TRUE(retry.failures.empty());
+    EXPECT_FALSE(retry.residual.has_value());
+    EXPECT_FALSE(trace->host_lock_alive);
+}
+
 struct SetupFailureCase {
     Operation failed_operation;
     Stage expected_stage;

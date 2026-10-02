@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-10-01
+Last verified: 2026-10-02
 
 ## How to use this file
 
@@ -34,12 +34,16 @@ cross-platform support are not current goals.
   fixed local setup sequence and returns either a move-only prepared owner or
   a typed failure with ordered rollback failures and an optional residual
   cleanup owner. Explicit cleanup and retry are consuming and bounded; owner
-  destruction makes one no-throw best-effort pass. The command runner executes
-  one exact path with separate arguments and an empty environment, enforces an
-  absolute deadline, always reaps its child, and retains at most 4 KiB of
-  standard-error diagnostics while draining the remainder. The library is not
-  linked into the helper and does not yet contain the production Linux/iproute2
-  adapter or create and configure real network resources.
+  destruction makes one no-throw best-effort pass. Its production entry point
+  acquires and owns the root host lock, validates root execution and a trusted
+  fixed-path `ip`, rejects fixed namespace/link names and intersecting host
+  IPv4 addresses or non-default routes, and uses a bounded validated
+  `RTM_GETROUTE` dump across all host routing tables. The command runner
+  executes one exact path with separate arguments and an empty environment,
+  enforces an absolute deadline, always reaps its child, and retains at most
+  4 KiB of standard-error diagnostics while draining the remainder. The
+  library is not linked into the helper; namespace/veth mutations and all real
+  Network Environment configuration remain unimplemented.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.

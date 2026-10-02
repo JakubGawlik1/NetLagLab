@@ -46,11 +46,13 @@ struct ScriptStep {
 struct SharedTrace {
     std::vector<Operation> operations;
     std::vector<std::chrono::steady_clock::time_point> deadlines;
+    bool host_lock_alive{};
 };
 
 [[nodiscard]] PreparationResult prepare_scripted_network_environment(
     std::vector<ScriptStep> script,
     std::shared_ptr<SharedTrace> trace,
-    std::chrono::steady_clock::time_point start = {});
+    std::chrono::steady_clock::time_point start = {},
+    bool track_host_lock = false);
 
 } // namespace netlaglab::network_environment::testing

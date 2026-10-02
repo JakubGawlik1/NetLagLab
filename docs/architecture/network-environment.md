@@ -18,13 +18,23 @@ dependency-aware, and bounded; destruction makes one no-throw best-effort pass.
 A shared trace keeps semantic calls and absolute deadlines observable after the
 dependencies move into an owner.
 
-The same private library also contains a bounded command runner that executes
-an exact path with separate arguments and an empty environment, enforces an
+The production entry point now acquires the root-owned host lock before its
+read-only preflight. That preflight validates root execution and a root-owned,
+non-writable fixed-path `ip`; checks the fixed namespace path and both host link
+names; inventories host IPv4 address prefixes; and performs a bounded,
+validated `RTM_GETROUTE` dump across all routing tables. Controlled tests cover
+exact, broader, and narrower overlaps, permitted default routes, multiple
+tables, multipart completion, netlink errors, truncation, malformed attributes,
+typed failures, and the absence of later mutation after rejection.
+
+The same private library contains a bounded command runner that executes an
+exact path with separate arguments and an empty environment, enforces an
 absolute deadline, captures at most 4 KiB of standard error while draining the
-remainder, and terminates and reaps a timed-out child. The production
-Linux/iproute2 adapter, host lock, inventory and rtnetlink decoders remain
-unimplemented. The library is not linked into the helper or active Session and
-does not create or configure real network resources.
+remainder, and terminates and reaps a timed-out child. The production adapter's
+resource-changing operations remain deliberately unavailable: after a
+successful preflight the first namespace-creation stage reports a typed system
+failure without starting a command. The library is not linked into the helper
+or active Session and does not create or configure real network resources.
 
 ## Target topology
 

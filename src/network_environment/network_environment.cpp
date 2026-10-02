@@ -1,5 +1,7 @@
 #include "network_environment.hpp"
 
+#include "preflight.hpp"
+#include "production_test_support.hpp"
 #include "transaction_test_support.hpp"
 
 #include <algorithm>
@@ -119,6 +121,14 @@ class MonotonicClock {
 public:
     virtual ~MonotonicClock() = default;
     [[nodiscard]] virtual TimePoint now() const = 0;
+};
+
+class SystemClock final : public MonotonicClock {
+public:
+    [[nodiscard]] TimePoint now() const override
+    {
+        return std::chrono::steady_clock::now();
+    }
 };
 
 class SemanticAdapter {
@@ -352,6 +362,137 @@ private:
     std::shared_ptr<ScriptState> state_;
 };
 
+class ProductionAdapter final : public SemanticAdapter {
+public:
+    explicit ProductionAdapter(
+        std::unique_ptr<detail::PreflightPlatform> platform,
+        std::shared_ptr<testing::ProductionTrace> trace = {})
+        : platform_{std::move(platform)}
+        , trace_{std::move(trace)}
+    {
+    }
+
+    [[nodiscard]] OperationResult preflight(const TimePoint deadline) override
+    {
+        detail::PreflightResult result{
+            detail::run_preflight(*platform_, deadline)};
+        if (result.succeeded) {
+            ip_path_ = std::move(result.ip_path);
+        }
+        return {result.succeeded, result.cause};
+    }
+
+    [[nodiscard]] NamespaceMutationResult create_namespace(TimePoint) override
+    {
+        if (trace_) {
+            ++trace_->semantic_mutation_requests;
+        }
+        return {false, Cause::system_failure, {}};
+    }
+
+    [[nodiscard]] VethMutationResult create_veth(TimePoint) override
+    {
+        return {false, Cause::system_failure, {}};
+    }
+
+    [[nodiscard]] VethMutationResult move_peer(
+        const NamespaceProof&,
+        HostVethProof proof,
+        TimePoint) override
+    {
+        VethState state;
+        state.emplace<HostVethProof>(std::move(proof));
+        return {false, Cause::system_failure, std::move(state)};
+    }
+
+    [[nodiscard]] OperationResult assign_host_address(
+        const PlacedVethProof&,
+        TimePoint) override
+    {
+        return {false, Cause::system_failure};
+    }
+
+    [[nodiscard]] OperationResult bring_host_link_up(
+        const PlacedVethProof&,
+        TimePoint) override
+    {
+        return {false, Cause::system_failure};
+    }
+
+    [[nodiscard]] OperationResult bring_loopback_up(
+        const NamespaceProof&,
+        TimePoint) override
+    {
+        return {false, Cause::system_failure};
+    }
+
+    [[nodiscard]] OperationResult assign_namespace_address(
+        const NamespaceProof&,
+        const PlacedVethProof&,
+        TimePoint) override
+    {
+        return {false, Cause::system_failure};
+    }
+
+    [[nodiscard]] OperationResult bring_namespace_link_up(
+        const NamespaceProof&,
+        const PlacedVethProof&,
+        TimePoint) override
+    {
+        return {false, Cause::system_failure};
+    }
+
+    [[nodiscard]] OperationResult add_default_route(
+        const NamespaceProof&,
+        const PlacedVethProof&,
+        TimePoint) override
+    {
+        return {false, Cause::system_failure};
+    }
+
+    [[nodiscard]] VethRemovalResult remove_veth(
+        ProvenVeth proof,
+        TimePoint) override
+    {
+        VethState state;
+        std::visit(
+            [&state](auto retained) {
+                state.emplace<std::decay_t<decltype(retained)>>(
+                    std::move(retained));
+            },
+            std::move(proof));
+        return {Cause::system_failure, std::move(state)};
+    }
+
+    [[nodiscard]] NamespaceRemovalResult remove_namespace(
+        NamespaceProof proof,
+        TimePoint) override
+    {
+        NamespaceState state;
+        state.emplace<NamespaceProof>(std::move(proof));
+        return {Cause::system_failure, std::move(state)};
+    }
+
+private:
+    std::unique_ptr<detail::PreflightPlatform> platform_;
+    std::shared_ptr<testing::ProductionTrace> trace_;
+    std::string ip_path_;
+};
+
+class TrackedHostLock final : public detail::HostLock {
+public:
+    explicit TrackedHostLock(std::shared_ptr<testing::SharedTrace> trace)
+        : trace_{std::move(trace)}
+    {
+        trace_->host_lock_alive = true;
+    }
+
+    ~TrackedHostLock() override { trace_->host_lock_alive = false; }
+
+private:
+    std::shared_ptr<testing::SharedTrace> trace_;
+};
+
 [[nodiscard]] TimePoint operation_deadline(
     const TimePoint now,
     const TimePoint transaction_deadline)
@@ -387,6 +528,7 @@ namespace detail {
 struct PreparationRuntime {
     std::unique_ptr<SemanticAdapter> adapter;
     std::unique_ptr<MonotonicClock> clock;
+    std::unique_ptr<HostLock> host_lock;
 };
 
 struct OwnerState {
@@ -732,12 +874,46 @@ PreparationResult prepare_network_environment(PreparationInput input)
     return detail::OwnerAccess::prepared(std::move(state));
 }
 
+namespace {
+
+[[nodiscard]] PreparationResult prepare_production_network_environment(
+    std::unique_ptr<detail::PreflightPlatform> platform,
+    std::shared_ptr<testing::ProductionTrace> trace = {})
+{
+    detail::HostLockResult lock{platform->acquire_host_lock()};
+    if (!lock.lock) {
+        return PreparationFailure{
+            {Stage::preflight, lock.cause},
+            {},
+            std::nullopt,
+        };
+    }
+    auto runtime{std::make_unique<detail::PreparationRuntime>(
+        detail::PreparationRuntime{
+            std::make_unique<ProductionAdapter>(
+                std::move(platform), std::move(trace)),
+            std::make_unique<SystemClock>(),
+            std::move(lock.lock),
+        })};
+    return prepare_network_environment(
+        detail::PreparationAccess::make(std::move(runtime)));
+}
+
+} // namespace
+
+PreparationResult prepare_network_environment()
+{
+    return prepare_production_network_environment(
+        detail::make_linux_preflight_platform());
+}
+
 namespace testing {
 
 PreparationResult prepare_scripted_network_environment(
     std::vector<ScriptStep> script,
     std::shared_ptr<SharedTrace> trace,
-    const TimePoint start)
+    const TimePoint start,
+    const bool track_host_lock)
 {
     auto script_state{std::make_shared<ScriptState>(ScriptState{
         start,
@@ -748,9 +924,20 @@ PreparationResult prepare_scripted_network_environment(
         detail::PreparationRuntime{
             std::make_unique<ScriptedAdapter>(script_state),
             std::make_unique<ScriptedClock>(script_state),
+            track_host_lock
+                ? std::make_unique<TrackedHostLock>(script_state->trace)
+                : nullptr,
         })};
     return prepare_network_environment(
         detail::PreparationAccess::make(std::move(runtime)));
+}
+
+PreparationResult prepare_with_preflight_platform(
+    std::unique_ptr<detail::PreflightPlatform> platform,
+    std::shared_ptr<ProductionTrace> trace)
+{
+    return prepare_production_network_environment(
+        std::move(platform), std::move(trace));
 }
 
 } // namespace testing

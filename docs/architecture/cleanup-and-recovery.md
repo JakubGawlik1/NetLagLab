@@ -13,9 +13,11 @@ rolls back only its proven prefix; explicit cleanup consumes a prepared or
 residual owner, continues across independent roots, aggregates failures, and
 returns only unresolved state. Identity-unconfirmed state never regains
 deletion authority, and owner destruction performs one bounded no-throw pass.
-There are still no production namespace, veth, route, NAT, firewall, DNS-mount,
-or qdisc resources to clean up, and the standalone library is not integrated
-with the helper.
+Its production entry point acquires the root-owned host lock before preflight,
+and the runtime retains that lock in either a prepared or residual owner until
+cleanup work is gone. There are still no production namespace, veth, route,
+NAT, firewall, DNS-mount, or qdisc resources to clean up, and the standalone
+library is not integrated with the helper.
 
 The remaining production ownership and cleanup rules below are accepted target
 design. A durable recovery journal is accepted in principle for persistent
