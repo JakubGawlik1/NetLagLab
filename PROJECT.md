@@ -45,10 +45,15 @@ cross-platform support are not current goals.
   production adapter can create the fixed namespace and veth roots, retain an
   exact `nsfs` handle, prove the veth identities with validated `RTM_GETLINK`
   replies on both sides of that handle, and reconcile ambiguous mutation and
-  proof-based cleanup outcomes. This path is covered only by controlled
-  unprivileged tests and has not passed privileged qualification. The library
-  is not linked into the helper; addresses, link state, routes, and later
-  Network Environment configuration remain unimplemented.
+  proof-based cleanup outcomes. It then assigns both fixed addresses, brings
+  up the host endpoint, namespace loopback, and Session endpoint, and installs
+  the namespace default route. Namespace-side commands enter through the exact
+  retained handle in bounded short-lived children; successful completion alone
+  returns the prepared owner, while configuration failure rolls back the proven
+  roots. This path is covered only by controlled unprivileged tests and has not
+  passed privileged qualification. The library is not linked into the helper;
+  DNS mounts, forwarding, NAT, firewall handling, shaping, Workload entry, and
+  active Session integration remain unimplemented.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.

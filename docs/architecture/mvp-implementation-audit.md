@@ -4,11 +4,12 @@
 
 The standalone private Network Environment library can now create and prove
 the fixed namespace and veth resource roots, move `nll-app` through the exact
-owned namespace handle, reconcile ambiguous mutation outcomes, and perform
-proof-based rollback. This implementation is covered by controlled
-unprivileged tests only. It is not linked into the helper, has not passed the
-separately authorized privileged qualification, and deliberately fails at the
-first host-configuration operation after rolling the proven roots back.
+owned namespace handle, configure both addresses, all three required link
+states, and the namespace default route, and perform proof-based cleanup.
+Namespace-side mutations enter the exact retained handle in bounded child
+processes. This implementation is covered by controlled unprivileged tests
+only. It is not linked into the helper and has not passed the separately
+authorized privileged qualification.
 
 ## Implementation update — 2026-09-29
 
@@ -62,9 +63,10 @@ the privileged helper, the helper launches and reaps the Workload under the
 invoking identity, the lifecycle preserves execution and infrastructure
 outcomes, and the Controller handles the complete public command set and
 dispatches typed Profile Changes. However, the Workload still runs in the host
-namespaces, the standalone production adapter does not configure a complete
-network environment, and no production code applies a Network Profile. The
-active Session therefore still has no network isolation or shaping.
+namespaces, the completed standalone host-local topology is not connected to
+the helper, DNS/mount and host-connectivity work remains absent, and no
+production code applies a Network Profile. The active Session therefore still
+has no network isolation or shaping.
 
 Using the accepted architecture responsibilities as the unit of counting, **5
 coherent implementation slices remain**. After those slices, **1 privileged
@@ -80,10 +82,9 @@ does not pretend that all five slices have equal size.
 
 - Original snapshot: branch `main`, commit `633207b`, including every staged,
   unstaged, and untracked file visible on 2026-09-25.
-- Update evidence: branch `main` through implementation commit `808e779` on
-  2026-09-29. The branch is 10 commits ahead of `origin/main`; this refreshed
-  document is an uncommitted working-tree edit, so the result remains a local
-  assessment rather than a released-version assessment.
+- Update evidence: local branch `main` through the standalone fixed-local-
+  topology implementation on 2026-10-02. The result remains a local assessment
+  rather than a released-version assessment.
 - Primary sources only: production code, tests, CMake configuration, repository
   architecture/product documents, the recorded manual experiment, and Git.
 - Documentation claims were accepted only when corroborated by current code or
@@ -95,9 +96,10 @@ does not pretend that all five slices have equal size.
   `nll-app`, `nft`, `ufw`, `firewalld`, `qdisc`, `netem`, `resolv.conf`,
   `ip_forward`, and `masquerade`. Profile-mutation frames are now implemented as
   an unprivileged conversation contract. That result is superseded for
-  standalone namespace/veth root creation by the 2026-10-02 update above;
-  configuration and Session integration remain absent. The Workload still uses
-  the host network and Controller status still reports `shaping: not applied`.
+  standalone namespace/veth creation and fixed local configuration by the
+  2026-10-02 update above; DNS/mount, host connectivity, and Session integration
+  remain absent. The Workload still uses the host network and Controller status
+  still reports `shaping: not applied`.
 
 ## MVP criteria recovered from the repository
 
@@ -160,14 +162,14 @@ count.
 | Helper-owned Workload execution | **Partial** | The helper authenticates the Supervisor, acquires `/run/netlaglab/host.lock`, launches, signals, and reaps the Workload (`src/helper_main.cpp`). The child restores groups/GID/UID, standard descriptors, cwd, argv/environment, and executes without a shell (`src/workload_process.cpp:189-329`). There is no namespace or mount entry before the identity drop; the accepted target requires both (`docs/architecture/workload-execution.md:40-69`). |
 | Base Controller | **Implemented control-plane checkpoint; shaping pending** | `ControllerControlPlane::handle()` owns framing, the 32-command queue, reply ownership, confirmed profile, shaping flag, and running/stopping state. Typed `set`/`reset` requests dispatch to the helper; production reports reversible failure because real shaping remains absent. Complete Session Outcome delivery and legacy attach compatibility remain implemented. |
 | Supervisor-helper protocol | **Implemented and connected; shaping pending** | Existing lifecycle/start/stop/cleanup behavior is preserved. Typed runtime variants include every Profile Change, exact canonical serialization, independent helper validation, one-operation ordering, fixed success/failure responses, stop priority, terminal cancellation, and byte-stream fragmentation/coalescing coverage. Production Controller dispatch uses this contract. |
-| Network and mount environment | **Manual experiment only; missing from production** | The manual commands created a namespace, veth, addresses, loopback, route, NAT, and DNS file (`docs/experiment_01.md:37-61,66-100`). The current target document states that production creates none of these (`docs/architecture/network-environment.md:3-9`). Source search found no production implementation. |
+| Network and mount environment | **Standalone local topology implemented; Session integration and mount/DNS pending** | The private production adapter transactionally creates and proves the fixed namespace/veth roots, assigns both addresses, brings up both endpoints and loopback, adds the namespace default route, and performs proof-based cleanup. Controlled tests cover exact commands and every new failure point. The library is not linked into the helper, the Workload remains in the host namespaces, and private mount/DNS setup is absent. |
 | Host routing/NAT/firewall | **Manual experiment only; missing from production** | Experiment 01 demonstrated scoped NAT and a UFW forwarding problem/fix (`docs/experiment_01.md:66-100,133-148`). Production currently performs no routing, forwarding, NAT, or firewall mutation (`docs/architecture/host-networking-and-firewall.md:3-10`). |
 | Traffic shaping | **Implemented domain/protocol/control-plane model plus manual experiment; runtime missing** | Typed validation, atomic Profile Change application, and live dispatch/result integration exist, and delay/jitter/loss were manually exercised on both veth endpoints (`docs/experiment_01.md:102-131`). Runtime qdisc application, bandwidth composition, and privileged apply/rollback are absent (`docs/architecture/traffic-shaping.md`). The manual experiment did not establish bandwidth limiting. |
-| Cleanup and recovery | **Partial** | Current process, descriptor, socket, and lock cleanup exists: the helper releases the lock and reports cleanup after reaping (`src/helper_main.cpp`), while the Supervisor reaps the launcher and removes `control.sock` (`src/session.cpp:394-408`). Network-resource rollback, persistent firewall recovery, and interrupted-state reconciliation cannot exist yet because those resources are not created (`docs/architecture/cleanup-and-recovery.md:3-13,39-53,106-132`). |
+| Cleanup and recovery | **Partial** | Current process, descriptor, socket, and lock cleanup exists. The standalone Network Environment owner now performs proof-based namespace/veth cleanup and configuration failures roll back those roots. Active helper integration, DNS/NAT/firewall/qdisc cleanup, persistent firewall recovery, and interrupted-state reconciliation remain absent. |
 
 The code-level classification now matches the repository feature map for the
-Controller and protocol checkpoints. Network, firewall, and runtime shaping
-classifications remain unchanged.
+Controller, protocol, and standalone fixed-local-topology checkpoints. Active
+Session networking, firewall, DNS/mount, and runtime shaping remain incomplete.
 
 ## The 5 remaining implementation slices
 
@@ -180,12 +182,13 @@ These are responsibility slices, not a mandatory commit sequence.
    contracts. Acceptance: the Workload demonstrably has the Session interfaces,
    routes, loopback, and resolver view while retaining the invoking identity.
 
-2. **Transactional network/mount environment.** Implement semantic preflight,
-   collision refusal, an ownership ledger, namespace/veth creation, addresses,
-   loopback, default route, private mount namespace, DNS file/mount, and reverse
-   rollback of every successfully created prefix. Acceptance: local isolation
-   works without requiring public Internet, and injected failure after each
-   setup step leaves no owned residue.
+2. **Transactional network/mount environment.** The standalone network portion
+   now implements preflight, collision refusal, ownership, namespace/veth,
+   addresses, loopback, default route, and proof-based rollback. Complete the
+   private mount namespace and DNS file/mount ownership within the same
+   transactional contract. Acceptance: local isolation works without requiring
+   public Internet, and injected failure after each remaining setup step leaves
+   no owned residue.
 
 3. **Scoped host connectivity and firewall integration.** Implement forwarding
    preflight, the Session-owned nftables NAT table, host-route policy, supported
@@ -208,11 +211,11 @@ These are responsibility slices, not a mandatory commit sequence.
    overrides a known Workload outcome with 125, and interrupted persistent state
    is reconciled under the host lock before a new Session starts.
 
-Slice 1 extends a currently partial module. Slices 2–5 are the missing
-privileged backend and dominate the remaining engineering risk. Slice 2 can be
-implemented and tested for host-local isolation before Q64/Q65/Q47 are closed;
-production DNS/Internet/firewall/recovery cannot be completed without those
-decisions (`docs/architecture/session-lifecycle-implementation-status.md:49-59`).
+Slice 1 extends a currently partial module. Slices 2–5 contain the remaining
+privileged backend and dominate the remaining engineering risk. The standalone
+host-local network portion of slice 2 is implemented; production DNS,
+Internet/firewall, and recovery cannot be completed without Q64/Q65/Q47
+(`docs/architecture/session-lifecycle-implementation-status.md:49-59`).
 
 ## Decisions and design work still open
 

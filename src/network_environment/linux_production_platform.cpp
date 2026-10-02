@@ -288,6 +288,20 @@ public:
             executable_path, arguments, handle->descriptor(), deadline);
     }
 
+    [[nodiscard]] CommandResult run_ip_in_namespace(
+        const std::string_view executable_path,
+        const std::span<const std::string> arguments,
+        const NamespaceHandle& namespace_handle,
+        const std::chrono::steady_clock::time_point deadline) override
+    {
+        const LinuxNamespaceHandle* handle{linux_handle(namespace_handle)};
+        if (handle == nullptr) {
+            return {CommandResultKind::system_failure, EINVAL, {}};
+        }
+        return run_command_in_network_namespace(
+            executable_path, arguments, handle->descriptor(), deadline);
+    }
+
     [[nodiscard]] NamespaceQuery query_namespace() override
     {
         const int raw_descriptor{

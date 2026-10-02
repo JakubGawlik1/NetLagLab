@@ -10,6 +10,7 @@
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -29,6 +30,12 @@ enum class ChildFailureKind : int {
 struct ChildFailureMessage {
     ChildFailureKind kind;
     int error_number;
+};
+
+enum class NamespaceMode {
+    none,
+    inherit_descriptor,
+    enter,
 };
 
 [[noreturn]] void report_child_failure_and_exit(
@@ -145,7 +152,8 @@ struct ChildFailureMessage {
 [[nodiscard]] static CommandResult run_command_impl(
     const std::string_view executable_path,
     const std::span<const std::string> arguments,
-    const int inherited_descriptor,
+    const int namespace_descriptor,
+    const NamespaceMode namespace_mode,
     const std::chrono::steady_clock::time_point deadline)
 {
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -209,11 +217,11 @@ struct ChildFailureMessage {
             }
             standard_error_writer.reset();
         }
-        if (inherited_descriptor >= 0) {
-            const int descriptor_flags{fcntl(inherited_descriptor, F_GETFD)};
+        if (namespace_mode == NamespaceMode::inherit_descriptor) {
+            const int descriptor_flags{fcntl(namespace_descriptor, F_GETFD)};
             if (descriptor_flags == -1
                 || fcntl(
-                       inherited_descriptor,
+                       namespace_descriptor,
                        F_SETFD,
                        descriptor_flags & ~FD_CLOEXEC)
                     == -1) {
@@ -222,6 +230,12 @@ struct ChildFailureMessage {
                     ChildFailureKind::system_failure,
                     errno);
             }
+        } else if (namespace_mode == NamespaceMode::enter
+            && setns(namespace_descriptor, CLONE_NEWNET) == -1) {
+            report_child_failure_and_exit(
+                child_failure_writer.get(),
+                ChildFailureKind::system_failure,
+                errno);
         }
         execve(executable.c_str(), argument_pointers.data(), environment);
         report_child_failure_and_exit(
@@ -389,7 +403,8 @@ CommandResult run_command(
     const std::span<const std::string> arguments,
     const std::chrono::steady_clock::time_point deadline)
 {
-    return run_command_impl(executable_path, arguments, -1, deadline);
+    return run_command_impl(
+        executable_path, arguments, -1, NamespaceMode::none, deadline);
 }
 
 CommandResult run_command_with_inherited_descriptor(
@@ -402,7 +417,28 @@ CommandResult run_command_with_inherited_descriptor(
         return {CommandResultKind::system_failure, EINVAL, {}};
     }
     return run_command_impl(
-        executable_path, arguments, inherited_descriptor, deadline);
+        executable_path,
+        arguments,
+        inherited_descriptor,
+        NamespaceMode::inherit_descriptor,
+        deadline);
+}
+
+CommandResult run_command_in_network_namespace(
+    const std::string_view executable_path,
+    const std::span<const std::string> arguments,
+    const int namespace_descriptor,
+    const std::chrono::steady_clock::time_point deadline)
+{
+    if (namespace_descriptor < 0) {
+        return {CommandResultKind::system_failure, EINVAL, {}};
+    }
+    return run_command_impl(
+        executable_path,
+        arguments,
+        namespace_descriptor,
+        NamespaceMode::enter,
+        deadline);
 }
 
 } // namespace netlaglab::network_environment

@@ -93,6 +93,7 @@ struct RecordedCommand {
     std::string executable;
     std::vector<std::string> arguments;
     const NamespaceHandle* inherited_namespace;
+    bool enters_namespace;
 };
 
 struct RecordedLinkQuery {
@@ -126,6 +127,24 @@ public:
             std::string{executable_path},
             {arguments.begin(), arguments.end()},
             inherited_namespace,
+            false,
+        });
+        CommandResult result{std::move(commands.front())};
+        commands.pop_front();
+        return result;
+    }
+
+    [[nodiscard]] CommandResult run_ip_in_namespace(
+        const std::string_view executable_path,
+        const std::span<const std::string> arguments,
+        const NamespaceHandle& namespace_handle,
+        std::chrono::steady_clock::time_point) override
+    {
+        trace->recorded_commands.push_back({
+            std::string{executable_path},
+            {arguments.begin(), arguments.end()},
+            &namespace_handle,
+            true,
         });
         CommandResult result{std::move(commands.front())};
         commands.pop_front();
@@ -227,6 +246,155 @@ void queue_absent_placed_pair(FakeProductionPlatform& platform)
     platform.namespace_links.push_back(absent_link());
 }
 
+TEST(NetworkProductionAdapterTest, ConfiguresTheCompleteFixedTopology)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    CleanupResult cleanup{
+        std::move(std::get<PreparedNetworkEnvironment>(result)).cleanup()};
+    EXPECT_TRUE(cleanup.failures.empty());
+    EXPECT_FALSE(cleanup.residual.has_value());
+    ASSERT_EQ(observed->recorded_commands.size(), 11U);
+    EXPECT_EQ(
+        observed->recorded_commands[3].arguments,
+        (std::vector<std::string>{
+            "address", "add", "10.200.0.1/30", "dev", "nll-host"}));
+    EXPECT_EQ(
+        observed->recorded_commands[4].arguments,
+        (std::vector<std::string>{"link", "set", "dev", "nll-host", "up"}));
+    EXPECT_EQ(
+        observed->recorded_commands[5].arguments,
+        (std::vector<std::string>{"link", "set", "dev", "lo", "up"}));
+    EXPECT_EQ(
+        observed->recorded_commands[6].arguments,
+        (std::vector<std::string>{
+            "address", "add", "10.200.0.2/30", "dev", "nll-app"}));
+    EXPECT_EQ(
+        observed->recorded_commands[7].arguments,
+        (std::vector<std::string>{"link", "set", "dev", "nll-app", "up"}));
+    EXPECT_EQ(
+        observed->recorded_commands[8].arguments,
+        (std::vector<std::string>{
+            "route", "add", "default", "via", "10.200.0.1", "dev", "nll-app"}));
+    EXPECT_FALSE(observed->recorded_commands[3].enters_namespace);
+    EXPECT_FALSE(observed->recorded_commands[4].enters_namespace);
+    const NamespaceHandle* exact_namespace{
+        observed->recorded_commands[2].inherited_namespace};
+    ASSERT_NE(exact_namespace, nullptr);
+    for (std::size_t index{5}; index <= 8; ++index) {
+        EXPECT_TRUE(observed->recorded_commands[index].enters_namespace);
+        EXPECT_EQ(
+            observed->recorded_commands[index].inherited_namespace,
+            exact_namespace);
+    }
+}
+
+struct ConfigurationFailureCase {
+    std::size_t operation_index;
+    Stage expected_stage;
+    CommandResultKind result_kind;
+    Cause expected_cause;
+};
+
+class NetworkProductionConfigurationFailureTest
+    : public ::testing::TestWithParam<ConfigurationFailureCase> {
+};
+
+TEST_P(
+    NetworkProductionConfigurationFailureTest,
+    StopsBeforeTheNextMutationAndRollsBackTheProvenRoots)
+{
+    const ConfigurationFailureCase parameter{GetParam()};
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    for (std::size_t index{}; index < 3 + parameter.operation_index; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    production->commands.push_back({parameter.result_kind, 1, {}});
+    production->commands.push_back({CommandResultKind::success, 0, {}});
+    production->commands.push_back({CommandResultKind::success, 0, {}});
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    const PreparationFailure& failure{std::get<PreparationFailure>(result)};
+    EXPECT_EQ(failure.primary.stage, parameter.expected_stage);
+    EXPECT_EQ(failure.primary.cause, parameter.expected_cause);
+    EXPECT_TRUE(failure.rollback_failures.empty());
+    EXPECT_FALSE(failure.residual.has_value());
+    ASSERT_EQ(
+        observed->recorded_commands.size(),
+        3 + parameter.operation_index + 1 + 2);
+    EXPECT_EQ(
+        observed->recorded_commands[3 + parameter.operation_index + 1].arguments,
+        (std::vector<std::string>{"link", "delete", "dev", "nll-host"}));
+    EXPECT_EQ(
+        observed->recorded_commands.back().arguments,
+        (std::vector<std::string>{"netns", "delete", "netlaglab"}));
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    EveryFixedConfigurationMutation,
+    NetworkProductionConfigurationFailureTest,
+    ::testing::Values(
+        ConfigurationFailureCase{
+            0,
+            Stage::host_configuration,
+            CommandResultKind::exec_failure,
+            Cause::unavailable_or_invalid_tool,
+        },
+        ConfigurationFailureCase{
+            1,
+            Stage::host_configuration,
+            CommandResultKind::signal,
+            Cause::command_signal,
+        },
+        ConfigurationFailureCase{
+            2,
+            Stage::namespace_configuration,
+            CommandResultKind::timeout,
+            Cause::timeout,
+        },
+        ConfigurationFailureCase{
+            3,
+            Stage::namespace_configuration,
+            CommandResultKind::system_failure,
+            Cause::system_failure,
+        },
+        ConfigurationFailureCase{
+            4,
+            Stage::namespace_configuration,
+            CommandResultKind::nonzero_exit,
+            Cause::command_exit,
+        },
+        ConfigurationFailureCase{
+            5,
+            Stage::route_configuration,
+            CommandResultKind::timeout,
+            Cause::timeout,
+        }));
+
 TEST(NetworkProductionAdapterTest, CreatesNamespaceAndRetainsItsExactIdentity)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
@@ -258,15 +426,15 @@ TEST(NetworkProductionAdapterTest, MovesPeerThroughTheExactOwnedNamespaceHandle)
     production->commands.push_back({CommandResultKind::success, 0, {}});
     production->commands.push_back({CommandResultKind::success, 0, {}});
     production->commands.push_back({CommandResultKind::success, 0, {}});
-    production->namespaces.push_back({
-        InventoryStatus::present,
-        std::make_unique<FakeNamespaceHandle>(NamespaceIdentity{7, 11}),
-    });
-    production->host_links.push_back(present_link(20, 21));
-    production->host_links.push_back(present_link(21, 20));
-    production->host_links.push_back(present_link(20, 21, 4));
-    production->host_links.push_back(absent_link());
-    production->namespace_links.push_back(present_link(21, 20, 8));
+    production->commands.push_back({CommandResultKind::nonzero_exit, 1, {}});
+    production->commands.push_back({CommandResultKind::success, 0, {}});
+    production->commands.push_back({CommandResultKind::success, 0, {}});
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
 
     PreparationResult result{testing::prepare_with_production_platform(
         std::make_unique<PassingPreflight>(), std::move(production))};
@@ -275,7 +443,7 @@ TEST(NetworkProductionAdapterTest, MovesPeerThroughTheExactOwnedNamespaceHandle)
     EXPECT_EQ(
         std::get<PreparationFailure>(result).primary.stage,
         Stage::host_configuration);
-    ASSERT_EQ(observed->recorded_commands.size(), 3U);
+    ASSERT_EQ(observed->recorded_commands.size(), 6U);
     EXPECT_EQ(
         observed->recorded_commands[1].arguments,
         (std::vector<std::string>{
@@ -431,9 +599,12 @@ TEST(NetworkProductionAdapterTest, RollsBackPlacedVethBeforeNamespace)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
     const auto observed{production->trace};
-    for (int index{}; index < 5; ++index) {
+    for (int index{}; index < 3; ++index) {
         production->commands.push_back({CommandResultKind::success, 0, {}});
     }
+    production->commands.push_back({CommandResultKind::nonzero_exit, 1, {}});
+    production->commands.push_back({CommandResultKind::success, 0, {}});
+    production->commands.push_back({CommandResultKind::success, 0, {}});
     queue_namespace_creation(*production);
     queue_namespace_cleanup(*production);
     queue_host_pair(*production);
@@ -449,12 +620,12 @@ TEST(NetworkProductionAdapterTest, RollsBackPlacedVethBeforeNamespace)
     EXPECT_EQ(failure.primary.stage, Stage::host_configuration);
     EXPECT_TRUE(failure.rollback_failures.empty());
     EXPECT_FALSE(failure.residual.has_value());
-    ASSERT_EQ(observed->recorded_commands.size(), 5U);
-    EXPECT_EQ(
-        observed->recorded_commands[3].arguments,
-        (std::vector<std::string>{"link", "delete", "dev", "nll-host"}));
+    ASSERT_EQ(observed->recorded_commands.size(), 6U);
     EXPECT_EQ(
         observed->recorded_commands[4].arguments,
+        (std::vector<std::string>{"link", "delete", "dev", "nll-host"}));
+    EXPECT_EQ(
+        observed->recorded_commands[5].arguments,
         (std::vector<std::string>{"netns", "delete", "netlaglab"}));
 }
 
@@ -582,9 +753,11 @@ TEST(NetworkProductionAdapterTest, DoesNotDeleteVethWhoseIdentityChanged)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
     const auto observed{production->trace};
-    for (int index{}; index < 4; ++index) {
+    for (int index{}; index < 3; ++index) {
         production->commands.push_back({CommandResultKind::success, 0, {}});
     }
+    production->commands.push_back({CommandResultKind::nonzero_exit, 1, {}});
+    production->commands.push_back({CommandResultKind::success, 0, {}});
     production->namespaces.push_back({
         InventoryStatus::present,
         std::make_unique<FakeNamespaceHandle>(NamespaceIdentity{7, 11}),
@@ -611,9 +784,9 @@ TEST(NetworkProductionAdapterTest, DoesNotDeleteVethWhoseIdentityChanged)
     ASSERT_EQ(failure.rollback_failures.size(), 1U);
     EXPECT_EQ(failure.rollback_failures[0].cause, Cause::identity_mismatch);
     ASSERT_TRUE(failure.residual.has_value());
-    ASSERT_EQ(observed->recorded_commands.size(), 4U);
+    ASSERT_EQ(observed->recorded_commands.size(), 5U);
     EXPECT_EQ(
-        observed->recorded_commands[3].arguments,
+        observed->recorded_commands[4].arguments,
         (std::vector<std::string>{"netns", "delete", "netlaglab"}));
 }
 
@@ -624,6 +797,7 @@ TEST(NetworkProductionAdapterTest, RechecksRetainedVethAfterNamespaceRemoval)
     production->commands.push_back({CommandResultKind::success, 0, {}});
     production->commands.push_back({CommandResultKind::success, 0, {}});
     production->commands.push_back({CommandResultKind::success, 0, {}});
+    production->commands.push_back({CommandResultKind::nonzero_exit, 1, {}});
     production->commands.push_back({CommandResultKind::nonzero_exit, 1, {}});
     production->commands.push_back({CommandResultKind::success, 0, {}});
     production->namespaces.push_back({
@@ -658,7 +832,7 @@ TEST(NetworkProductionAdapterTest, RechecksRetainedVethAfterNamespaceRemoval)
     ASSERT_EQ(failure.rollback_failures.size(), 1U);
     EXPECT_EQ(failure.rollback_failures[0].cause, Cause::command_exit);
     EXPECT_FALSE(failure.residual.has_value());
-    ASSERT_EQ(observed->recorded_commands.size(), 5U);
+    ASSERT_EQ(observed->recorded_commands.size(), 6U);
     EXPECT_EQ(
         observed->recorded_commands.back().arguments,
         (std::vector<std::string>{"netns", "delete", "netlaglab"}));

@@ -151,5 +151,28 @@ TEST(NetworkCommandRunnerTest, InheritsTheExplicitNamespaceDescriptor)
     EXPECT_EQ(close(descriptor), 0);
 }
 
+TEST(NetworkCommandRunnerTest, ReportsNamespaceEntryFailureBeforeExec)
+{
+    const int descriptor{open("/dev/null", O_RDONLY | O_CLOEXEC)};
+    ASSERT_NE(descriptor, -1);
+    const std::string marker{
+        "/tmp/netlaglab-setns-command-" + std::to_string(getpid())};
+    (void)unlink(marker.c_str());
+
+    const CommandResult result{run_command_in_network_namespace(
+        NETWORK_COMMAND_PROBE_PATH,
+        std::vector<std::string>{"create-marker", marker},
+        descriptor,
+        std::chrono::steady_clock::now() + std::chrono::seconds{2})};
+
+    EXPECT_EQ(result.kind, CommandResultKind::system_failure);
+    EXPECT_NE(result.code, 0);
+    errno = 0;
+    EXPECT_EQ(access(marker.c_str(), F_OK), -1);
+    EXPECT_EQ(errno, ENOENT);
+    EXPECT_EQ(close(descriptor), 0);
+    (void)unlink(marker.c_str());
+}
+
 } // namespace
 } // namespace netlaglab::network_environment

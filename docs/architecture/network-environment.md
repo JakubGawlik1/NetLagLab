@@ -4,12 +4,12 @@
 
 The active NetLagLab Session does not currently create a network or mount
 namespace, veth pair, routes, DNS view, NAT rules, or qdiscs. The standalone
-private library now implements creation and cleanup of the namespace and veth
-resource roots, but it is not linked into the helper and has not been
+private library now implements the complete fixed host-local topology through
+namespace and veth creation, addresses, link state, loopback, default route,
+and proof-based cleanup. It is not linked into the helper and has not been
 privileged-qualified. The topology and basic connectivity were verified
-manually in [Experiment 01](../experiment_01.md). The resource shape below is
-accepted target design; DNS contents and host route selection remain
-deliberately open.
+manually in [Experiment 01](../experiment_01.md). DNS contents and host route
+selection remain deliberately open.
 
 The private transaction foundation is implemented and tested without
 privilege. One preparation operation drives the complete fixed semantic setup
@@ -45,11 +45,14 @@ deletion authority.
 
 Controlled tests cover exact arguments, runner-result mapping, ownership
 transitions, exact-handle reuse, ambiguous effects, cleanup ordering, mismatch
-refusal, and the post-namespace-removal veth recheck. The first host-address
-operation remains deliberately unavailable, so standalone preparation rolls
-back after proving the resource roots. The adapter is therefore
-unprivileged-tested, not privileged-qualified. The library remains unlinked
-from the helper and active Session.
+refusal, and the post-namespace-removal veth recheck. After proving the roots,
+the adapter assigns `10.200.0.1/30`, brings up `nll-host`, enters the exact
+namespace handle to bring up loopback, assigns `10.200.0.2/30`, brings up
+`nll-app`, and adds the default route through `10.200.0.1`. Each mutation is
+one bounded child operation; no redundant readiness readback is added.
+Standalone preparation now returns a prepared owner only after that complete
+sequence. The adapter remains unprivileged-tested, not privileged-qualified,
+and the library remains unlinked from the helper and active Session.
 
 ## Target topology
 

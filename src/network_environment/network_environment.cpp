@@ -549,47 +549,72 @@ public:
 
     [[nodiscard]] OperationResult assign_host_address(
         const PlacedVethProof&,
-        TimePoint) override
+        const TimePoint deadline) override
     {
-        return {false, Cause::system_failure};
+        const std::vector<std::string> arguments{
+            "address", "add", "10.200.0.1/30", "dev", "nll-host"};
+        return command_result(
+            production_->run_ip(ip_path_, arguments, nullptr, deadline));
     }
 
     [[nodiscard]] OperationResult bring_host_link_up(
         const PlacedVethProof&,
-        TimePoint) override
+        const TimePoint deadline) override
     {
-        return {false, Cause::system_failure};
+        const std::vector<std::string> arguments{
+            "link", "set", "dev", "nll-host", "up"};
+        return command_result(
+            production_->run_ip(ip_path_, arguments, nullptr, deadline));
     }
 
     [[nodiscard]] OperationResult bring_loopback_up(
-        const NamespaceProof&,
-        TimePoint) override
+        const NamespaceProof& namespace_proof,
+        const TimePoint deadline) override
     {
-        return {false, Cause::system_failure};
+        const std::vector<std::string> arguments{
+            "link", "set", "dev", "lo", "up"};
+        return command_result(production_->run_ip_in_namespace(
+            ip_path_, arguments, *namespace_proof.exact_handle_, deadline));
     }
 
     [[nodiscard]] OperationResult assign_namespace_address(
-        const NamespaceProof&,
+        const NamespaceProof& namespace_proof,
         const PlacedVethProof&,
-        TimePoint) override
+        const TimePoint deadline) override
     {
-        return {false, Cause::system_failure};
+        const std::vector<std::string> arguments{
+            "address", "add", "10.200.0.2/30", "dev", "nll-app"};
+        return command_result(production_->run_ip_in_namespace(
+            ip_path_, arguments, *namespace_proof.exact_handle_, deadline));
     }
 
     [[nodiscard]] OperationResult bring_namespace_link_up(
-        const NamespaceProof&,
+        const NamespaceProof& namespace_proof,
         const PlacedVethProof&,
-        TimePoint) override
+        const TimePoint deadline) override
     {
-        return {false, Cause::system_failure};
+        const std::vector<std::string> arguments{
+            "link", "set", "dev", "nll-app", "up"};
+        return command_result(production_->run_ip_in_namespace(
+            ip_path_, arguments, *namespace_proof.exact_handle_, deadline));
     }
 
     [[nodiscard]] OperationResult add_default_route(
-        const NamespaceProof&,
+        const NamespaceProof& namespace_proof,
         const PlacedVethProof&,
-        TimePoint) override
+        const TimePoint deadline) override
     {
-        return {false, Cause::system_failure};
+        const std::vector<std::string> arguments{
+            "route",
+            "add",
+            "default",
+            "via",
+            "10.200.0.1",
+            "dev",
+            "nll-app",
+        };
+        return command_result(production_->run_ip_in_namespace(
+            ip_path_, arguments, *namespace_proof.exact_handle_, deadline));
     }
 
     [[nodiscard]] VethRemovalResult remove_veth(
@@ -648,6 +673,15 @@ public:
     }
 
 private:
+    [[nodiscard]] static OperationResult command_result(
+        const CommandResult& result)
+    {
+        return {
+            result.kind == CommandResultKind::success,
+            command_cause(result),
+        };
+    }
+
     [[nodiscard]] static Cause command_cause(const CommandResult& result)
     {
         switch (result.kind) {
@@ -873,6 +907,15 @@ public:
         std::string_view,
         std::span<const std::string>,
         const detail::NamespaceHandle*,
+        TimePoint) override
+    {
+        return {CommandResultKind::system_failure, 0, {}};
+    }
+
+    [[nodiscard]] CommandResult run_ip_in_namespace(
+        std::string_view,
+        std::span<const std::string>,
+        const detail::NamespaceHandle&,
         TimePoint) override
     {
         return {CommandResultKind::system_failure, 0, {}};

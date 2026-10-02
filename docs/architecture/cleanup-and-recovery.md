@@ -15,9 +15,11 @@ returns only unresolved state. Identity-unconfirmed state never regains
 deletion authority, and owner destruction performs one bounded no-throw pass.
 Its production entry point acquires the root-owned host lock before preflight,
 and the runtime retains that lock in either a prepared or residual owner until
-cleanup work is gone. There are still no production namespace, veth, route,
-NAT, firewall, DNS-mount, or qdisc resources to clean up, and the standalone
-library is not integrated with the helper.
+cleanup work is gone. The standalone production path can now create and clean
+the proven namespace/veth roots together with their contained addresses, link
+state, loopback state, and namespace route. The active helper still creates
+none of these resources, and NAT, firewall, DNS-mount, qdisc, and durable
+recovery ownership remain unimplemented.
 
 The remaining production ownership and cleanup rules below are accepted target
 design. A durable recovery journal is accepted in principle for persistent
