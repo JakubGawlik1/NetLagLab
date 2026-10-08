@@ -250,6 +250,54 @@ if(BUILD_TESTING)
                 RUN_SERIAL TRUE
                 TIMEOUT 60
         )
+
+        add_executable(
+            netlaglab_session_qualification
+            tests/session_qualification_test.cpp
+        )
+        target_link_libraries(
+            netlaglab_session_qualification
+            PRIVATE GTest::gtest
+        )
+        target_compile_definitions(
+            netlaglab_session_qualification
+            PRIVATE
+                NETLAGLAB_EXECUTABLE_PATH="$<TARGET_FILE:netlaglab>"
+                NETLAGLAB_SESSION_PROBE_PATH="$<TARGET_FILE:netlaglab_session_qualification>"
+        )
+        add_dependencies(
+            netlaglab_session_qualification
+            netlaglab
+            netlaglab-helper
+        )
+        target_compile_features(
+            netlaglab_session_qualification
+            PRIVATE cxx_std_20
+        )
+        set_target_properties(
+            netlaglab_session_qualification
+            PROPERTIES CXX_EXTENSIONS OFF
+        )
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(
+                netlaglab_session_qualification
+                PRIVATE
+                    -Wall
+                    -Wextra
+                    -Wpedantic
+            )
+        endif()
+        add_test(
+            NAME netlaglab_session_qualification
+            COMMAND netlaglab_session_qualification
+        )
+        set_tests_properties(
+            netlaglab_session_qualification
+            PROPERTIES
+                LABELS privileged
+                RUN_SERIAL TRUE
+                TIMEOUT 180
+        )
     endif()
 
     add_executable(

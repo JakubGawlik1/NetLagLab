@@ -404,6 +404,40 @@ accessor can borrow that handle from the opaque implementation; no descriptor
 accessor is added to the module interface. This test-only process is not the
 production Workload integration.
 
+## Integrated Session qualification
+
+`netlaglab_session_qualification` exercises the production `netlaglab run`
+Supervisor/helper path and the production `attach` Controller. Its controlled
+Workload probe verifies its distinct network namespace, the `10.200.0.2/30`
+address, the helper's unchanged host namespace, argv, environment, cwd,
+UID/GID/supplementary groups, stdin/stdout/stderr, no-new-privileges policy,
+and absence of inherited namespace, host-lock, or helper-socket descriptors.
+It exchanges one bounded UDP datagram with a host-side peer at `10.200.0.1`,
+then exercises natural exit, Controller `stop`, Supervisor loss, and failed
+exec. Every case checks the owned namespace and veth roots and confirms that
+`/run/netlaglab/host.lock` is available after completion.
+
+The target is built and registered only with
+`NETLAGLAB_BUILD_PRIVILEGED_TESTS=ON`, is labelled `privileged`, runs serially,
+and is skipped unless `NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1` is set and the test
+process is root. The harness itself never invokes `sudo`; the actual
+`netlaglab run` command starts the helper through the product's normal `sudo`
+launcher. Enabling the CMake option or approving this test plan does not
+authorize execution. Run it only after separate explicit authorization:
+
+```bash
+cmake -S . -B build -G Ninja -DNETLAGLAB_BUILD_PRIVILEGED_TESTS=ON
+cmake --build build --target netlaglab_session_qualification
+NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 ctest --test-dir build \
+  -R '^netlaglab_session_qualification$' --output-on-failure
+```
+
+The qualification remains unverified until this command completes on a
+supported host. A skipped test, compile-only result, or failed/blocked host
+operation is not evidence that Session namespace integration passed. The test
+uses only numeric local addresses and does not configure forwarding, NAT,
+firewall policy, DNS, or shaping.
+
 ## Experimentally verified behavior
 
 The manual experiment established that:

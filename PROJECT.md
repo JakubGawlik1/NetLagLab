@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-10-02
+Last verified: 2026-10-08
 
 ## How to use this file
 
@@ -54,7 +54,10 @@ cross-platform support are not current goals.
   capability for entering the exact retained namespace only to the forked
   child, and explicitly cleans prepared or residual ownership after Workload
   reaping. The path has deterministic unprivileged coverage but has not passed
-  privileged Session qualification. DNS mounts, forwarding, NAT, firewall
+  privileged Session qualification. An opt-in integration qualification now
+  exercises natural exit, Controller stop, Supervisor loss, failed exec, the
+  Workload context, local UDP, and cleanup through the production CLI path; it
+  has not been run on a supported host. DNS mounts, forwarding, NAT, firewall
   handling, and shaping remain unimplemented.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises

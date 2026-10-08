@@ -211,8 +211,11 @@ contracts:
 
 Conversation framing and malformed-input behavior belong to focused tests of
 the conversation module rather than being duplicated here. Local unprivileged
-process tests cover production socket and launcher adapters. A privileged
-happy-path test remains a separate, explicitly authorized integration step.
+process tests cover production socket and launcher adapters. The opt-in
+integrated Session qualification covers natural exit, Controller stop,
+Supervisor loss, and failed exec through the production CLI, but remains a
+separately authorized and unverified host execution step; see
+[Network Environment qualification](network-environment.md#integrated-session-qualification).
 
 ## Remaining implementation boundary
 
