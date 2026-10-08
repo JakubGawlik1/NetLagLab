@@ -1,5 +1,31 @@
 # MVP implementation audit — updated 2026-10-02
 
+## Privileged Session qualification — 2026-10-08
+
+The opt-in `netlaglab_session_qualification` CTest was run directly as root on
+Arch Linux kernel `7.2.9-arch1-1` using
+`NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1`. CTest exited successfully with three
+cases passed and one skipped:
+
+- **Controller stop:** passed. The directly managed Workload observed
+  termination, the Controller received the final Session Outcome, and cleanup
+  released the owned topology and host lock.
+- **Supervisor loss:** passed. The helper stopped and reaped the Workload, and
+  cleanup released the owned topology and host lock.
+- **Failed exec:** passed. The failure result was preserved and prepared
+  topology/lock cleanup completed.
+- **Natural exit:** the test verified Workload context, exit code `37`, and
+  topology/lock cleanup. It then skipped the UDP assertion: the host peer
+  received no reply even though the packet was observed at `nll-host`. This
+  host's UDP receive path therefore remains unqualified. The skip is not
+  counted as a successful UDP exchange.
+
+No firewall changes were made. This run verifies the integrated Session
+namespace and lifecycle/cleanup paths on this host, subject to the UDP receive
+limitation. It does not verify UDP echo, public connectivity, DNS, NAT,
+firewall integration, or shaping. The reproducible test and its explicit skip
+reason are in `tests/session_qualification_test.cpp`.
+
 ## Implementation update — 2026-10-02
 
 The standalone private Network Environment library can now create and prove

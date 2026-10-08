@@ -53,12 +53,15 @@ cross-platform support are not current goals.
   roots. The helper now prepares the topology before Workload launch, passes a
   capability for entering the exact retained namespace only to the forked
   child, and explicitly cleans prepared or residual ownership after Workload
-  reaping. The path has deterministic unprivileged coverage but has not passed
-  privileged Session qualification. An opt-in integration qualification now
-  exercises natural exit, Controller stop, Supervisor loss, failed exec, the
-  Workload context, local UDP, and cleanup through the production CLI path; it
-  has not been run on a supported host. DNS mounts, forwarding, NAT, firewall
-  handling, and shaping remain unimplemented.
+  reaping. On 2026-10-08, the opt-in root-run Session qualification completed
+  on Arch Linux kernel 7.2.9-arch1-1: Controller stop, Supervisor loss, and
+  failed exec passed, including Workload reaping and topology/lock cleanup.
+  Natural exit also verified its exit result and cleanup, then skipped the UDP
+  exchange assertion because the packet reached `nll-host` but no reply reached
+  the host peer. This is a recorded host receive-path limitation, not a passing
+  UDP qualification; no firewall changes were made. See
+  `docs/architecture/mvp-implementation-audit.md` for the run result. DNS
+  mounts, forwarding, NAT, firewall handling, and shaping remain unimplemented.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.
