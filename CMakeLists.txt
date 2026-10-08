@@ -91,6 +91,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 include(CTest)
+option(
+    NETLAGLAB_BUILD_PRIVILEGED_TESTS
+    "Build tests that create and clean privileged local network resources"
+    OFF
+)
+
+if(NETLAGLAB_BUILD_PRIVILEGED_TESTS AND NOT BUILD_TESTING)
+    message(FATAL_ERROR "NETLAGLAB_BUILD_PRIVILEGED_TESTS requires BUILD_TESTING")
+endif()
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -185,6 +194,56 @@ if(BUILD_TESTING)
     endif()
 
     gtest_discover_tests(netlaglab_network_environment_tests)
+
+    if(NETLAGLAB_BUILD_PRIVILEGED_TESTS)
+        target_compile_definitions(
+            netlaglab_network_environment
+            PRIVATE NETLAGLAB_BUILD_PRIVILEGED_TESTS=1
+        )
+
+        add_executable(
+            netlaglab_network_environment_privileged_smoke
+            tests/network_environment_privileged_smoke_test.cpp
+        )
+        target_include_directories(
+            netlaglab_network_environment_privileged_smoke
+            PRIVATE src
+        )
+        target_link_libraries(
+            netlaglab_network_environment_privileged_smoke
+            PRIVATE
+                netlaglab_network_environment
+                GTest::gtest_main
+        )
+        target_compile_definitions(
+            netlaglab_network_environment_privileged_smoke
+            PRIVATE NETLAGLAB_BUILD_PRIVILEGED_TESTS=1
+        )
+        target_compile_features(
+            netlaglab_network_environment_privileged_smoke
+            PRIVATE cxx_std_20
+        )
+        set_target_properties(
+            netlaglab_network_environment_privileged_smoke
+            PROPERTIES CXX_EXTENSIONS OFF
+        )
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(
+                netlaglab_network_environment_privileged_smoke
+                PRIVATE
+                    -Wall
+                    -Wextra
+                    -Wpedantic
+            )
+        endif()
+        gtest_discover_tests(
+            netlaglab_network_environment_privileged_smoke
+            PROPERTIES
+                LABELS privileged
+                RUN_SERIAL TRUE
+                TIMEOUT 60
+        )
+    endif()
 
     add_executable(
         netlaglab_lifecycle_tests

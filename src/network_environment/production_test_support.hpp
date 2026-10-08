@@ -7,6 +7,15 @@
 #include <cstddef>
 #include <memory>
 
+#ifdef NETLAGLAB_BUILD_PRIVILEGED_TESTS
+namespace netlaglab::network_environment::detail {
+
+[[nodiscard]] int duplicate_namespace_descriptor_for_test(
+    const NamespaceHandle& handle);
+
+} // namespace netlaglab::network_environment::detail
+#endif
+
 namespace netlaglab::network_environment::testing {
 
 struct ProductionTrace {
@@ -20,5 +29,10 @@ struct ProductionTrace {
 [[nodiscard]] PreparationResult prepare_with_production_platform(
     std::unique_ptr<detail::PreflightPlatform> preflight,
     std::unique_ptr<detail::ProductionPlatform> production);
+
+#ifdef NETLAGLAB_BUILD_PRIVILEGED_TESTS
+[[nodiscard]] int duplicate_owned_namespace_descriptor(
+    const PreparedNetworkEnvironment& environment);
+#endif
 
 } // namespace netlaglab::network_environment::testing

@@ -434,4 +434,16 @@ std::unique_ptr<ProductionPlatform> make_linux_production_platform()
     return std::make_unique<LinuxProductionPlatform>();
 }
 
+#ifdef NETLAGLAB_BUILD_PRIVILEGED_TESTS
+int duplicate_namespace_descriptor_for_test(const NamespaceHandle& handle)
+{
+    const LinuxNamespaceHandle* linux_namespace{linux_handle(handle)};
+    if (linux_namespace == nullptr) {
+        errno = EINVAL;
+        return -1;
+    }
+    return fcntl(linux_namespace->descriptor(), F_DUPFD_CLOEXEC, 0);
+}
+#endif
+
 } // namespace netlaglab::network_environment::detail

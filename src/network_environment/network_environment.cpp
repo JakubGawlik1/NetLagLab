@@ -45,6 +45,7 @@ private:
     std::unique_ptr<detail::NamespaceHandle> exact_handle_;
 
     friend class ProductionAdapter;
+    friend struct detail::OwnerAccess;
 };
 
 struct VethIdentityPair {
@@ -1043,6 +1044,19 @@ struct OwnerAccess {
     {
         return std::move(owner.state_);
     }
+
+#ifdef NETLAGLAB_BUILD_PRIVILEGED_TESTS
+    [[nodiscard]] static const NamespaceHandle* namespace_handle(
+        const PreparedNetworkEnvironment& owner)
+    {
+        if (!owner.state_) {
+            return nullptr;
+        }
+        const auto* proof{
+            std::get_if<NamespaceProof>(&owner.state_->namespace_root)};
+        return proof == nullptr ? nullptr : proof->exact_handle_.get();
+    }
+#endif
 };
 
 } // namespace detail
@@ -1423,6 +1437,18 @@ PreparationResult prepare_with_production_platform(
     return prepare_production_network_environment(
         std::move(preflight), std::move(production));
 }
+
+#ifdef NETLAGLAB_BUILD_PRIVILEGED_TESTS
+int duplicate_owned_namespace_descriptor(
+    const PreparedNetworkEnvironment& environment)
+{
+    const detail::NamespaceHandle* handle{
+        detail::OwnerAccess::namespace_handle(environment)};
+    return handle == nullptr
+        ? -1
+        : detail::duplicate_namespace_descriptor_for_test(*handle);
+}
+#endif
 
 } // namespace testing
 } // namespace netlaglab::network_environment

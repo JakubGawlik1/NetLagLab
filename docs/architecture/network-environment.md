@@ -350,7 +350,9 @@ with separate test files for each seam and one
 `netlaglab-network-command-probe` executable. The privileged smoke is compiled
 and registered only when a dedicated CMake option, off by default, is enabled;
 it is labelled `privileged`, runs serially, refuses insufficient privilege, and
-never invokes `sudo` itself.
+requires `NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1` at execution time, and never
+invokes `sudo` itself. Enabling the build option alone does not authorize the
+test to mutate host networking.
 
 ## Standalone checkpoint acceptance
 
@@ -388,6 +390,11 @@ and confirm that the owned resources are absent. This test is opt-in rather
 than part of default CTest and does not replace the final privileged MVP
 qualification matrix. It does not require public Internet, DNS, NAT, firewall,
 traffic shaping, Workload integration, or privileged fault injection.
+
+Run that smoke explicitly as root with
+`NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 ctest --test-dir build -L privileged
+--output-on-failure`; the environment variable is checked before preparation
+begins.
 
 The local packet check uses a test-only UDP echo child. The child enters the
 already-owned exact namespace handle, binds `10.200.0.2`, echoes one bounded

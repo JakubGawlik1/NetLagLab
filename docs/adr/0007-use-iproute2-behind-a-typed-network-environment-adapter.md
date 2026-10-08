@@ -56,6 +56,13 @@ placement. This avoids parsing `ip` output or adding `ethtool`, but the exact
 cross-namespace attributes must be confirmed by a focused privileged experiment
 before the production decoder is qualified.
 
+The focused experiment on 2026-10-08 confirmed reciprocal `IFLA_LINK` indices,
+`IFLA_LINK_NETNSID` values of 0 from each querying namespace, and veth kind on
+both ends. See the RTM_GETLINK ownership proof experiment in
+`docs/experiment_01.md`. The decoder remains subject to the opt-in privileged
+topology and packet smoke; this observation alone does not qualify full adapter
+behavior or Session integration.
+
 The adapter satisfies an internal port of fixed, named semantic operations
 rather than a generic command variant or configurable network builder. This
 makes the unavoidable transaction steps explicit and gives namespace creation,
