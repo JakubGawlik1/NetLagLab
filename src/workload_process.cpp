@@ -189,7 +189,8 @@ WorkloadPollResult WorkloadProcess::poll()
 WorkloadLaunchResult launch_workload(
     const WorkloadContext& context,
     const WorkloadIdentity& identity,
-    const WorkloadStandardDescriptors& standard_descriptors)
+    const WorkloadStandardDescriptors& standard_descriptors,
+    const network_environment::WorkloadNamespaceEntry* namespace_entry)
 {
     if (context.arguments.empty()) {
         return {.process = std::nullopt, .failure_exit_code = 125};
@@ -230,6 +231,10 @@ WorkloadLaunchResult launch_workload(
     if (child_pid == 0) {
         error_reader.reset();
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1 || getppid() != expected_parent) {
+            report_child_failure_and_exit(error_writer.get(), 125);
+        }
+
+        if (namespace_entry != nullptr && !namespace_entry->enter()) {
             report_child_failure_and_exit(error_writer.get(), 125);
         }
 

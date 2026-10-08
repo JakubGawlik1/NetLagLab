@@ -2,13 +2,13 @@
 
 ## Status
 
-The active NetLagLab Session does not currently create a network or mount
-namespace, veth pair, routes, DNS view, NAT rules, or qdiscs. The standalone
-private library now implements the complete fixed host-local topology through
-namespace and veth creation, addresses, link state, loopback, default route,
-and proof-based cleanup. It is not linked into the helper and has not been
-privileged-qualified. The topology and basic connectivity were verified
-manually in [Experiment 01](../experiment_01.md). DNS contents and host route
+The active NetLagLab Session prepares the fixed host-local topology through the
+private Network Environment library. The library owns the root host lock,
+namespace and veth proofs, setup transaction, and explicit cleanup. The helper
+passes a narrow capability for entering the exact retained namespace to the
+forked Workload child; the long-lived helper remains in the host network
+namespace. The production Session path has deterministic coverage but has not
+yet passed the separate privileged qualification. DNS contents and host route
 selection remain deliberately open.
 
 The private transaction foundation is implemented and tested without
@@ -50,9 +50,10 @@ the adapter assigns `10.200.0.1/30`, brings up `nll-host`, enters the exact
 namespace handle to bring up loopback, assigns `10.200.0.2/30`, brings up
 `nll-app`, and adds the default route through `10.200.0.1`. Each mutation is
 one bounded child operation; no redundant readiness readback is added.
-Standalone preparation now returns a prepared owner only after that complete
-sequence. The adapter remains unprivileged-tested, not privileged-qualified,
-and the library remains unlinked from the helper and active Session.
+Preparation returns a prepared owner only after that complete sequence. The
+helper explicitly consumes the prepared or residual owner after Workload
+reaping. A cleanup failure remains an infrastructure failure even if the
+bounded residual pass later removes the remaining resources.
 
 ## Target topology
 

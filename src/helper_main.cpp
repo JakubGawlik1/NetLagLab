@@ -1,5 +1,7 @@
 #include "file_descriptor.hpp"
+#include "helper_session.hpp"
 #include "helper_protocol.hpp"
+#include "network_environment/network_environment.hpp"
 #include "process_status.hpp"
 #include "session_paths.hpp"
 #include "session_socket.hpp"
@@ -19,9 +21,9 @@
 #include <optional>
 #include <ostream>
 #include <poll.h>
+#include <sys/file.h>
 #include <string>
 #include <string_view>
-#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -42,8 +44,6 @@ constexpr std::string_view usage{
     "Usage: netlaglab-helper --runtime-dir <absolute-path> "
     "--supervisor-pid <pid> --supervisor-start-time <ticks>\n"};
 constexpr int usage_error_exit_code{2};
-constexpr std::string_view global_runtime_directory{"/run/netlaglab"};
-constexpr std::string_view global_lock_name{"host.lock"};
 constexpr int supervisor_connection_poll_timeout_ms{100};
 
 struct ValidatedSession {
@@ -285,71 +285,6 @@ struct InvokingIds {
     return std::nullopt;
 }
 
-[[nodiscard]] std::optional<netlaglab::FileDescriptor> acquire_global_lock(
-    std::ostream& error)
-{
-    const int mkdir_result{mkdir(global_runtime_directory.data(), 0755)};
-    if (mkdir_result == -1 && errno != EEXIST) {
-        error << "NetLagLab helper: failed to create " << global_runtime_directory
-              << ": " << std::strerror(errno) << '\n';
-        return std::nullopt;
-    }
-    const int directory_descriptor{open(
-        global_runtime_directory.data(),
-        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-    if (directory_descriptor == -1) {
-        error << "NetLagLab helper: failed to open " << global_runtime_directory
-              << ": " << std::strerror(errno) << '\n';
-        return std::nullopt;
-    }
-    netlaglab::FileDescriptor directory{directory_descriptor};
-    if (mkdir_result == 0 && fchmod(directory.get(), 0755) == -1) {
-        error << "NetLagLab helper: failed to set permissions on "
-              << global_runtime_directory << ": " << std::strerror(errno) << '\n';
-        return std::nullopt;
-    }
-    struct stat directory_status {};
-    if (fstat(directory.get(), &directory_status) == -1
-        || !S_ISDIR(directory_status.st_mode) || directory_status.st_uid != 0
-        || (directory_status.st_mode & 0777) != 0755) {
-        error << "NetLagLab helper: " << global_runtime_directory
-              << " must be a root-owned directory with permissions 0755\n";
-        return std::nullopt;
-    }
-
-    const int lock_descriptor{openat(
-        directory.get(), global_lock_name.data(),
-        O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600)};
-    if (lock_descriptor == -1) {
-        error << "NetLagLab helper: failed to open " << global_lock_name
-              << ": " << std::strerror(errno) << '\n';
-        return std::nullopt;
-    }
-    netlaglab::FileDescriptor lock{lock_descriptor};
-    struct stat lock_status {};
-    if (fstat(lock.get(), &lock_status) == -1 || !S_ISREG(lock_status.st_mode)
-        || lock_status.st_uid != 0) {
-        error << "NetLagLab helper: " << global_lock_name
-              << " must be a root-owned regular file\n";
-        return std::nullopt;
-    }
-    if (fchmod(lock.get(), 0600) == -1) {
-        error << "NetLagLab helper: failed to set permissions on " << global_lock_name
-              << ": " << std::strerror(errno) << '\n';
-        return std::nullopt;
-    }
-    if (flock(lock.get(), LOCK_EX | LOCK_NB) == -1) {
-        if (errno == EWOULDBLOCK || errno == EAGAIN) {
-            error << "NetLagLab helper: another host-wide Session is active\n";
-        } else {
-            error << "NetLagLab helper: failed to acquire " << global_lock_name
-                  << ": " << std::strerror(errno) << '\n';
-        }
-        return std::nullopt;
-    }
-    return lock;
-}
-
 [[nodiscard]] std::optional<netlaglab::WorkloadContext> read_start_block(
     const int supervisor_descriptor,
     std::ostream& error)
@@ -455,7 +390,6 @@ public:
 [[nodiscard]] int supervise_workload(
     const int supervisor_descriptor,
     netlaglab::WorkloadProcess workload,
-    netlaglab::FileDescriptor& global_lock,
     std::ostream& error)
 {
     netlaglab::HelperRuntimeConversation conversation;
@@ -463,26 +397,13 @@ public:
     while (true) {
         const netlaglab::WorkloadPollResult workload_result{workload.poll()};
         if (workload_result.state == netlaglab::WorkloadPollState::error) {
-            global_lock.reset();
-            (void)netlaglab::send_socket_text(
-                supervisor_descriptor,
-                netlaglab::helper_conversation_event_message(
-                    netlaglab::CleanupFailedEvent{}));
+            (void)stop_after_supervisor_loss(workload);
             error << "NetLagLab helper: failed to reap Workload\n";
             return 125;
         }
         if (workload_result.state == netlaglab::WorkloadPollState::finished) {
             conversation.workload_finished();
             if (!send_workload_status(supervisor_descriptor, *workload_result.status)) {
-                global_lock.reset();
-                error << "NetLagLab helper: failed to report Workload completion\n";
-                return 125;
-            }
-            global_lock.reset();
-            if (!netlaglab::send_socket_text(
-                    supervisor_descriptor,
-                    netlaglab::helper_conversation_event_message(
-                        netlaglab::CleanupSucceededEvent{}))) {
                 error << "NetLagLab helper: failed to report Workload completion\n";
                 return 125;
             }
@@ -547,6 +468,58 @@ public:
         }
     }
 }
+
+class ProductionHelperSessionOperations final
+    : public netlaglab::HelperSessionOperations {
+public:
+    ProductionHelperSessionOperations(
+        const int supervisor_descriptor,
+        std::ostream& error)
+        : supervisor_descriptor_{supervisor_descriptor}
+        , error_{error}
+    {
+    }
+
+    [[nodiscard]] netlaglab::network_environment::PreparationResult prepare()
+        override
+    {
+        return netlaglab::network_environment::prepare_network_environment();
+    }
+
+    [[nodiscard]] netlaglab::WorkloadLaunchResult launch(
+        const netlaglab::WorkloadContext& context,
+        const netlaglab::WorkloadIdentity& identity,
+        const netlaglab::WorkloadStandardDescriptors& standard_descriptors,
+        const netlaglab::network_environment::WorkloadNamespaceEntry& namespace_entry)
+        override
+    {
+        return netlaglab::launch_workload(
+            context, identity, standard_descriptors, &namespace_entry);
+    }
+
+    [[nodiscard]] bool send(
+        const netlaglab::HelperConversationEvent& event) override
+    {
+        return netlaglab::send_socket_text(
+            supervisor_descriptor_,
+            netlaglab::helper_conversation_event_message(event));
+    }
+
+    [[nodiscard]] int supervise(netlaglab::WorkloadProcess workload) override
+    {
+        return supervise_workload(supervisor_descriptor_, std::move(workload), error_);
+    }
+
+    [[nodiscard]] bool stop_and_reap(
+        netlaglab::WorkloadProcess& workload) override
+    {
+        return stop_after_supervisor_loss(workload);
+    }
+
+private:
+    int supervisor_descriptor_;
+    std::ostream& error_;
+};
 
 int usage_error(const std::string_view message)
 {
@@ -649,12 +622,6 @@ int run_helper(const int argc, char* argv[])
     const netlaglab::WorkloadIdentity identity{
         invoking_ids->uid, invoking_ids->gid, *peer_groups};
 
-    auto global_lock{acquire_global_lock(std::cerr)};
-    if (!global_lock.has_value()) {
-        (void)send_helper_error(supervisor_socket->get(), "Host-wide Session lock unavailable.");
-        (void)cleanup_helper_listener(listening_socket, helper_socket_path_owner, std::cerr);
-        return 125;
-    }
     if (!cleanup_helper_listener(listening_socket, helper_socket_path_owner, std::cerr)) {
         return 125;
     }
@@ -685,6 +652,7 @@ int run_helper(const int argc, char* argv[])
     if (!context.has_value()) {
         return 125;
     }
+
     netlaglab::WorkloadStandardDescriptors standard_descriptors;
     for (std::size_t index{}; index < standard_descriptors.sources.size(); ++index) {
         const auto disposition{received_standard_descriptors->dispositions[index]};
@@ -696,30 +664,9 @@ int run_helper(const int argc, char* argv[])
             standard_descriptors.sources[index] = netlaglab::close_standard_descriptor;
         }
     }
-    netlaglab::WorkloadLaunchResult launch{
-        netlaglab::launch_workload(*context, identity, standard_descriptors)};
-    if (!launch.process.has_value()) {
-        const bool failure_reported{netlaglab::send_socket_text(
-            supervisor_socket->get(),
-            netlaglab::helper_conversation_event_message(
-                netlaglab::ActivationFailedEvent{launch.failure_exit_code}))};
-        global_lock->reset();
-        const bool reported{failure_reported
-            && netlaglab::send_socket_text(
-                   supervisor_socket->get(),
-                   netlaglab::helper_conversation_event_message(
-                       netlaglab::CleanupSucceededEvent{}))};
-        return reported ? 0 : 125;
-    }
-    if (!netlaglab::send_socket_text(
-            supervisor_socket->get(),
-            netlaglab::helper_conversation_event_message(
-                netlaglab::ActivatedEvent{launch.process->pid()}))) {
-        (void)stop_after_supervisor_loss(*launch.process);
-        return 125;
-    }
-    return supervise_workload(
-        supervisor_socket->get(), std::move(*launch.process), *global_lock, std::cerr);
+    ProductionHelperSessionOperations operations{supervisor_socket->get(), std::cerr};
+    return netlaglab::run_helper_session(
+        operations, *context, identity, standard_descriptors, std::cerr);
 }
 
 } // namespace

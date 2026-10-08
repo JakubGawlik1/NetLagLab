@@ -15,13 +15,16 @@ For example:
 netlaglab run -- firefox --private-window
 ```
 
-The privileged helper resolves a bare program name using the first exact `PATH=` entry in the
-captured environment, starts it with the captured argv, environment, working directory, user
-identity, supplementary groups, and standard streams, and waits for it to finish. The helper is
-the program's direct parent.
+The privileged helper prepares the fixed local Network Environment, then resolves a bare program
+name using the first exact `PATH=` entry in the captured environment. It starts the program with
+the captured argv, environment, working directory, user identity, supplementary groups, and
+standard streams. The helper is the program's direct parent and enters the retained Session
+network namespace in the child before dropping privileges and executing the program.
 
-This lifecycle checkpoint does not yet create a network namespace or apply shaping. The program
-therefore still uses the host network environment.
+The Workload can use numeric IPv4 addresses to communicate with the host endpoint at
+`10.200.0.1`. This checkpoint does not configure production Internet access, a Session DNS view,
+or traffic shaping. A preparation or namespace-entry failure prevents Workload execution; the
+Session reports cleanup separately and requires complete cleanup for infrastructure success.
 
 ## Attach a controller
 

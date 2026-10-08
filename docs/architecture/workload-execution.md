@@ -3,9 +3,9 @@
 ## Status
 
 The helper now forks, launches, signals, and reaps the directly managed
-Workload. It restores the invoking identity and transmitted execution context,
-but namespace and mount entry are not implemented, so the Workload still uses
-the host network environment.
+Workload. The child enters the exact retained Session network namespace before
+restoring the invoking identity and transmitted execution context. A mount
+namespace and DNS view are not implemented.
 
 ## Ownership boundary
 
@@ -26,6 +26,7 @@ start block. The helper then performs:
 ```text
 fork
   -> establish PR_SET_PDEATHSIG
+  -> enter the exact retained Session network namespace
   -> map standard descriptors
   -> restore supplementary groups, GID, and UID
   -> set PR_SET_NO_NEW_PRIVS
@@ -34,8 +35,8 @@ fork
 ```
 
 An exec-status pipe distinguishes successful execution from `125`, `126`, or
-`127` start failure. The Workload remains in the host namespaces because no
-namespace, veth, DNS mount, routing, NAT, or shaping setup exists yet.
+`127` start failure. The Workload uses the Session network namespace. No mount
+namespace, Session DNS view, Internet NAT, or traffic shaping is installed yet.
 
 ## Accepted target launch sequence
 

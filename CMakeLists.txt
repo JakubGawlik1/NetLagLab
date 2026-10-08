@@ -73,6 +73,7 @@ endif()
 add_executable(
     netlaglab-helper
     src/helper_protocol.cpp
+    src/helper_session.cpp
     src/helper_main.cpp
     src/process_status.cpp
     src/session_socket.cpp
@@ -83,7 +84,13 @@ add_executable(
 )
 
 target_compile_features(netlaglab-helper PRIVATE cxx_std_20)
-target_link_libraries(netlaglab-helper PRIVATE netlaglab_core)
+target_include_directories(netlaglab-helper PRIVATE src)
+target_link_libraries(
+    netlaglab-helper
+    PRIVATE
+        netlaglab_core
+        netlaglab_network_environment
+)
 set_target_properties(netlaglab-helper PROPERTIES CXX_EXTENSIONS OFF)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -393,7 +400,12 @@ if(BUILD_TESTING)
         tests/process_status_test.cpp
     )
     target_include_directories(netlaglab_process_tests PRIVATE src)
-    target_link_libraries(netlaglab_process_tests PRIVATE GTest::gtest_main)
+    target_link_libraries(
+        netlaglab_process_tests
+        PRIVATE
+            GTest::gtest_main
+            netlaglab_network_environment
+    )
     target_compile_definitions(
         netlaglab_process_tests
         PRIVATE WORKLOAD_PROBE_PATH="$<TARGET_FILE:netlaglab-workload-probe>"
@@ -413,4 +425,35 @@ if(BUILD_TESTING)
     endif()
 
     gtest_discover_tests(netlaglab_process_tests)
+
+    add_executable(
+        netlaglab_helper_session_tests
+        src/helper_session.cpp
+        src/workload_context.cpp
+        src/workload_process.cpp
+        tests/helper_session_test.cpp
+    )
+    target_include_directories(netlaglab_helper_session_tests PRIVATE src)
+    target_link_libraries(
+        netlaglab_helper_session_tests
+        PRIVATE
+            GTest::gtest_main
+            netlaglab_core
+            netlaglab_network_environment
+    )
+    target_compile_features(netlaglab_helper_session_tests PRIVATE cxx_std_20)
+    set_target_properties(
+        netlaglab_helper_session_tests
+        PROPERTIES CXX_EXTENSIONS OFF
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_helper_session_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+    gtest_discover_tests(netlaglab_helper_session_tests)
 endif()

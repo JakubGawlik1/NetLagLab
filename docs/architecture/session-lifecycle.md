@@ -5,8 +5,9 @@
 The lifecycle checkpoint is implemented through one blocking typed boundary.
 The helper owns and reaps the directly managed Workload and holds the
 host-wide lock through cleanup; the Supervisor owns Controller coordination
-and reaps its `sudo` launcher. Network-resource setup and cleanup are not yet
-implemented.
+and reaps its `sudo` launcher. The helper prepares the fixed local network
+environment before Workload launch and explicitly cleans it after Workload
+reaping.
 
 ## Responsibility
 
@@ -28,8 +29,10 @@ validate XDG_RUNTIME_DIR and session directory
   -> acquire per-user session.lock
   -> start sudo -- netlaglab-helper
   -> authenticate the root peer as part of that launcher process tree
-  -> helper acquires /run/netlaglab/host.lock and sends READY
+  -> helper authenticates and sends READY
   -> transfer standard descriptors plus bounded argv/environment/cwd
+  -> helper transaction acquires the host lock and prepares the local topology
+  -> child enters the retained Session network namespace and drops privileges
   -> helper fork/execve()s the Workload under the invoking identity
   -> receive ACTIVE and only then publish control.sock
   -> poll helper, Controller, and signal self-pipe
@@ -37,8 +40,8 @@ validate XDG_RUNTIME_DIR and session directory
   -> Supervisor reaps the sudo launcher and removes control.sock
 ```
 
-The per-user `session.lock` protects the user runtime while the root-owned
-`/run/netlaglab/host.lock` provides host-wide exclusion. The lifecycle keeps
+The per-user `session.lock` protects the user runtime while the transaction-owned
+root host lock provides host-wide exclusion. The lifecycle keeps
 reading helper events after `READY`, rejects malformed or impossible ordering,
 and returns only after final cleanup and launcher reaping.
 
@@ -65,8 +68,9 @@ The semantic order is:
    lock.
 2. Before invoking `sudo`, it explains why privileges are needed and that an
    exact scoped firewall exception may later require confirmation.
-3. The helper authenticates the Supervisor, acquires the global host lock, and
-   performs semantic preflight checks and collision detection.
+3. The helper authenticates the Supervisor and accepts the bounded execution
+   context; the Network Environment transaction then acquires the global host
+   lock and performs semantic preflight checks and collision detection.
 4. If a firewall mutation is necessary, the helper reports the exact plan and
    the user confirms it through `/dev/tty` before mutation.
 5. The helper creates the network and mount environment and applies the

@@ -178,8 +178,7 @@ non-negative peer namespace ID.
 This supports the adapter's existing proof contract without relying on link
 names after placement or weakening ownership checks. The focused observation
 qualifies the cross-namespace attributes only; the opt-in topology and packet
-smoke remains a separate qualification gate, and Session integration remains
-unimplemented.
+smoke remains a separate qualification gate for the production Session path.
 
 ## What I learned
 

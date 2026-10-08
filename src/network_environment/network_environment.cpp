@@ -1045,21 +1045,30 @@ struct OwnerAccess {
         return std::move(owner.state_);
     }
 
-#ifdef NETLAGLAB_BUILD_PRIVILEGED_TESTS
     [[nodiscard]] static const NamespaceHandle* namespace_handle(
         const PreparedNetworkEnvironment& owner)
     {
         if (!owner.state_) {
             return nullptr;
         }
-        const auto* proof{
-            std::get_if<NamespaceProof>(&owner.state_->namespace_root)};
+        const auto* proof{std::get_if<NamespaceProof>(&owner.state_->namespace_root)};
         return proof == nullptr ? nullptr : proof->exact_handle_.get();
     }
-#endif
+
 };
 
 } // namespace detail
+
+WorkloadNamespaceEntry::WorkloadNamespaceEntry(
+    const detail::NamespaceHandle* handle) noexcept
+    : handle_{handle}
+{
+}
+
+bool WorkloadNamespaceEntry::enter() const noexcept
+{
+    return handle_ != nullptr && detail::enter_network_namespace(*handle_);
+}
 
 namespace {
 
@@ -1193,6 +1202,11 @@ PreparedNetworkEnvironment::PreparedNetworkEnvironment(
 PreparedNetworkEnvironment::~PreparedNetworkEnvironment() noexcept
 {
     best_effort_cleanup(std::move(state_));
+}
+
+WorkloadNamespaceEntry PreparedNetworkEnvironment::workload_namespace() const noexcept
+{
+    return WorkloadNamespaceEntry{detail::OwnerAccess::namespace_handle(*this)};
 }
 
 CleanupResult PreparedNetworkEnvironment::cleanup() &&

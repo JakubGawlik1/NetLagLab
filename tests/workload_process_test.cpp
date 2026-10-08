@@ -110,6 +110,22 @@ TEST(WorkloadProcessTest, MissingProgramAndNonExecutableMapToConventionalResults
         126);
 }
 
+TEST(WorkloadProcessTest, NamespaceEntryFailurePreventsExec)
+{
+    const WorkloadContext context{
+        .working_directory = "/",
+        .arguments = {"true"},
+        .environment = {"PATH=/bin"},
+    };
+    const network_environment::WorkloadNamespaceEntry unavailable_namespace;
+
+    WorkloadLaunchResult launch{
+        launch_workload(context, current_identity(), {}, &unavailable_namespace)};
+
+    EXPECT_FALSE(launch.process.has_value());
+    EXPECT_EQ(launch.failure_exit_code, 125);
+}
+
 TEST(WorkloadProcessTest, ExplicitlyRedirectsWorkloadStandardOutput)
 {
     int pipe_descriptors[2]{};

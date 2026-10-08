@@ -1,6 +1,6 @@
 # Current runtime call map
 
-Last verified against the working-tree code: 2026-09-29.
+Last verified against the working-tree code: 2026-10-08.
 
 This document maps the implemented process, socket, ownership, and cleanup
 flow. It does not treat accepted target architecture as implemented behavior.
@@ -11,13 +11,14 @@ flow. It does not treat accepted target architecture as implemented behavior.
 |---|---|
 | `netlaglab_core` | `NetworkProfile` validation and atomic typed Profile Change application. |
 | `netlaglab` | CLI, user-scoped Supervisor, Controller client, lifecycle coordination, signal self-pipe, and `sudo` launcher ownership. |
-| `netlaglab-helper` | Authenticated root helper, host lock, Workload launch/reaping, stop/Profile Change commands, and final helper events. |
+| `netlaglab-helper` | Authenticated root helper, transactional local network setup/cleanup, Workload launch/reaping, stop/Profile Change commands, and final helper events. |
 | `netlaglab_core_tests` | Network-profile validation tests. |
 | `netlaglab_lifecycle_tests` | Scripted tests through the blocking lifecycle seam. |
 | `netlaglab_protocol_tests` | Start-block and helper-conversation tests. |
 | `netlaglab_controller_protocol_tests` | Controller framing, escaping, and typed-command tests. |
 | `netlaglab_controller_outcome_tests` | Structured terminal Session Outcome protocol and attach-presentation tests. |
 | `netlaglab_process_tests` | Local unprivileged Workload-launch tests using `netlaglab-workload-probe`. |
+| `netlaglab_helper_session_tests` | Controlled helper-boundary tests for preparation, launch, supervision, and cleanup ordering without privileged mutations. |
 
 ## Process and IPC topology
 
@@ -36,9 +37,10 @@ The helper is the Workload's direct parent. The Supervisor never calls
 semantic helper events. The Supervisor owns and always attempts to reap only
 the `sudo` launcher PID.
 
-The implemented checkpoint does not create a network or mount namespace.
-Consequently the Workload still uses the host network environment even though
-its lifecycle owner has moved to the helper.
+The helper prepares the fixed local network topology through the Network
+Environment transaction. The child enters its exact retained network namespace
+before dropping privileges. The helper itself remains in the host namespace.
+There is no mount namespace, Session DNS view, NAT, or shaping yet.
 
 ## `netlaglab run` call sequence
 
@@ -90,17 +92,19 @@ netlaglab-helper main
     -> authenticate the exact Supervisor PID, UID, and GID with SO_PEERCRED
     -> read the authenticated Supervisor's supplementary groups from
        /proc/<peer-pid>/status
-    -> acquire /run/netlaglab/host.lock
     -> remove helper.sock listener path
     -> ignore helper-side SIGINT
     -> send READY
     -> receive the standard-descriptor marker and optional SCM_RIGHTS payload
     -> read and validate the bounded START block (30-second deadline begins
        at START_BEGIN)
+    -> prepare the Network Environment transaction and acquire its host lock
+       through explicit cleanup
     -> launch_workload
        -> pipe2(O_CLOEXEC) for exec-success evidence
        -> fork
        -> child: PR_SET_PDEATHSIG(SIGKILL)
+       -> child: setns() through capability for the exact retained handle
        -> child: restore default SIGINT
        -> child: map transferred/inherited/closed stdin, stdout, and stderr
        -> child: setgroups -> setgid -> setuid
@@ -115,14 +119,14 @@ netlaglab-helper main
        -> complete each Profile Change as restored-after-failure until a real shaping adapter exists
        -> apply STOP TERM / STOP KILL to the directly managed PID only
        -> send WORKLOAD_EXITED or WORKLOAD_SIGNALED after reaping
-       -> release /run/netlaglab/host.lock
-       -> send CLEANUP_OK and exit
+    -> explicitly clean the prepared or residual owner
+    -> send CLEANUP_OK only after cleanup succeeds
 ```
 
 If the Supervisor connection is lost, the helper sends `SIGTERM` to the
 directly managed Workload, waits five seconds, then sends `SIGKILL` if needed,
-reaps it, releases the host lock, and exits. `WorkloadProcess` has a destructor
-fallback that kills and reaps an otherwise still-owned PID.
+reaps it, cleans the owned network environment, and exits. `WorkloadProcess`
+has a destructor fallback that kills and reaps an otherwise still-owned PID.
 
 ## Execution-context transport
 

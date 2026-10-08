@@ -50,10 +50,12 @@ cross-platform support are not current goals.
   the namespace default route. Namespace-side commands enter through the exact
   retained handle in bounded short-lived children; successful completion alone
   returns the prepared owner, while configuration failure rolls back the proven
-  roots. This path is covered only by controlled unprivileged tests and has not
-  passed privileged qualification. The library is not linked into the helper;
-  DNS mounts, forwarding, NAT, firewall handling, shaping, Workload entry, and
-  active Session integration remain unimplemented.
+  roots. The helper now prepares the topology before Workload launch, passes a
+  capability for entering the exact retained namespace only to the forked
+  child, and explicitly cleans prepared or residual ownership after Workload
+  reaping. The path has deterministic unprivileged coverage but has not passed
+  privileged Session qualification. DNS mounts, forwarding, NAT, firewall
+  handling, and shaping remain unimplemented.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.
@@ -77,7 +79,8 @@ cross-platform support are not current goals.
   host-wide lock, signalling, and reaping.
 - The Workload receives the original bounded argv/environment/cwd snapshot,
   invoking UID/GID/supplementary groups, and explicit standard-descriptor
-  semantics. It still runs in the host namespaces.
+  semantics. It enters the exact Session network namespace while retaining the
+  host's mount namespace.
 - Typed outbound and inbound profiles exist, but no network shaping is applied.
 
 ## Candidate capabilities
@@ -86,9 +89,8 @@ These bullets describe desired capabilities, not milestones or fixed task
 boundaries. Their grouping and order should be reconsidered with the user from
 current code whenever work begins.
 
-- Create and clean up the network namespace and veth pair through the helper.
-- Run the application in the namespace and provide routing, scoped NAT/firewall
-  handling, and DNS.
+- Provide production Internet routing, scoped NAT/firewall handling, and DNS
+  for the Session network namespace.
 - Apply separate outbound and inbound shaping and allow live profile updates.
 - Record the settings timeline as JSON Lines for replay and reports.
 - Add a GUI over the same typed operations after the CLI/control path supports
