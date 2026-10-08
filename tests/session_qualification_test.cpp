@@ -61,6 +61,14 @@ constexpr std::string_view ready_prefix{"NLL_SESSION_PROBE_READY:"};
 constexpr std::string_view probe_stdout{"NLL_SESSION_PROBE_STDOUT\n"};
 constexpr std::string_view probe_stderr{"NLL_SESSION_PROBE_STDERR\n"};
 
+[[nodiscard]] int report_probe_failure(
+    const int status,
+    const std::string_view reason)
+{
+    std::cerr << "Session qualification probe failed: " << reason << '\n';
+    return status;
+}
+
 volatile std::sig_atomic_t termination_requested{};
 
 extern "C" void handle_termination(int)
@@ -293,42 +301,56 @@ extern "C" void handle_termination(int)
 [[nodiscard]] int run_workload_probe(const int argc, char* argv[])
 {
     if (argc != 5) {
-        return 80;
+        return report_probe_failure(80, "unexpected probe argument count");
     }
     const std::string_view mode{argv[2]};
     const std::string_view port_text{argv[3]};
     const std::string_view token{argv[4]};
     if (mode != "natural" && mode != "hold") {
-        return 81;
+        return report_probe_failure(81, "unexpected probe mode");
     }
     std::uint64_t port_value{};
     if (!parse_unsigned(port_text, port_value) || port_value == 0
-        || port_value > 65535
-        || !verify_arguments(argc, argv, mode, port_text, token)
-        || !verify_identity() || !verify_working_directory()
-        || !verify_no_inherited_privileged_descriptor()
-        || prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) {
-        return 82;
+        || port_value > 65535) {
+        return report_probe_failure(81, "invalid UDP port");
+    }
+    if (!verify_arguments(argc, argv, mode, port_text, token)) {
+        return report_probe_failure(82, "argv or token environment mismatch");
+    }
+    if (!verify_identity()) {
+        return report_probe_failure(82, "restored UID, GID, or supplementary groups mismatch");
+    }
+    if (!verify_working_directory()) {
+        return report_probe_failure(82, "working directory mismatch");
+    }
+    if (!verify_no_inherited_privileged_descriptor()) {
+        return report_probe_failure(82, "inherited privileged descriptor detected");
+    }
+    if (prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) != 1) {
+        return report_probe_failure(82, "no-new-privileges is not enabled");
     }
     std::uint64_t session_inode{};
-    if (!verify_network_namespaces(session_inode) || !verify_session_address()) {
-        return 83;
+    if (!verify_network_namespaces(session_inode)) {
+        return report_probe_failure(83, "network namespace identity mismatch");
+    }
+    if (!verify_session_address()) {
+        return report_probe_failure(83, "expected nll-app IPv4 address is missing");
     }
     const char* expected_stdin{required_environment(stdin_variable)};
     std::string stdin_line;
     if (expected_stdin == nullptr || !std::getline(std::cin, stdin_line)
         || stdin_line != expected_stdin) {
-        return 84;
+        return report_probe_failure(84, "transferred stdin mismatch");
     }
     if (!perform_udp_exchange(static_cast<std::uint16_t>(port_value), token)) {
-        return 85;
+        return report_probe_failure(85, "bounded host UDP exchange failed");
     }
     if (mode == "hold") {
         struct sigaction action {};
         action.sa_handler = handle_termination;
         sigemptyset(&action.sa_mask);
         if (sigaction(SIGTERM, &action, nullptr) == -1) {
-            return 86;
+            return report_probe_failure(86, "could not install SIGTERM handler");
         }
     }
     std::cout << ready_prefix << token << ':' << session_inode << '\n'
@@ -568,6 +590,10 @@ public:
                         std::string_view{stdout_text}.substr(
                             value_start, value_end - value_start),
                         session_inode);
+            }
+            if ((descriptors[0].revents & POLLHUP) != 0
+                && (descriptors[1].revents & POLLHUP) != 0) {
+                return false;
             }
         }
         return false;
