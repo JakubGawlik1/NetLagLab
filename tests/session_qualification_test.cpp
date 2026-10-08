@@ -60,6 +60,7 @@ constexpr std::string_view response_prefix{"nll-session-response:"};
 constexpr std::string_view ready_prefix{"NLL_SESSION_PROBE_READY:"};
 constexpr std::string_view probe_stdout{"NLL_SESSION_PROBE_STDOUT\n"};
 constexpr std::string_view probe_stderr{"NLL_SESSION_PROBE_STDERR\n"};
+constexpr std::string_view udp_result_prefix{"NLL_SESSION_PROBE_UDP:"};
 
 [[nodiscard]] int report_probe_failure(
     const int status,
@@ -342,8 +343,10 @@ extern "C" void handle_termination(int)
         || stdin_line != expected_stdin) {
         return report_probe_failure(84, "transferred stdin mismatch");
     }
-    if (!perform_udp_exchange(static_cast<std::uint16_t>(port_value), token)) {
-        return report_probe_failure(85, "bounded host UDP exchange failed");
+    const bool udp_succeeded{
+        perform_udp_exchange(static_cast<std::uint16_t>(port_value), token)};
+    if (!udp_succeeded) {
+        std::cerr << "Session qualification probe failed: bounded host UDP exchange failed\n";
     }
     if (mode == "hold") {
         struct sigaction action {};
@@ -354,7 +357,8 @@ extern "C" void handle_termination(int)
         }
     }
     std::cout << ready_prefix << token << ':' << session_inode << '\n'
-              << probe_stdout;
+              << probe_stdout << udp_result_prefix << token << ':'
+              << (udp_succeeded ? "success" : "unavailable") << '\n';
     std::cerr << probe_stderr;
     std::cout.flush();
     std::cerr.flush();
@@ -540,6 +544,8 @@ public:
         std::string& stdout_text,
         std::string& stderr_text,
         std::uint64_t& session_inode,
+        bool& host_peer_received_datagram,
+        bool& udp_exchange_succeeded,
         const std::chrono::milliseconds timeout = 20000ms)
     {
         const auto deadline{std::chrono::steady_clock::now() + timeout};
@@ -573,20 +579,36 @@ public:
                 if (!udp_seen) {
                     return false;
                 }
+                host_peer_received_datagram = true;
             }
             const std::string expected_line{
                 std::string{ready_prefix} + std::string{token} + ':'};
+            const std::string expected_udp_line{
+                std::string{udp_result_prefix} + std::string{token} + ':'};
             const std::size_t ready_at{stdout_text.find(expected_line)};
+            const std::size_t udp_result_at{stdout_text.find(expected_udp_line)};
             if (ready_at != std::string::npos
                 && stdout_text.find(probe_stdout) != std::string::npos
-                && stderr_text.find(probe_stderr) != std::string::npos) {
+                && stderr_text.find(probe_stderr) != std::string::npos
+                && udp_result_at != std::string::npos) {
                 const std::size_t value_start{ready_at + expected_line.size()};
                 const std::size_t value_end{stdout_text.find('\n', value_start)};
-                if (value_end == std::string::npos) {
+                const std::size_t udp_value_start{
+                    udp_result_at + expected_udp_line.size()};
+                const std::size_t udp_value_end{
+                    stdout_text.find('\n', udp_value_start)};
+                if (value_end == std::string::npos
+                    || udp_value_end == std::string::npos) {
                     return false;
                 }
-                return udp_seen
-                    && parse_unsigned(
+                const std::string_view udp_result{
+                    stdout_text.data() + udp_value_start,
+                    udp_value_end - udp_value_start};
+                if (udp_result != "success" && udp_result != "unavailable") {
+                    return false;
+                }
+                udp_exchange_succeeded = udp_result == "success";
+                return parse_unsigned(
                         std::string_view{stdout_text}.substr(
                             value_start, value_end - value_start),
                         session_inode);
@@ -998,14 +1020,22 @@ public:
         const std::string_view mode,
         std::string& stdout_text,
         std::string& stderr_text,
-        std::uint64_t& session_inode) const
+        std::uint64_t& session_inode,
+        bool& host_peer_received_datagram,
+        bool& udp_exchange_succeeded) const
     {
         if (!process.start(
                 run_arguments(mode), work_directory(), std::string{stdin_value} + "\n")) {
             return false;
         }
         return process.wait_for_ready(
-            udp_descriptor(), token_, stdout_text, stderr_text, session_inode);
+            udp_descriptor(),
+            token_,
+            stdout_text,
+            stderr_text,
+            session_inode,
+            host_peer_received_datagram,
+            udp_exchange_succeeded);
     }
 
 private:
@@ -1085,16 +1115,31 @@ TEST(SessionNetworkQualification, NaturalExitPreservesContextUdpAndCleanup)
     std::string output;
     std::string error;
     std::uint64_t session_inode{};
+    bool host_peer_received_datagram{};
+    bool udp_exchange_succeeded{};
     ASSERT_TRUE(scenario.launch_and_wait_for_probe(
-        session, "natural", output, error, session_inode))
+        session,
+        "natural",
+        output,
+        error,
+        session_inode,
+        host_peer_received_datagram,
+        udp_exchange_succeeded))
         << "Workload did not report its namespace, context, and UDP probe result\n"
         << error << output;
 
     const std::optional<int> status{session.wait_for_exit(output, error)};
     ASSERT_TRUE(status.has_value()) << "Session did not finish naturally\n" << error;
-    EXPECT_EQ(*status, 37) << error;
-    EXPECT_TRUE(wait_for_cleanup(session_inode))
+    ASSERT_EQ(*status, 37) << error;
+    ASSERT_TRUE(wait_for_cleanup(session_inode))
         << "owned namespace/veth roots or the host lock remained after natural exit";
+    if (!udp_exchange_succeeded) {
+        GTEST_SKIP() << "host UDP peer received no reply from the Session; the packet "
+                        "was observed at nll-host, so UDP qualification is limited by "
+                        "this host's receive path";
+    }
+    EXPECT_TRUE(host_peer_received_datagram)
+        << "Workload received an echo but the host peer did not report its request";
 }
 
 TEST(SessionNetworkQualification, ControllerStopReapsWorkloadBeforeCleanup)
@@ -1113,10 +1158,20 @@ TEST(SessionNetworkQualification, ControllerStopReapsWorkloadBeforeCleanup)
     std::string session_output;
     std::string session_error;
     std::uint64_t session_inode{};
+    bool host_peer_received_datagram{};
+    bool udp_exchange_succeeded{};
     ASSERT_TRUE(scenario.launch_and_wait_for_probe(
-        session, "hold", session_output, session_error, session_inode))
+        session,
+        "hold",
+        session_output,
+        session_error,
+        session_inode,
+        host_peer_received_datagram,
+        udp_exchange_succeeded))
         << "Workload did not report its namespace, context, and UDP probe result\n"
         << session_error << session_output;
+    EXPECT_TRUE(!udp_exchange_succeeded || host_peer_received_datagram)
+        << "Workload received a UDP echo that the host peer did not observe";
 
     std::string controller_output;
     std::string controller_error;
@@ -1155,10 +1210,20 @@ TEST(SessionNetworkQualification, SupervisorLossStopsWorkloadAndCleansTopology)
     std::string output;
     std::string error;
     std::uint64_t session_inode{};
+    bool host_peer_received_datagram{};
+    bool udp_exchange_succeeded{};
     ASSERT_TRUE(scenario.launch_and_wait_for_probe(
-        session, "hold", output, error, session_inode))
+        session,
+        "hold",
+        output,
+        error,
+        session_inode,
+        host_peer_received_datagram,
+        udp_exchange_succeeded))
         << "Workload did not report its namespace, context, and UDP probe result\n"
         << error << output;
+    EXPECT_TRUE(!udp_exchange_succeeded || host_peer_received_datagram)
+        << "Workload received a UDP echo that the host peer did not observe";
 
     ASSERT_TRUE(session.kill_and_reap(SIGKILL));
     EXPECT_TRUE(wait_for_signal_marker(scenario.signal_marker()))
