@@ -472,7 +472,8 @@ public:
     [[nodiscard]] bool start(
         const std::vector<std::string>& arguments,
         const std::filesystem::path& working_directory,
-        const std::string_view standard_input = {})
+        const std::string_view standard_input = {},
+        const bool keep_standard_input_open = false)
     {
         int input_pipe[2]{-1, -1};
         int output_pipe[2]{-1, -1};
@@ -532,7 +533,9 @@ public:
                 }
             }
         }
-        input_.reset();
+        if (!keep_standard_input_open) {
+            input_.reset();
+        }
         return true;
     }
 
@@ -1093,7 +1096,8 @@ private:
     if (!controller.start(
             {NETLAGLAB_EXECUTABLE_PATH, "attach"},
             working_directory,
-            "stop\n")) {
+            "stop\n",
+            true)) {
         return std::nullopt;
     }
     return controller.wait_for_exit(stdout_text, stderr_text, 15000ms);
