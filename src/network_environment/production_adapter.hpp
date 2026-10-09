@@ -61,5 +61,9 @@ public:
 };
 
 [[nodiscard]] std::unique_ptr<ProductionPlatform> make_linux_production_platform();
+[[nodiscard]] bool enter_network_namespace(const NamespaceHandle& handle) noexcept;
+
+[[nodiscard]] int borrow_linux_namespace_descriptor_for_testing(
+    const NamespaceHandle& handle) noexcept;
 
 } // namespace netlaglab::network_environment::detail

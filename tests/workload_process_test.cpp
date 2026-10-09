@@ -1,14 +1,17 @@
 #include "workload_process.hpp"
 #include "file_descriptor.hpp"
 #include "socket_io.hpp"
+#include "workload_process_test_support.hpp"
 
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cerrno>
 #include <fcntl.h>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -108,6 +111,82 @@ TEST(WorkloadProcessTest, MissingProgramAndNonExecutableMapToConventionalResults
     EXPECT_EQ(
         launch_workload(non_executable, current_identity()).failure_exit_code,
         126);
+}
+
+TEST(WorkloadProcessTest, NamespaceEntryFailurePreventsExec)
+{
+    const WorkloadContext context{
+        .working_directory = "/",
+        .arguments = {"true"},
+        .environment = {"PATH=/bin"},
+    };
+    const network_environment::WorkloadNamespaceEntry unavailable_namespace;
+
+    WorkloadLaunchResult launch{
+        launch_workload(context, current_identity(), {}, &unavailable_namespace)};
+
+    EXPECT_FALSE(launch.process.has_value());
+    EXPECT_EQ(launch.failure_exit_code, 125);
+    int status{};
+    errno = 0;
+    EXPECT_EQ(waitpid(-1, &status, WNOHANG), -1);
+    EXPECT_EQ(errno, ECHILD);
+}
+
+namespace {
+
+struct ChildSetupTrace {
+    int descriptor;
+};
+
+[[nodiscard]] bool record_namespace_entry(void* const raw_trace) noexcept
+{
+    auto* const trace{static_cast<ChildSetupTrace*>(raw_trace)};
+    constexpr char marker{'N'};
+    return write(trace->descriptor, &marker, sizeof(marker))
+        == static_cast<ssize_t>(sizeof(marker));
+}
+
+void record_identity_drop(void* const raw_trace) noexcept
+{
+    auto* const trace{static_cast<ChildSetupTrace*>(raw_trace)};
+    constexpr char marker{'I'};
+    (void)write(trace->descriptor, &marker, sizeof(marker));
+}
+
+} // namespace
+
+TEST(WorkloadProcessTest, EntersNamespaceBeforeIdentityTransitionAndExec)
+{
+    int marker_pipe[2]{};
+    ASSERT_EQ(pipe2(marker_pipe, O_CLOEXEC), 0);
+    FileDescriptor marker_reader{marker_pipe[0]};
+    FileDescriptor marker_writer{marker_pipe[1]};
+    ChildSetupTrace trace{marker_writer.get()};
+    const workload_process_testing::ChildSetupHooks hooks{
+        &record_namespace_entry,
+        &record_identity_drop,
+        &trace,
+    };
+    const WorkloadContext context{
+        .working_directory = "/",
+        .arguments = {"/bin/true"},
+        .environment = {"PATH=/bin"},
+    };
+
+    WorkloadLaunchResult launch{workload_process_testing::launch_with_child_setup_hooks(
+        context, current_identity(), {}, hooks)};
+    marker_writer.reset();
+
+    ASSERT_TRUE(launch.process.has_value());
+    const std::optional<WorkloadStatus> status{launch.process->wait()};
+    ASSERT_TRUE(status.has_value());
+    EXPECT_TRUE(status->exited);
+    EXPECT_EQ(status->value, 0);
+
+    std::array<char, 2> markers{};
+    EXPECT_EQ(read(marker_reader.get(), markers.data(), markers.size()), 2);
+    EXPECT_EQ((std::string_view{markers.data(), markers.size()}), "NI");
 }
 
 TEST(WorkloadProcessTest, ExplicitlyRedirectsWorkloadStandardOutput)

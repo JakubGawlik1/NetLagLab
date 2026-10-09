@@ -2,13 +2,13 @@
 
 ## Status
 
-The active NetLagLab Session does not currently create a network or mount
-namespace, veth pair, routes, DNS view, NAT rules, or qdiscs. The standalone
-private library now implements the complete fixed host-local topology through
-namespace and veth creation, addresses, link state, loopback, default route,
-and proof-based cleanup. It is not linked into the helper and has not been
-privileged-qualified. The topology and basic connectivity were verified
-manually in [Experiment 01](../experiment_01.md). DNS contents and host route
+The active NetLagLab Session prepares the fixed host-local topology through the
+private Network Environment library. The library owns the root host lock,
+namespace and veth proofs, setup transaction, and explicit cleanup. The helper
+passes a narrow capability for entering the exact retained namespace to the
+forked Workload child; the long-lived helper remains in the host network
+namespace. The production Session path has deterministic coverage but has not
+yet passed the separate privileged qualification. DNS contents and host route
 selection remain deliberately open.
 
 The private transaction foundation is implemented and tested without
@@ -50,9 +50,10 @@ the adapter assigns `10.200.0.1/30`, brings up `nll-host`, enters the exact
 namespace handle to bring up loopback, assigns `10.200.0.2/30`, brings up
 `nll-app`, and adds the default route through `10.200.0.1`. Each mutation is
 one bounded child operation; no redundant readiness readback is added.
-Standalone preparation now returns a prepared owner only after that complete
-sequence. The adapter remains unprivileged-tested, not privileged-qualified,
-and the library remains unlinked from the helper and active Session.
+Preparation returns a prepared owner only after that complete sequence. The
+helper explicitly consumes the prepared or residual owner after Workload
+reaping. A cleanup failure remains an infrastructure failure even if the
+bounded residual pass later removes the remaining resources.
 
 ## Target topology
 
@@ -185,9 +186,8 @@ preflight. A private move-only runtime containing that lock, the semantic
 adapter, and the monotonic clock then moves into the prepared or residual owner
 and remains there through cleanup, retry, and any destructor safety pass. The
 module releases the lock only after the owner no longer has cleanup work. The
-current helper-side manual lock remains untouched while this standalone module
-is unintegrated; later integration must replace that acquisition with this one,
-not nest a second lock.
+helper no longer acquires a separate lock: it relies on the transaction-owned
+lock for preparation, Workload execution, and explicit cleanup.
 
 The public module surface consists of concrete move-only owner types with opaque
 implementations and consuming prepare, cleanup, and residual-retry operations.
@@ -374,10 +374,12 @@ The implementation-ready contract for this checkpoint was confirmed on
 6. The affected targets build with the configured warnings, the full default
    CTest suite passes after the CMake change, and `git diff --check` is clean.
 
-Until item 5 passes, the implementation may be described as unprivileged-tested
-standalone code, not as a privileged-qualified adapter. Even after it passes,
-the library is not integrated Session functionality until a later checkpoint
-wires it into the helper and Workload launch path.
+This section records the acceptance criteria for the standalone checkpoint;
+it is not a statement of the current implementation boundary. The helper now
+uses the transaction for Session preparation and cleanup, and the Workload
+enters the retained namespace in its forked child. Privileged qualification of
+that integrated Session path remains separate from the standalone adapter
+qualification described here.
 
 ## Focused privileged qualification
 

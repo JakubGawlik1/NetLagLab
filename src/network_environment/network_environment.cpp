@@ -45,6 +45,7 @@ private:
     std::unique_ptr<detail::NamespaceHandle> exact_handle_;
 
     friend class ProductionAdapter;
+    friend struct detail::OwnerAccess;
 };
 
 struct VethIdentityPair {
@@ -1043,6 +1044,17 @@ struct OwnerAccess {
     {
         return std::move(owner.state_);
     }
+
+    [[nodiscard]] static const NamespaceHandle* borrow_namespace_handle(
+        const PreparedNetworkEnvironment& owner) noexcept
+    {
+        if (!owner.state_) {
+            return nullptr;
+        }
+        const auto* proof{
+            std::get_if<NamespaceProof>(&owner.state_->namespace_root)};
+        return proof == nullptr ? nullptr : proof->exact_handle_.get();
+    }
 };
 
 } // namespace detail
@@ -1179,6 +1191,23 @@ PreparedNetworkEnvironment::PreparedNetworkEnvironment(
 PreparedNetworkEnvironment::~PreparedNetworkEnvironment() noexcept
 {
     best_effort_cleanup(std::move(state_));
+}
+
+WorkloadNamespaceEntry::WorkloadNamespaceEntry(
+    const detail::NamespaceHandle* handle) noexcept
+    : handle_{handle}
+{
+}
+
+bool WorkloadNamespaceEntry::enter() const noexcept
+{
+    return handle_ != nullptr && detail::enter_network_namespace(*handle_);
+}
+
+WorkloadNamespaceEntry PreparedNetworkEnvironment::workload_namespace() const noexcept
+{
+    return WorkloadNamespaceEntry{
+        detail::OwnerAccess::borrow_namespace_handle(*this)};
 }
 
 CleanupResult PreparedNetworkEnvironment::cleanup() &&
@@ -1422,6 +1451,16 @@ PreparationResult prepare_with_production_platform(
 {
     return prepare_production_network_environment(
         std::move(preflight), std::move(production));
+}
+
+int borrow_prepared_namespace_descriptor(
+    const PreparedNetworkEnvironment& environment) noexcept
+{
+    const detail::NamespaceHandle* handle{
+        detail::OwnerAccess::borrow_namespace_handle(environment)};
+    return handle == nullptr
+        ? -1
+        : detail::borrow_linux_namespace_descriptor_for_testing(*handle);
 }
 
 } // namespace testing

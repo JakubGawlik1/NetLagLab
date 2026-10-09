@@ -17,9 +17,10 @@ Its production entry point acquires the root-owned host lock before preflight,
 and the runtime retains that lock in either a prepared or residual owner until
 cleanup work is gone. The standalone production path can now create and clean
 the proven namespace/veth roots together with their contained addresses, link
-state, loopback state, and namespace route. The active helper still creates
-none of these resources, and NAT, firewall, DNS-mount, qdisc, and durable
-recovery ownership remain unimplemented.
+state, loopback state, and namespace route. The active helper prepares this
+local topology before Workload launch and explicitly cleans it after the
+Workload is reaped. NAT, firewall, DNS-mount, qdisc, and durable recovery
+ownership remain unimplemented.
 
 The remaining production ownership and cleanup rules below are accepted target
 design. A durable recovery journal is accepted in principle for persistent
@@ -71,9 +72,8 @@ The production preparation operation acquires the root-owned global host lock
 before preflight and transfers it with the adapter and clock into whichever
 owner survives. That owner retains the lock through explicit cleanup, residual
 retry, and any destructor safety pass. A clean preparation failure or complete
-cleanup releases it. The standalone module is not yet called by the helper;
-future integration replaces the helper's current manual lock acquisition rather
-than attempting to acquire the same lock twice.
+cleanup releases it. The helper relies on this transaction-owned lock and does
+not acquire a duplicate lock.
 
 Explicit cleanup consumes the prepared environment or residual cleanup owner
 and performs exactly one dependency-aware pass. Complete cleanup returns no new

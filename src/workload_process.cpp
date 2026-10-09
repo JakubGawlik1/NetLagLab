@@ -2,6 +2,10 @@
 
 #include "file_descriptor.hpp"
 
+#ifdef NETLAGLAB_ENABLE_PROCESS_TEST_HOOKS
+#include "workload_process_test_support.hpp"
+#endif
+
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -99,97 +103,17 @@ namespace {
     return {false, 0};
 }
 
-} // namespace
-
-WorkloadProcess::WorkloadProcess(const pid_t pid) noexcept
-    : pid_{pid}
-{
-}
-
-WorkloadProcess::~WorkloadProcess()
-{
-    terminate_and_reap();
-}
-
-WorkloadProcess::WorkloadProcess(WorkloadProcess&& other) noexcept
-    : pid_{std::exchange(other.pid_, -1)}
-{
-}
-
-WorkloadProcess& WorkloadProcess::operator=(WorkloadProcess&& other) noexcept
-{
-    if (this != &other) {
-        terminate_and_reap();
-        pid_ = std::exchange(other.pid_, -1);
-    }
-    return *this;
-}
-
-void WorkloadProcess::terminate_and_reap() noexcept
-{
-    if (pid_ <= 0) {
-        return;
-    }
-    (void)kill(pid_, SIGKILL);
-    int status{};
-    while (waitpid(pid_, &status, 0) == -1 && errno == EINTR) {
-    }
-    pid_ = -1;
-}
-
-pid_t WorkloadProcess::pid() const noexcept
-{
-    return pid_;
-}
-
-bool WorkloadProcess::send_signal(const int signal_number) const noexcept
-{
-    return pid_ > 0 && kill(pid_, signal_number) == 0;
-}
-
-std::optional<WorkloadStatus> WorkloadProcess::wait()
-{
-    if (pid_ <= 0) {
-        return std::nullopt;
-    }
-
-    int status{};
-    pid_t result{};
-    do {
-        result = waitpid(pid_, &status, 0);
-    } while (result == -1 && errno == EINTR);
-    if (result != pid_) {
-        return std::nullopt;
-    }
-    pid_ = -1;
-    return decode_wait_status(status);
-}
-
-WorkloadPollResult WorkloadProcess::poll()
-{
-    if (pid_ <= 0) {
-        return {WorkloadPollState::error, std::nullopt};
-    }
-
-    int status{};
-    pid_t result{};
-    do {
-        result = waitpid(pid_, &status, WNOHANG);
-    } while (result == -1 && errno == EINTR);
-    if (result == 0) {
-        return {WorkloadPollState::running, std::nullopt};
-    }
-    if (result != pid_) {
-        return {WorkloadPollState::error, std::nullopt};
-    }
-    pid_ = -1;
-    return {WorkloadPollState::finished, decode_wait_status(status)};
-}
-
-WorkloadLaunchResult launch_workload(
+[[nodiscard]] WorkloadLaunchResult launch_workload_impl(
     const WorkloadContext& context,
     const WorkloadIdentity& identity,
-    const WorkloadStandardDescriptors& standard_descriptors)
+    const WorkloadStandardDescriptors& standard_descriptors,
+    const network_environment::WorkloadNamespaceEntry* namespace_entry,
+#ifdef NETLAGLAB_ENABLE_PROCESS_TEST_HOOKS
+    const workload_process_testing::ChildSetupHooks* hooks
+#else
+    const void* hooks
+#endif
+)
 {
     if (context.arguments.empty()) {
         return {.process = std::nullopt, .failure_exit_code = 125};
@@ -230,6 +154,17 @@ WorkloadLaunchResult launch_workload(
     if (child_pid == 0) {
         error_reader.reset();
         if (prctl(PR_SET_PDEATHSIG, SIGKILL) == -1 || getppid() != expected_parent) {
+            report_child_failure_and_exit(error_writer.get(), 125);
+        }
+
+        if (hooks != nullptr) {
+#ifdef NETLAGLAB_ENABLE_PROCESS_TEST_HOOKS
+            if (!hooks->enter_namespace(hooks->context)) {
+                report_child_failure_and_exit(error_writer.get(), 125);
+            }
+            hooks->before_identity_drop(hooks->context);
+#endif
+        } else if (namespace_entry != nullptr && !namespace_entry->enter()) {
             report_child_failure_and_exit(error_writer.get(), 125);
         }
 
@@ -328,5 +263,114 @@ WorkloadLaunchResult launch_workload(
     }
     return {.process = std::nullopt, .failure_exit_code = failure_exit_code};
 }
+
+} // namespace
+
+WorkloadProcess::WorkloadProcess(const pid_t pid) noexcept
+    : pid_{pid}
+{
+}
+
+WorkloadProcess::~WorkloadProcess()
+{
+    terminate_and_reap();
+}
+
+WorkloadProcess::WorkloadProcess(WorkloadProcess&& other) noexcept
+    : pid_{std::exchange(other.pid_, -1)}
+{
+}
+
+WorkloadProcess& WorkloadProcess::operator=(WorkloadProcess&& other) noexcept
+{
+    if (this != &other) {
+        terminate_and_reap();
+        pid_ = std::exchange(other.pid_, -1);
+    }
+    return *this;
+}
+
+void WorkloadProcess::terminate_and_reap() noexcept
+{
+    if (pid_ <= 0) {
+        return;
+    }
+    (void)kill(pid_, SIGKILL);
+    int status{};
+    while (waitpid(pid_, &status, 0) == -1 && errno == EINTR) {
+    }
+    pid_ = -1;
+}
+
+pid_t WorkloadProcess::pid() const noexcept
+{
+    return pid_;
+}
+
+bool WorkloadProcess::send_signal(const int signal_number) const noexcept
+{
+    return pid_ > 0 && kill(pid_, signal_number) == 0;
+}
+
+std::optional<WorkloadStatus> WorkloadProcess::wait()
+{
+    if (pid_ <= 0) {
+        return std::nullopt;
+    }
+
+    int status{};
+    pid_t result{};
+    do {
+        result = waitpid(pid_, &status, 0);
+    } while (result == -1 && errno == EINTR);
+    if (result != pid_) {
+        return std::nullopt;
+    }
+    pid_ = -1;
+    return decode_wait_status(status);
+}
+
+WorkloadPollResult WorkloadProcess::poll()
+{
+    if (pid_ <= 0) {
+        return {WorkloadPollState::error, std::nullopt};
+    }
+
+    int status{};
+    pid_t result{};
+    do {
+        result = waitpid(pid_, &status, WNOHANG);
+    } while (result == -1 && errno == EINTR);
+    if (result == 0) {
+        return {WorkloadPollState::running, std::nullopt};
+    }
+    if (result != pid_) {
+        return {WorkloadPollState::error, std::nullopt};
+    }
+    pid_ = -1;
+    return {WorkloadPollState::finished, decode_wait_status(status)};
+}
+
+WorkloadLaunchResult launch_workload(
+    const WorkloadContext& context,
+    const WorkloadIdentity& identity,
+    const WorkloadStandardDescriptors& standard_descriptors,
+    const network_environment::WorkloadNamespaceEntry* namespace_entry)
+{
+    return launch_workload_impl(
+        context, identity, standard_descriptors, namespace_entry, nullptr);
+}
+
+#ifdef NETLAGLAB_ENABLE_PROCESS_TEST_HOOKS
+WorkloadLaunchResult workload_process_testing::launch_with_child_setup_hooks(
+    const WorkloadContext& context,
+    const WorkloadIdentity& identity,
+    const WorkloadStandardDescriptors& standard_descriptors,
+    const workload_process_testing::ChildSetupHooks& hooks)
+{
+    return launch_workload_impl(
+        context, identity, standard_descriptors, nullptr, &hooks);
+}
+#endif
 
 } // namespace netlaglab

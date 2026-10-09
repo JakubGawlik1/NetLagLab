@@ -154,6 +154,32 @@ rule are runtime resources and should be removed after the experiment. A
 restart also removes the namespace, veth pair and qdiscs, but the UFW rule is
 persistent and must be deleted explicitly.
 
+## RTM_GETLINK ownership proof experiment (#10)
+
+On 2026-10-08, the focused privileged experiment created the fixed
+`netlaglab` namespace and `nll-host`/`nll-app` veth pair, queried each link
+with `ip -d -j link show`, moved `nll-app` into the namespace, queried both
+ends again, and removed the temporary resources. It did not configure
+addresses or routes, send traffic, or modify firewall, NAT, or qdisc state.
+
+Before peer placement, both links were visible from the host namespace. The
+JSON `link` field named the peer (`nll-app` from `nll-host` and `nll-host` from
+`nll-app`), and both reported `linkinfo.info_kind` as `veth`.
+
+After placement, the host query reported `nll-host` at ifindex 5 with
+`link_index` 4 and `link_netnsid` 0. The query inside the exact `netlaglab`
+namespace reported `nll-app` at ifindex 4 with `link_index` 5 and
+`link_netnsid` 0. Both still reported `linkinfo.info_kind` as `veth`; the
+host-side `nll-app` query reported the link absent. Thus the observed
+`RTM_GETLINK` identity is reciprocal across namespaces: each link's peer index
+matches the other link's interface index, and each query includes a
+non-negative peer namespace ID.
+
+This supports the adapter's existing proof contract without relying on link
+names after placement or weakening ownership checks. The focused observation
+qualifies the cross-namespace attributes only; the opt-in topology and packet
+smoke remains a separate qualification gate for the production Session path.
+
 ## What I learned
 
 - How to create an isolated network namespace.

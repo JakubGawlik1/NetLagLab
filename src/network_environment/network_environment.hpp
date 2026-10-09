@@ -40,9 +40,26 @@ struct OwnerState;
 struct OwnerAccess;
 struct PreparationRuntime;
 struct PreparationAccess;
+class NamespaceHandle;
 } // namespace detail
 
 class CleanupResult;
+
+class WorkloadNamespaceEntry {
+public:
+    WorkloadNamespaceEntry() noexcept = default;
+    WorkloadNamespaceEntry(const WorkloadNamespaceEntry&) = default;
+    WorkloadNamespaceEntry& operator=(const WorkloadNamespaceEntry&) = default;
+
+    [[nodiscard]] bool enter() const noexcept;
+
+private:
+    explicit WorkloadNamespaceEntry(const detail::NamespaceHandle* handle) noexcept;
+
+    const detail::NamespaceHandle* handle_{};
+
+    friend class PreparedNetworkEnvironment;
+};
 
 class PreparationInput {
 public:
@@ -69,6 +86,7 @@ public:
     PreparedNetworkEnvironment& operator=(const PreparedNetworkEnvironment&) = delete;
     ~PreparedNetworkEnvironment() noexcept;
 
+    [[nodiscard]] WorkloadNamespaceEntry workload_namespace() const noexcept;
     [[nodiscard]] CleanupResult cleanup() &&;
 
 private:

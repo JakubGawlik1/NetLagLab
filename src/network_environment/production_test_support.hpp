@@ -21,4 +21,7 @@ struct ProductionTrace {
     std::unique_ptr<detail::PreflightPlatform> preflight,
     std::unique_ptr<detail::ProductionPlatform> production);
 
+[[nodiscard]] int borrow_prepared_namespace_descriptor(
+    const PreparedNetworkEnvironment& environment) noexcept;
+
 } // namespace netlaglab::network_environment::testing

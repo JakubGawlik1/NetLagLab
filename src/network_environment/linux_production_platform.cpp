@@ -429,9 +429,23 @@ public:
 
 } // namespace
 
+bool enter_network_namespace(const NamespaceHandle& handle) noexcept
+{
+    const auto* linux_namespace{dynamic_cast<const LinuxNamespaceHandle*>(&handle)};
+    return linux_namespace != nullptr
+        && setns(linux_namespace->descriptor(), CLONE_NEWNET) == 0;
+}
+
 std::unique_ptr<ProductionPlatform> make_linux_production_platform()
 {
     return std::make_unique<LinuxProductionPlatform>();
+}
+
+int borrow_linux_namespace_descriptor_for_testing(
+    const NamespaceHandle& handle) noexcept
+{
+    const LinuxNamespaceHandle* linux_namespace{linux_handle(handle)};
+    return linux_namespace == nullptr ? -1 : linux_namespace->descriptor();
 }
 
 } // namespace netlaglab::network_environment::detail

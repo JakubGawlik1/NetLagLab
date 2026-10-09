@@ -1,6 +1,7 @@
 #pragma once
 
 #include "workload_context.hpp"
+#include "network_environment/network_environment.hpp"
 
 #include <array>
 #include <optional>
@@ -72,6 +73,7 @@ struct WorkloadLaunchResult {
 [[nodiscard]] WorkloadLaunchResult launch_workload(
     const WorkloadContext& context,
     const WorkloadIdentity& identity,
-    const WorkloadStandardDescriptors& standard_descriptors = {});
+    const WorkloadStandardDescriptors& standard_descriptors = {},
+    const network_environment::WorkloadNamespaceEntry* namespace_entry = nullptr);
 
 } // namespace netlaglab

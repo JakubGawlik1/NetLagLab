@@ -73,6 +73,7 @@ endif()
 add_executable(
     netlaglab-helper
     src/helper_protocol.cpp
+    src/helper_session.cpp
     src/helper_main.cpp
     src/process_status.cpp
     src/session_socket.cpp
@@ -83,7 +84,13 @@ add_executable(
 )
 
 target_compile_features(netlaglab-helper PRIVATE cxx_std_20)
-target_link_libraries(netlaglab-helper PRIVATE netlaglab_core)
+target_include_directories(netlaglab-helper PRIVATE src)
+target_link_libraries(
+    netlaglab-helper
+    PRIVATE
+        netlaglab_core
+        netlaglab_network_environment
+)
 set_target_properties(netlaglab-helper PROPERTIES CXX_EXTENSIONS OFF)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
@@ -91,6 +98,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 include(CTest)
+
+option(
+    NETLAGLAB_BUILD_PRIVILEGED_TESTS
+    "Build opt-in tests that mutate the host network and require root"
+    OFF
+)
 
 if(BUILD_TESTING)
     find_package(GTest REQUIRED)
@@ -185,6 +198,51 @@ if(BUILD_TESTING)
     endif()
 
     gtest_discover_tests(netlaglab_network_environment_tests)
+
+    if(NETLAGLAB_BUILD_PRIVILEGED_TESTS)
+        add_executable(
+            netlaglab_network_environment_privileged_smoke
+            tests/network_environment_privileged_smoke.cpp
+        )
+        target_include_directories(
+            netlaglab_network_environment_privileged_smoke
+            PRIVATE src
+        )
+        target_link_libraries(
+            netlaglab_network_environment_privileged_smoke
+            PRIVATE
+                netlaglab_network_environment
+                GTest::gtest
+        )
+        target_compile_features(
+            netlaglab_network_environment_privileged_smoke
+            PRIVATE cxx_std_20
+        )
+        set_target_properties(
+            netlaglab_network_environment_privileged_smoke
+            PROPERTIES CXX_EXTENSIONS OFF
+        )
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(
+                netlaglab_network_environment_privileged_smoke
+                PRIVATE
+                    -Wall
+                    -Wextra
+                    -Wpedantic
+            )
+        endif()
+
+        add_test(
+            NAME netlaglab_network_environment_privileged_smoke
+            COMMAND netlaglab_network_environment_privileged_smoke
+        )
+        set_tests_properties(
+            netlaglab_network_environment_privileged_smoke
+            PROPERTIES
+                LABELS privileged
+                RUN_SERIAL TRUE
+        )
+    endif()
 
     add_executable(
         netlaglab_lifecycle_tests
@@ -334,10 +392,19 @@ if(BUILD_TESTING)
         tests/process_status_test.cpp
     )
     target_include_directories(netlaglab_process_tests PRIVATE src)
-    target_link_libraries(netlaglab_process_tests PRIVATE GTest::gtest_main)
+    target_link_libraries(
+        netlaglab_process_tests
+        PRIVATE
+            GTest::gtest_main
+            netlaglab_network_environment
+    )
     target_compile_definitions(
         netlaglab_process_tests
         PRIVATE WORKLOAD_PROBE_PATH="$<TARGET_FILE:netlaglab-workload-probe>"
+    )
+    target_compile_definitions(
+        netlaglab_process_tests
+        PRIVATE NETLAGLAB_ENABLE_PROCESS_TEST_HOOKS
     )
     add_dependencies(netlaglab_process_tests netlaglab-workload-probe)
     target_compile_features(netlaglab_process_tests PRIVATE cxx_std_20)
@@ -354,4 +421,35 @@ if(BUILD_TESTING)
     endif()
 
     gtest_discover_tests(netlaglab_process_tests)
+
+    add_executable(
+        netlaglab_helper_session_tests
+        src/helper_session.cpp
+        src/workload_context.cpp
+        src/workload_process.cpp
+        tests/helper_session_test.cpp
+    )
+    target_include_directories(netlaglab_helper_session_tests PRIVATE src)
+    target_link_libraries(
+        netlaglab_helper_session_tests
+        PRIVATE
+            GTest::gtest_main
+            netlaglab_core
+            netlaglab_network_environment
+    )
+    target_compile_features(netlaglab_helper_session_tests PRIVATE cxx_std_20)
+    set_target_properties(
+        netlaglab_helper_session_tests
+        PROPERTIES CXX_EXTENSIONS OFF
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_helper_session_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+    gtest_discover_tests(netlaglab_helper_session_tests)
 endif()
