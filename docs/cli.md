@@ -52,23 +52,25 @@ set <outbound|inbound> <delay|jitter|loss|bandwidth> <value>
 reset <outbound|inbound> <delay|jitter|loss|bandwidth>
 ```
 
+Delay, jitter, and packet loss are applied independently to outbound and inbound traffic.
+The helper confirms a change before it appears in `status`; a recoverable failure preserves
+the last confirmed profile. If it cannot establish or restore the qdisc state, the Session ends
+with a profile-state infrastructure failure. Bandwidth limiting is not supported; a bandwidth
+`set` is rejected without changing the confirmed profile.
+
 Delay and jitter use milliseconds by default and accept `ms` or `s`. Bandwidth uses `kbps`
 by default and accepts `kbps` or `mbps`; it must be greater than zero. Loss uses percent by
 default, accepts `%`, and must be between 0 and 100 inclusive. Units may be attached or
 separated. Commands and names are lowercase; spaces and tabs may surround and separate tokens.
-The production helper currently responds with
-`ERROR Profile change could not be applied; previous profile remains active.` because the real
-traffic-shaping adapter is not implemented. The request still crosses the typed privilege
-boundary and completes deterministically. `help` does not advertise these commands until the
-production backend can apply them successfully.
+`help` lists directional delay, jitter, packet loss, and reset commands. `status` shows
+`shaping: not applied` before the first confirmed change and `shaping: applied` after one;
+the displayed values always come from the last helper-confirmed Network Profile. Resetting the
+last active impairment returns that direction to its unrestricted `noqueue` qdisc.
 
 Controller lines are limited to 1024 raw bytes before trimming. At most 32 parsed commands may
 wait behind the operation in flight. Ordinary syntax errors return a fixed `ERROR` response and
 do not consume queue capacity. An oversized command or queue overflow reports a fixed error and
 disconnects the Controller without cancelling an already dispatched Profile Change.
-
-The status output says `shaping: not applied`. NetLagLab does not apply the displayed network
-profile in this stage of the project.
 
 Only one controller can be connected at a time. After a successful `detach`, another
 `netlaglab attach` can connect to the same session. End-of-file on the controller's standard input

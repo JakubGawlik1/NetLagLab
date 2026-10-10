@@ -9,14 +9,17 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -149,6 +152,13 @@ struct OperationResult {
     Cause cause;
 };
 
+enum class ProfileOperationStatus {
+    applied,
+    failed_before_mutation,
+    failed_after_mutation,
+    state_unknown,
+};
+
 struct NamespaceMutationResult {
     bool succeeded;
     Cause cause;
@@ -222,6 +232,13 @@ public:
         TimePoint deadline) = 0;
     [[nodiscard]] virtual OperationResult validate_connectivity(
         const ConnectivityProof& proof,
+        TimePoint deadline) = 0;
+    [[nodiscard]] virtual ProfileOperationStatus apply_profile(
+        const NetworkProfile& profile,
+        TrafficDirection direction,
+        const NamespaceProof& namespace_proof,
+        const PlacedVethProof& veth_proof,
+        bool restoring,
         TimePoint deadline) = 0;
     [[nodiscard]] virtual ConnectivityRemovalResult remove_connectivity(
         ConnectivityProof proof,
@@ -430,6 +447,29 @@ public:
         return operation(Operation::validate_connectivity, deadline);
     }
 
+    [[nodiscard]] ProfileOperationStatus apply_profile(
+        const NetworkProfile&,
+        TrafficDirection,
+        const NamespaceProof&,
+        const PlacedVethProof&,
+        const bool restoring,
+        const TimePoint deadline) override
+    {
+        const ScriptStep step{next(
+            restoring ? Operation::restore_profile : Operation::apply_profile,
+            deadline)};
+        if (step.outcome == Outcome::success) {
+            return ProfileOperationStatus::applied;
+        }
+        if (step.outcome == Outcome::fail_unchanged) {
+            return ProfileOperationStatus::failed_before_mutation;
+        }
+        if (step.outcome == Outcome::fail_new_state) {
+            return ProfileOperationStatus::failed_after_mutation;
+        }
+        return ProfileOperationStatus::state_unknown;
+    }
+
     [[nodiscard]] ConnectivityRemovalResult remove_connectivity(
         ConnectivityProof,
         const TimePoint deadline) override
@@ -544,6 +584,8 @@ struct TrustedToolLookup {
     std::array<std::string_view, 4> paths{};
     if (tool == "nft") {
         paths = {"/usr/sbin/nft", "/usr/bin/nft", "/sbin/nft", "/bin/nft"};
+    } else if (tool == "tc") {
+        paths = {"/usr/sbin/tc", "/usr/bin/tc", "/sbin/tc", "/bin/tc"};
     } else if (tool == "ufw") {
         paths = {"/usr/sbin/ufw", "/usr/bin/ufw", "/sbin/ufw", "/bin/ufw"};
     } else if (tool == "firewall-cmd") {
@@ -791,6 +833,87 @@ public:
         };
         return command_result(production_->run_ip_in_namespace(
             ip_path_, arguments, *namespace_proof.exact_handle_, deadline));
+    }
+
+    [[nodiscard]] ProfileOperationStatus apply_profile(
+        const NetworkProfile& profile,
+        const TrafficDirection direction,
+        const NamespaceProof& namespace_proof,
+        const PlacedVethProof& veth_proof,
+        const bool,
+        const TimePoint deadline) override
+    {
+        if (!veth_proof.identity_) {
+            return ProfileOperationStatus::state_unknown;
+        }
+        const detail::LinkQuery host{
+            production_->query_host_link("nll-host", deadline)};
+        const detail::LinkQuery misplaced_session{
+            production_->query_host_link("nll-app", deadline)};
+        const detail::LinkQuery session{
+            production_->query_namespace_link(
+                *namespace_proof.exact_handle_, "nll-app", deadline)};
+        if (!valid_placed_pair(host, misplaced_session, session)
+            || !host.identity || !session.identity
+            || *host.identity != veth_proof.identity_->host
+            || *session.identity != veth_proof.identity_->session) {
+            return ProfileOperationStatus::state_unknown;
+        }
+
+        const TrustedToolLookup tc{find_trusted_tool(*platform_, "tc")};
+        if (!tc.query_succeeded) {
+            return ProfileOperationStatus::failed_before_mutation;
+        }
+        if (!tc.path.has_value()) {
+            return ProfileOperationStatus::failed_before_mutation;
+        }
+
+        const bool outbound{direction == TrafficDirection::outbound};
+        const DirectionSettings* const settings{
+            outbound ? &profile.outbound : &profile.inbound};
+        const std::string_view device{outbound ? "nll-app" : "nll-host"};
+        std::vector<std::string> arguments{
+            "qdisc", "replace", "dev", std::string{device}, "root"};
+        if (settings->bandwidth_kbps.has_value()) {
+            return ProfileOperationStatus::failed_before_mutation;
+        }
+        if (settings->delay.count() == 0 && settings->jitter.count() == 0
+            && settings->packet_loss_percent == 0.0) {
+            arguments.emplace_back("noqueue");
+        } else {
+            arguments.emplace_back("handle");
+            arguments.emplace_back("1:");
+            arguments.emplace_back("netem");
+            if (settings->delay.count() > 0 || settings->jitter.count() > 0) {
+                arguments.emplace_back("delay");
+                arguments.emplace_back(std::to_string(settings->delay.count()) + "ms");
+                if (settings->jitter.count() > 0) {
+                    arguments.emplace_back(
+                        std::to_string(settings->jitter.count()) + "ms");
+                }
+            }
+            if (settings->packet_loss_percent > 0.0) {
+                std::array<char, 64> value{};
+                const auto converted{std::to_chars(
+                    value.data(), value.data() + value.size(),
+                    settings->packet_loss_percent, std::chars_format::general,
+                    std::numeric_limits<double>::max_digits10)};
+                if (converted.ec != std::errc{}) {
+                    return ProfileOperationStatus::failed_before_mutation;
+                }
+                arguments.emplace_back("loss");
+                arguments.emplace_back(
+                    std::string{value.data(), converted.ptr} + "%");
+            }
+        }
+
+        const CommandResult command = outbound
+            ? production_->run_tool_in_namespace(
+                  *tc.path, arguments, *namespace_proof.exact_handle_, deadline)
+            : production_->run_tool(*tc.path, arguments, deadline);
+        return command.kind == CommandResultKind::success
+            ? ProfileOperationStatus::applied
+            : ProfileOperationStatus::failed_after_mutation;
     }
 
     [[nodiscard]] ConnectivityMutationResult configure_connectivity(
@@ -2081,6 +2204,15 @@ public:
         return {CommandResultKind::system_failure, 0, {}};
     }
 
+    [[nodiscard]] CommandResult run_tool_in_namespace(
+        std::string_view,
+        std::span<const std::string>,
+        const detail::NamespaceHandle&,
+        TimePoint) override
+    {
+        return {CommandResultKind::system_failure, 0, {}};
+    }
+
     [[nodiscard]] std::optional<bool> ipv4_forwarding_enabled() override
     {
         return std::nullopt;
@@ -2187,6 +2319,8 @@ struct OwnerState {
     NamespaceState namespace_root;
     VethState veth_root;
     ConnectivityState connectivity_root;
+    NetworkProfile confirmed_profile;
+    bool profile_state_unknown{};
 };
 
 struct PreparationAccess {
@@ -2424,6 +2558,69 @@ std::optional<Failure> PreparedNetworkEnvironment::validate_connectivity() const
         return std::nullopt;
     }
     return Failure{Stage::internet_connectivity, validation.cause};
+}
+
+ProfileApplyResult PreparedNetworkEnvironment::apply_change(
+    const ProfileChange& change)
+{
+    if (!state_ || !state_->runtime) {
+        return ProfileApplyResult::state_unknown;
+    }
+    if (state_->profile_state_unknown) {
+        return ProfileApplyResult::state_unknown;
+    }
+    if (std::holds_alternative<SetBandwidth>(change)) {
+        return ProfileApplyResult::restored_after_failure;
+    }
+    const ProfileChangeApplication application{
+        netlaglab::apply_profile_change(state_->confirmed_profile, change)};
+    const auto* candidate{std::get_if<NetworkProfile>(&application)};
+    if (candidate == nullptr || candidate->outbound.bandwidth_kbps.has_value()
+        || candidate->inbound.bandwidth_kbps.has_value()) {
+        return ProfileApplyResult::restored_after_failure;
+    }
+
+    TrafficDirection direction{};
+    std::visit([&direction](const auto& operation) {
+        direction = operation.direction;
+    }, change);
+    const auto* reset{std::get_if<ResetSetting>(&change)};
+    if (*candidate == state_->confirmed_profile && reset != nullptr
+        && reset->setting == NetworkSetting::bandwidth) {
+        return ProfileApplyResult::applied;
+    }
+
+    const auto* namespace_proof{std::get_if<NamespaceProof>(
+        &state_->namespace_root)};
+    const auto* veth_proof{std::get_if<PlacedVethProof>(&state_->veth_root)};
+    if (namespace_proof == nullptr || veth_proof == nullptr) {
+        state_->profile_state_unknown = true;
+        return ProfileApplyResult::state_unknown;
+    }
+    const auto now{state_->runtime->clock->now()};
+    const ProfileOperationStatus attempt{state_->runtime->adapter->apply_profile(
+        *candidate, direction, *namespace_proof, *veth_proof, false,
+        now + operation_limit)};
+    if (attempt == ProfileOperationStatus::applied) {
+        state_->confirmed_profile = *candidate;
+        return ProfileApplyResult::applied;
+    }
+    if (attempt == ProfileOperationStatus::failed_before_mutation) {
+        return ProfileApplyResult::restored_after_failure;
+    }
+    if (attempt == ProfileOperationStatus::state_unknown) {
+        state_->profile_state_unknown = true;
+        return ProfileApplyResult::state_unknown;
+    }
+
+    const ProfileOperationStatus rollback{state_->runtime->adapter->apply_profile(
+        state_->confirmed_profile, direction, *namespace_proof, *veth_proof,
+        true, state_->runtime->clock->now() + operation_limit)};
+    if (rollback == ProfileOperationStatus::applied) {
+        return ProfileApplyResult::restored_after_failure;
+    }
+    state_->profile_state_unknown = true;
+    return ProfileApplyResult::state_unknown;
 }
 
 CleanupResult PreparedNetworkEnvironment::cleanup() &&

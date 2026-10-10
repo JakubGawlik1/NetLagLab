@@ -21,6 +21,8 @@ enum class Operation {
     add_default_route,
     configure_connectivity,
     validate_connectivity,
+    apply_profile,
+    restore_profile,
     remove_connectivity,
     remove_veth,
     remove_namespace,

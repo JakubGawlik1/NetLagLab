@@ -6,9 +6,11 @@ The Controller control plane is implemented as one Session-scoped event/action
 module. It owns command framing, a bounded queue, reply ownership, the last
 helper-confirmed Network Profile, and public running/stopping state. Valid
 `set` and `reset` commands are dispatched to the helper and complete only after
-its typed result. The current production adapter reports every change as
-restored after failure because real shaping is still absent; therefore
-production status truthfully remains unrestricted and `shaping: not applied`.
+its typed result. The production helper applies delay, jitter, and packet loss
+through the prepared Network Environment. It confirms successful qdisc
+operations, restores the previous qdisc after a recoverable failure, and ends
+the Session if it cannot establish the actual state. Bandwidth remains
+unsupported.
 
 ## Role and ownership
 
@@ -153,9 +155,9 @@ precedence:
 The parser replaced direct command-string comparisons without taking ownership
 of transport or Session state. Existing `help`, `status`, `stop`, and `detach`
 behavior remains unchanged. A valid Profile Change enters the serialized
-helper-dispatch path. `help` advertises only commands that can produce a real
-applied result, so it does not list `set` or `reset` until the runtime shaping
-backend exists.
+helper-dispatch path. `help` advertises directional delay, jitter, packet loss,
+and reset commands now that the runtime adapter can apply them. Bandwidth
+remains unsupported and is identified in the help text.
 
 ### Parser error presentation
 
@@ -306,6 +308,8 @@ The status shaping flag starts as `shaping: not applied`. The first
 helper-confirmed `PROFILE_OK` changes it to `shaping: applied`. A reversible
 failure preserves the flag as well as the preceding profile: it remains `not
 applied` before any success and `applied` after a previously confirmed success.
+Resetting the last impairment leaves shaping applied with an unrestricted
+profile.
 
 Target status contains:
 

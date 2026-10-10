@@ -462,8 +462,11 @@ constexpr std::string_view help_response{
     "HELP_BEGIN\n"
     "help - Show controller commands\n"
     "status - Show the active session\n"
+    "set - Set directional delay, jitter, or packet loss\n"
+    "reset - Reset a directional delay, jitter, or packet loss\n"
     "stop - Stop the active Workload\n"
     "detach - Disconnect this controller\n"
+    "Bandwidth changes are not supported.\n"
     "HELP_END\n"};
 
 void append_before_dispatch(

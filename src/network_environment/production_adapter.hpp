@@ -58,6 +58,11 @@ public:
         std::string_view executable_path,
         std::span<const std::string> arguments,
         std::chrono::steady_clock::time_point deadline) = 0;
+    [[nodiscard]] virtual CommandResult run_tool_in_namespace(
+        std::string_view executable_path,
+        std::span<const std::string> arguments,
+        const NamespaceHandle& namespace_handle,
+        std::chrono::steady_clock::time_point deadline) = 0;
     [[nodiscard]] virtual std::optional<bool> ipv4_forwarding_enabled() = 0;
     [[nodiscard]] virtual std::optional<bool> legacy_iptables_rules_present() = 0;
     [[nodiscard]] virtual bool request_firewall_consent(

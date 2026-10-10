@@ -378,14 +378,31 @@ struct InvokingIds {
     return workload.wait().has_value();
 }
 
-class RestoreOnlyProfileChangeAdapter final
+class SessionProfileChangeAdapter final
     : public netlaglab::ProfileChangeAdapter {
 public:
-    netlaglab::ProfileChangeCompletion apply(
-        const netlaglab::ProfileChange&) override
+    explicit SessionProfileChangeAdapter(
+        netlaglab::network_environment::PreparedNetworkEnvironment& environment)
+        : environment_{environment}
     {
-        return netlaglab::ProfileChangeCompletion::restored_after_failure;
     }
+
+    netlaglab::ProfileChangeCompletion apply(
+        const netlaglab::ProfileChange& change) override
+    {
+        switch (environment_.apply_change(change)) {
+        case netlaglab::network_environment::ProfileApplyResult::applied:
+            return netlaglab::ProfileChangeCompletion::applied;
+        case netlaglab::network_environment::ProfileApplyResult::restored_after_failure:
+            return netlaglab::ProfileChangeCompletion::restored_after_failure;
+        case netlaglab::network_environment::ProfileApplyResult::state_unknown:
+            return netlaglab::ProfileChangeCompletion::state_unknown;
+        }
+        return netlaglab::ProfileChangeCompletion::state_unknown;
+    }
+
+private:
+    netlaglab::network_environment::PreparedNetworkEnvironment& environment_;
 };
 
 [[nodiscard]] int supervise_workload(
@@ -395,7 +412,7 @@ public:
     std::ostream& error)
 {
     netlaglab::HelperRuntimeConversation conversation;
-    RestoreOnlyProfileChangeAdapter profile_change_adapter;
+    SessionProfileChangeAdapter profile_change_adapter{environment};
     auto next_connectivity_check{std::chrono::steady_clock::now() + 1s};
     bool connectivity_checks_enabled{true};
     while (true) {

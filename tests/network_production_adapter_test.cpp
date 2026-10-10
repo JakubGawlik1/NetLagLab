@@ -364,6 +364,27 @@ public:
         return {CommandResultKind::success, 0, {}, {}};
     }
 
+    [[nodiscard]] CommandResult run_tool_in_namespace(
+        const std::string_view executable_path,
+        const std::span<const std::string> arguments,
+        const NamespaceHandle& namespace_handle,
+        std::chrono::steady_clock::time_point) override
+    {
+        recorded_tools.push_back({
+            std::string{executable_path},
+            {arguments.begin(), arguments.end()},
+            &namespace_handle,
+            true,
+        });
+        trace->recorded_tools.push_back(recorded_tools.back());
+        if (!tool_commands.empty()) {
+            CommandResult result{std::move(tool_commands.front())};
+            tool_commands.pop_front();
+            return result;
+        }
+        return {CommandResultKind::success, 0, {}, {}};
+    }
+
     [[nodiscard]] std::optional<bool> ipv4_forwarding_enabled() override
     {
         return forwarding_enabled;
@@ -494,6 +515,18 @@ void queue_absent_placed_pair(FakeProductionPlatform& platform)
     platform.namespace_links.push_back(absent_link());
 }
 
+void queue_successful_preparation(FakeProductionPlatform& platform)
+{
+    for (int index{}; index < 11; ++index) {
+        platform.commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(platform);
+    queue_namespace_cleanup(platform);
+    queue_host_pair(platform);
+    queue_placed_pair(platform);
+    queue_placed_pair(platform);
+}
+
 TEST(NetworkProductionAdapterTest, ConfiguresTheCompleteFixedTopology)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
@@ -565,6 +598,201 @@ TEST(NetworkProductionAdapterTest, ConfiguresTheCompleteFixedTopology)
             "iifname", "\"nll-host\"", "ip", "saddr", "10.200.0.2/32",
             "counter", "masquerade", "comment",
             "\"netlaglab:" + nat_rule->arguments[3].substr(10) + "\""}));
+}
+
+TEST(NetworkProductionAdapterTest, AppliesOutboundDelayOnTheExactNamespaceLink)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    FakeProductionPlatform* const platform{production.get()};
+    const auto observed{production->trace};
+    queue_successful_preparation(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    const std::size_t tool_count_before_bandwidth{observed->recorded_tools.size()};
+    EXPECT_EQ(environment->apply_change(SetBandwidth{
+                  TrafficDirection::outbound, 5000}),
+        ProfileApplyResult::restored_after_failure);
+    EXPECT_EQ(observed->recorded_tools.size(), tool_count_before_bandwidth);
+    EXPECT_EQ(environment->apply_change(SetDelay{
+                  TrafficDirection::outbound, std::chrono::milliseconds{0}}),
+        ProfileApplyResult::applied);
+    EXPECT_EQ(observed->recorded_tools.back().arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-app", "root", "noqueue"}));
+    EXPECT_EQ(environment->apply_change(SetDelay{
+                  TrafficDirection::outbound, std::chrono::milliseconds{35}}),
+        ProfileApplyResult::applied);
+
+    ASSERT_FALSE(observed->recorded_tools.empty());
+    const RecordedCommand& command{observed->recorded_tools.back()};
+    EXPECT_EQ(command.executable, "/usr/sbin/tc");
+    EXPECT_EQ(command.arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-app", "root", "handle", "1:",
+            "netem", "delay", "35ms"}));
+    EXPECT_TRUE(command.enters_namespace);
+    ASSERT_FALSE(observed->recorded_link_queries.empty());
+    EXPECT_EQ(observed->recorded_link_queries.back().name, "nll-app");
+    EXPECT_NE(observed->recorded_link_queries.back().namespace_handle, nullptr);
+    EXPECT_TRUE(platform->tool_commands.empty());
+    EXPECT_EQ(environment->apply_change(
+                  ResetSetting{TrafficDirection::outbound, NetworkSetting::delay}),
+        ProfileApplyResult::applied);
+    EXPECT_EQ(observed->recorded_tools.back().arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-app", "root", "noqueue"}));
+}
+
+TEST(NetworkProductionAdapterTest, AppliesInboundJitterAndPacketLossOnHostEgress)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    queue_successful_preparation(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    ASSERT_EQ(environment->apply_change(SetJitter{
+                  TrafficDirection::inbound, std::chrono::milliseconds{8}}),
+        ProfileApplyResult::applied);
+    ASSERT_EQ(environment->apply_change(SetPacketLoss{
+                  TrafficDirection::inbound, 1.5}), ProfileApplyResult::applied);
+
+    ASSERT_GE(observed->recorded_tools.size(), 2U);
+    EXPECT_EQ(observed->recorded_tools[observed->recorded_tools.size() - 2].arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-host", "root", "handle", "1:",
+            "netem", "delay", "0ms", "8ms"}));
+    EXPECT_FALSE(observed->recorded_tools[observed->recorded_tools.size() - 2]
+                     .enters_namespace);
+    EXPECT_EQ(observed->recorded_tools.back().arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-host", "root", "handle", "1:",
+            "netem", "delay", "0ms", "8ms", "loss", "1.5%"}));
+    EXPECT_EQ(environment->apply_change(
+                  ResetSetting{TrafficDirection::inbound, NetworkSetting::jitter}),
+        ProfileApplyResult::applied);
+    EXPECT_EQ(observed->recorded_tools.back().arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-host", "root", "handle", "1:",
+            "netem", "loss", "1.5%"}));
+    EXPECT_EQ(environment->apply_change(ResetSetting{
+                  TrafficDirection::inbound, NetworkSetting::packet_loss}),
+        ProfileApplyResult::applied);
+    EXPECT_EQ(observed->recorded_tools.back().arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-host", "root", "noqueue"}));
+}
+
+TEST(NetworkProductionAdapterTest, DirectionalChangesPreserveTheOtherDirection)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    queue_successful_preparation(*production);
+    for (int index{}; index < 3; ++index) {
+        queue_placed_pair(*production);
+    }
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    ASSERT_EQ(environment->apply_change(SetDelay{
+                  TrafficDirection::outbound, std::chrono::milliseconds{35}}),
+        ProfileApplyResult::applied);
+    ASSERT_EQ(environment->apply_change(SetPacketLoss{
+                  TrafficDirection::inbound, 1.0}), ProfileApplyResult::applied);
+    ASSERT_EQ(environment->apply_change(SetJitter{
+                  TrafficDirection::outbound, std::chrono::milliseconds{5}}),
+        ProfileApplyResult::applied);
+
+    ASSERT_GE(observed->recorded_tools.size(), 3U);
+    EXPECT_EQ(observed->recorded_tools.back().arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-app", "root", "handle", "1:",
+            "netem", "delay", "35ms", "5ms"}));
+    EXPECT_TRUE(observed->recorded_tools.back().enters_namespace);
+}
+
+TEST(NetworkProductionAdapterTest, RestoresTheConfirmedProfileAfterAnAmbiguousTcFailure)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    FakeProductionPlatform* const platform{production.get()};
+    const auto observed{production->trace};
+    queue_successful_preparation(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    EXPECT_EQ(environment->apply_change(SetDelay{
+                  TrafficDirection::outbound, std::chrono::milliseconds{35}}),
+        ProfileApplyResult::applied);
+    platform->tool_commands.push_back(
+        {CommandResultKind::timeout, 0, "operation timed out"});
+    platform->tool_commands.push_back({CommandResultKind::success, 0, {}});
+
+    EXPECT_EQ(environment->apply_change(SetPacketLoss{
+                  TrafficDirection::outbound, 2.0}),
+        ProfileApplyResult::restored_after_failure);
+
+    ASSERT_GE(observed->recorded_tools.size(), 3U);
+    EXPECT_EQ(observed->recorded_tools[observed->recorded_tools.size() - 2]
+                  .arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-app", "root", "handle", "1:",
+            "netem", "delay", "35ms", "loss", "2%"}));
+    EXPECT_EQ(observed->recorded_tools.back().arguments,
+        (std::vector<std::string>{
+            "qdisc", "replace", "dev", "nll-app", "root", "handle", "1:",
+            "netem", "delay", "35ms"}));
+}
+
+TEST(NetworkProductionAdapterTest, FailedRestorationMakesTheProfileUnknown)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    FakeProductionPlatform* const platform{production.get()};
+    queue_successful_preparation(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    platform->tool_commands.push_back(
+        {CommandResultKind::timeout, 0, "operation timed out"});
+    platform->tool_commands.push_back(
+        {CommandResultKind::nonzero_exit, 2, "restoration failed"});
+
+    EXPECT_EQ(environment->apply_change(SetDelay{
+                  TrafficDirection::inbound, std::chrono::milliseconds{20}}),
+        ProfileApplyResult::state_unknown);
+    const std::size_t tools_after_unknown{platform->recorded_tools.size()};
+    EXPECT_EQ(environment->apply_change(SetPacketLoss{
+                  TrafficDirection::outbound, 1.0}),
+        ProfileApplyResult::state_unknown);
+    EXPECT_EQ(platform->recorded_tools.size(), tools_after_unknown);
 }
 
 TEST(NetworkProductionAdapterTest, RefusesCustomIpv4PolicyRouting)

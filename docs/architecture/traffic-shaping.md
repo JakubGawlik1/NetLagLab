@@ -3,14 +3,12 @@
 ## Status
 
 The code contains typed outbound and inbound profile settings, validation, and
-an integrated Controller-to-helper Profile Change path. Status owns the last
-helper-confirmed profile. The production restore-only adapter cannot confirm a
-change, so status remains unrestricted and reports `shaping: not applied`.
-Delay, jitter, and loss were exercised manually with `tc/netem`; bandwidth
-limiting was not established by that experiment.
-
-The semantics and Profile Change rules below are accepted target design. Runtime
-qdisc application and live updates are not implemented.
+an integrated Controller-to-helper Profile Change path. The helper applies
+delay, jitter, and packet loss through bounded `tc/netem` operations on the
+proven Session veth pair. Status owns the last helper-confirmed profile. The
+production path has deterministic adapter coverage; real privileged
+directional qualification has not been run for this change. Bandwidth limiting
+remains unsupported.
 
 ## Network Profile meaning
 
@@ -93,9 +91,9 @@ sending CLI text or replacing a full profile.
 Controller-owned type or a separate wire DTO. One pure domain operation applies
 a Profile Change to a supplied Network Profile and returns the resulting
 profile. The operation performs no I/O and does not decide whether a change is
-confirmed. The Supervisor calls it only after `PROFILE_OK`; the future shaping
-backend may use the same operation to track the preceding confirmed state it
-must restore after failure.
+confirmed. The Supervisor calls it only after `PROFILE_OK`; the prepared
+Network Environment uses it to track and restore its preceding confirmed
+profile after failure.
 
 The operation validates the complete resulting profile and returns
 `std::variant<NetworkProfile, std::vector<ValidationError>>`. The error
@@ -110,16 +108,19 @@ For every delta:
 1. The Supervisor retains the previous confirmed Network Profile and marks one
    operation in flight internally.
 2. The helper validates the operation against its state.
-3. The helper applies all privileged changes needed for that one setting.
+3. The helper validates the exact retained namespace and both veth identities,
+   then applies one complete directional qdisc with a trusted fixed-path `tc`.
 4. Only after complete success does the helper acknowledge the operation.
 5. Only after acknowledgement does the Supervisor update its public profile
    and reply successfully to the Controller.
 
 Sequential commands do not make a multi-step `tc` change atomic: one system
 operation can succeed and a later one fail. The helper must keep enough private
-state to restore the preceding confirmed configuration. If rollback fails or
-the actual qdisc state becomes unknown, the Session fails and proceeds to
-cleanup.
+state to restore the preceding confirmed configuration. Attempt and rollback
+each have a separate bounded command deadline. If rollback fails or the
+interface identity can no longer be proven, the Session fails and proceeds to
+cleanup. The qdiscs are attached to the Session-owned veth links and are removed
+with those links during Network Environment cleanup.
 
 ## Workload exit race
 
@@ -137,11 +138,10 @@ ping can conceal direction. It did not prove production rollback, live profile
 updates, bandwidth limiting, Controller behavior, helper protocol behavior, or
 cleanup.
 
-## Open implementation design
+## Remaining qualification
 
-- The exact fixed C++ operations and qdisc command/netlink realization behind
-  each typed Profile Change.
-- How bandwidth limiting composes with netem while preserving transactional
-  replacement and rollback.
-- Focused privileged verification for each direction and each supported
-  setting, separately authorized from normal unit tests.
+- Run focused privileged verification for each direction and supported
+  setting, separately authorized from ordinary automated tests. Use asymmetric
+  controlled traffic so delay, jitter, and loss evidence identifies the
+  direction being exercised.
+- Bandwidth limiting and its composition with netem remain out of scope.

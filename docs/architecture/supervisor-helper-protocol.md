@@ -217,13 +217,12 @@ and the Session result, but not for lifecycle cleanup. It maps to the dedicated
 `PROFILE_STATE`; the conversation still carries stop escalation, the Workload
 terminal result, and `CLEANUP_OK` or `CLEANUP_FAILED`.
 
-The Controller control-plane checkpoint does not broaden into runtime shaping.
-Until a real shaping adapter exists, the production helper completes every
-valid Profile Change immediately as `restored_after_failure`. Because it makes
-no privileged mutation, it can prove that the preceding unrestricted state was
-retained. It must not silently discard the command or claim `applied`. Focused
-tests inject an in-memory adapter to exercise the successful path; production
-can produce `applied` only after the runtime shaping backend is integrated.
+The production helper routes each valid Profile Change to the Session-owned
+Network Environment. It reports `applied` only after `tc` confirms the complete
+directional qdisc, `restored_after_failure` only after a bounded rollback
+succeeds, and `state_unknown` when the link proof or rollback is unavailable.
+The existing conversation preserves stop escalation, Workload-terminal, and
+cleanup handling after `state_unknown`.
 
 The helper conversation continues framing input while a Profile Change result
 is pending. It retains an incomplete suffix, returns complete stop or
@@ -322,8 +321,7 @@ The accepted checkpoint is complete when focused unprivileged tests prove:
   behavior remains covered and unchanged.
 
 The conversation checkpoint is now connected to the Controller control plane.
-Valid `set` and `reset` commands cross the typed helper boundary, while the
-production restore-only adapter returns `restored_after_failure` until a real
-shaping backend exists. Status therefore continues to report `shaping: not
-applied`. Real `sudo`/PTY and privileged shaping coverage remains a separately
-authorized qualification concern.
+Valid `set` and `reset` commands cross the typed helper boundary and update
+public status only after the helper confirms them. Real `sudo`/PTY and
+privileged shaping coverage remains a separately authorized qualification
+concern.

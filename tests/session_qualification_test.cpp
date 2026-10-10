@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -20,6 +21,7 @@
 #include <net/if.h>
 #include <netdb.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <poll.h>
 #include <set>
@@ -27,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -64,6 +67,10 @@ constexpr std::string_view probe_stderr{"NLL_SESSION_PROBE_STDERR\n"};
 constexpr std::string_view udp_result_prefix{"NLL_SESSION_PROBE_UDP:"};
 constexpr std::string_view connectivity_result_prefix{
     "NLL_SESSION_PROBE_CONNECTIVITY:"};
+constexpr std::string_view traffic_sample_prefix{"NLL_SESSION_TRAFFIC:"};
+constexpr std::string_view inbound_traffic_prefix{"NLL_SESSION_INBOUND:"};
+constexpr std::string_view outbound_probe_prefix{"nll-session-outbound:"};
+constexpr std::string_view inbound_probe_prefix{"nll-session-inbound:"};
 
 [[nodiscard]] int report_probe_failure(
     const int status,
@@ -259,7 +266,8 @@ extern "C" void handle_termination(int)
 
 [[nodiscard]] bool perform_udp_exchange(
     const std::uint16_t port,
-    const std::string_view token)
+    const std::string_view token,
+    const int timeout_milliseconds = 5000)
 {
     const int descriptor{socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
     if (descriptor == -1) {
@@ -288,7 +296,7 @@ extern "C" void handle_termination(int)
     pollfd watched{descriptor, POLLIN, 0};
     int ready{};
     do {
-        ready = poll(&watched, 1, 5000);
+        ready = poll(&watched, 1, timeout_milliseconds);
     } while (ready == -1 && errno == EINTR);
     char response[256]{};
     const ssize_t received{ready > 0 && (watched.revents & POLLIN) != 0
@@ -463,7 +471,8 @@ extern "C" void handle_termination(int)
     const std::string_view mode{argv[2]};
     const std::string_view port_text{argv[3]};
     const std::string_view token{argv[4]};
-    if (mode != "natural" && mode != "hold" && mode != "connectivity") {
+    if (mode != "natural" && mode != "hold" && mode != "connectivity"
+        && mode != "traffic") {
         return report_probe_failure(81, "unexpected probe mode");
     }
     std::uint64_t port_value{};
@@ -504,7 +513,7 @@ extern "C" void handle_termination(int)
     if (!udp_succeeded) {
         std::cerr << "Session qualification probe failed: bounded host UDP exchange failed\n";
     }
-    if (mode == "hold") {
+    if (mode == "hold" || mode == "traffic") {
         struct sigaction action {};
         action.sa_handler = handle_termination;
         sigemptyset(&action.sa_mask);
@@ -533,6 +542,69 @@ extern "C" void handle_termination(int)
     std::cerr.flush();
     if (mode == "natural") {
         return 37;
+    }
+    if (mode == "traffic") {
+        const int inbound_socket{socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+        if (inbound_socket == -1) {
+            return report_probe_failure(86, "could not create inbound traffic socket");
+        }
+        sockaddr_in inbound_address{};
+        inbound_address.sin_family = AF_INET;
+        inbound_address.sin_addr.s_addr = htonl(INADDR_ANY);
+        inbound_address.sin_port = htons(static_cast<std::uint16_t>(port_value));
+        if (bind(inbound_socket, reinterpret_cast<sockaddr*>(&inbound_address),
+                sizeof(inbound_address)) == -1) {
+            (void)close(inbound_socket);
+            return report_probe_failure(86, "could not bind inbound traffic socket");
+        }
+        sockaddr_in outbound_address{};
+        outbound_address.sin_family = AF_INET;
+        outbound_address.sin_port = htons(static_cast<std::uint16_t>(port_value));
+        if (inet_pton(AF_INET, "10.200.0.1", &outbound_address.sin_addr) != 1) {
+            (void)close(inbound_socket);
+            return report_probe_failure(86, "could not configure outbound traffic peer");
+        }
+        const std::string outbound_prefix{
+            std::string{outbound_probe_prefix} + std::string{token} + ':'};
+        const std::string inbound_prefix{
+            std::string{inbound_probe_prefix} + std::string{token} + ':'};
+        while (termination_requested == 0) {
+            const auto now{std::chrono::steady_clock::now()};
+            const auto timestamp{std::chrono::duration_cast<std::chrono::microseconds>(
+                now.time_since_epoch()).count()};
+            const std::string outbound{outbound_prefix + std::to_string(timestamp)};
+            const ssize_t sent{sendto(inbound_socket, outbound.data(), outbound.size(), 0,
+                reinterpret_cast<const sockaddr*>(&outbound_address),
+                sizeof(outbound_address))};
+            if (sent == static_cast<ssize_t>(outbound.size())) {
+                std::cout << traffic_sample_prefix << token << ':' << timestamp << '\n';
+            }
+            pollfd watched{inbound_socket, POLLIN, 0};
+            if (poll(&watched, 1, 0) > 0 && (watched.revents & POLLIN) != 0) {
+                char buffer[256]{};
+                const ssize_t size{recv(inbound_socket, buffer, sizeof(buffer), 0)};
+                if (size > 0) {
+                    const std::string_view message{buffer, static_cast<std::size_t>(size)};
+                    if (message.starts_with(inbound_prefix)) {
+                        std::int64_t sent_at{};
+                        const std::string_view value{message.substr(inbound_prefix.size())};
+                        const auto parsed{std::from_chars(
+                            value.data(), value.data() + value.size(), sent_at)};
+                        if (parsed.ec == std::errc{}
+                            && parsed.ptr == value.data() + value.size()) {
+                            const auto arrived{std::chrono::duration_cast<
+                                std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count()};
+                            std::cout << inbound_traffic_prefix << token << ':' << sent_at
+                                      << ':' << arrived << '\n';
+                        }
+                    }
+                }
+            }
+            std::cout.flush();
+            (void)poll(nullptr, 0, 20);
+        }
+        (void)close(inbound_socket);
     }
     while (termination_requested == 0) {
         (void)pause();
@@ -709,6 +781,12 @@ public:
     }
 
     [[nodiscard]] pid_t pid() const noexcept { return pid_; }
+
+    void drain_output(std::string& stdout_text, std::string& stderr_text)
+    {
+        (void)read_available(output_.get(), stdout_text);
+        (void)read_available(error_.get(), stderr_text);
+    }
 
     [[nodiscard]] bool wait_for_ready(
         const int udp_descriptor,
@@ -1008,6 +1086,120 @@ private:
     bool valid_{};
 };
 
+class UdpEchoPump {
+public:
+    struct Sample {
+        std::int64_t sent_at;
+        std::int64_t observed_at;
+    };
+
+    UdpEchoPump(const int descriptor, std::string token, const std::uint16_t port)
+        : descriptor_{descriptor}
+        , token_{std::move(token)}
+        , port_{port}
+        , worker_{[this] { run(); }}
+    {
+    }
+
+    UdpEchoPump(const UdpEchoPump&) = delete;
+    UdpEchoPump& operator=(const UdpEchoPump&) = delete;
+
+    [[nodiscard]] std::vector<Sample> outbound_samples() const
+    {
+        std::lock_guard lock{mutex_};
+        return outbound_samples_;
+    }
+
+    [[nodiscard]] std::vector<std::int64_t> inbound_sends() const
+    {
+        std::lock_guard lock{mutex_};
+        return inbound_sends_;
+    }
+
+    ~UdpEchoPump()
+    {
+        stopping_.store(true);
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+private:
+    void run()
+    {
+        const std::string outbound_prefix{
+            std::string{outbound_probe_prefix} + token_ + ':'};
+        const std::string inbound_prefix{
+            std::string{inbound_probe_prefix} + token_ + ':'};
+        in_addr expected_source{};
+        sockaddr_in inbound_peer{};
+        inbound_peer.sin_family = AF_INET;
+        inbound_peer.sin_port = htons(port_);
+        if (inet_pton(AF_INET, "10.200.0.2", &expected_source) != 1
+            || inet_pton(AF_INET, "10.200.0.2", &inbound_peer.sin_addr) != 1) {
+            return;
+        }
+        auto next_inbound_send{std::chrono::steady_clock::now()};
+        while (!stopping_.load()) {
+            const auto now{std::chrono::steady_clock::now()};
+            if (now >= next_inbound_send) {
+                const auto sent_at{std::chrono::duration_cast<std::chrono::microseconds>(
+                    now.time_since_epoch()).count()};
+                const std::string request{inbound_prefix + std::to_string(sent_at)};
+                if (sendto(descriptor_, request.data(), request.size(), 0,
+                        reinterpret_cast<const sockaddr*>(&inbound_peer),
+                        sizeof(inbound_peer)) == static_cast<ssize_t>(request.size())) {
+                    std::lock_guard lock{mutex_};
+                    inbound_sends_.push_back(sent_at);
+                }
+                next_inbound_send = now + 20ms;
+            }
+            pollfd watched{descriptor_, POLLIN, 0};
+            int ready{};
+            do {
+                ready = poll(&watched, 1, 5);
+            } while (ready == -1 && errno == EINTR);
+            if (ready <= 0 || (watched.revents & POLLIN) == 0) {
+                continue;
+            }
+            char buffer[256]{};
+            sockaddr_in peer{};
+            socklen_t peer_size{sizeof(peer)};
+            const ssize_t size{recvfrom(
+                descriptor_, buffer, sizeof(buffer), 0,
+                reinterpret_cast<sockaddr*>(&peer), &peer_size)};
+            if (size <= 0 || peer.sin_family != AF_INET || peer_size != sizeof(peer)
+                || peer.sin_addr.s_addr != expected_source.s_addr) {
+                continue;
+            }
+            const std::string_view message{buffer, static_cast<std::size_t>(size)};
+            if (!message.starts_with(outbound_prefix)) {
+                continue;
+            }
+            std::int64_t sent_at{};
+            const std::string_view value{message.substr(outbound_prefix.size())};
+            const auto parsed{std::from_chars(
+                value.data(), value.data() + value.size(), sent_at)};
+            if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size()) {
+                const auto observed_at{std::chrono::duration_cast<
+                    std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count()};
+                std::lock_guard lock{mutex_};
+                outbound_samples_.push_back({sent_at, observed_at});
+            }
+        }
+    }
+
+    int descriptor_;
+    std::string token_;
+    std::uint16_t port_;
+    mutable std::mutex mutex_;
+    std::vector<Sample> outbound_samples_;
+    std::vector<std::int64_t> inbound_sends_;
+    std::atomic_bool stopping_{};
+    std::thread worker_;
+};
+
 [[nodiscard]] bool namespace_roots_absent(std::uint64_t session_inode)
 {
     struct stat namespace_path {};
@@ -1243,10 +1435,12 @@ private:
     return false;
 }
 
-[[nodiscard]] std::optional<int> run_controller_stop(
+[[nodiscard]] std::optional<int> run_controller_input(
     const std::filesystem::path& working_directory,
+    const std::string_view input,
     std::string& stdout_text,
-    std::string& stderr_text)
+    std::string& stderr_text,
+    const std::chrono::milliseconds timeout = 15000ms)
 {
     const char* runtime_directory{std::getenv("XDG_RUNTIME_DIR")};
     if (runtime_directory == nullptr) {
@@ -1267,11 +1461,139 @@ private:
     if (!controller.start(
             {NETLAGLAB_EXECUTABLE_PATH, "attach"},
             working_directory,
-            "stop\n",
-            true)) {
+            input)) {
         return std::nullopt;
     }
-    return controller.wait_for_exit(stdout_text, stderr_text, 15000ms);
+    return controller.wait_for_exit(stdout_text, stderr_text, timeout);
+}
+
+[[nodiscard]] std::optional<int> run_controller_stop(
+    const std::filesystem::path& working_directory,
+    std::string& stdout_text,
+    std::string& stderr_text)
+{
+    return run_controller_input(
+        working_directory, "stop\n", stdout_text, stderr_text);
+}
+
+struct TrafficSample {
+    std::int64_t sent_at;
+    std::int64_t observed_at;
+};
+
+[[nodiscard]] std::optional<std::int64_t> parse_signed(
+    const std::string_view text)
+{
+    std::int64_t value{};
+    const auto parsed{std::from_chars(text.data(), text.data() + text.size(), value)};
+    return !text.empty() && parsed.ec == std::errc{}
+            && parsed.ptr == text.data() + text.size()
+        ? std::optional<std::int64_t>{value}
+        : std::nullopt;
+}
+
+[[nodiscard]] std::vector<std::int64_t> parse_traffic_sends(
+    const std::string_view output,
+    const std::string_view token)
+{
+    std::vector<std::int64_t> samples;
+    const std::string prefix{std::string{traffic_sample_prefix} + std::string{token} + ':'};
+    std::size_t beginning{};
+    while (beginning < output.size()) {
+        const std::size_t ending{output.find('\n', beginning)};
+        if (ending == std::string_view::npos) {
+            break;
+        }
+        const std::string_view line{output.substr(beginning, ending - beginning)};
+        beginning = ending + 1U;
+        if (!line.starts_with(prefix)) {
+            continue;
+        }
+        const std::string_view fields{line.substr(prefix.size())};
+        const auto timestamp{parse_signed(fields)};
+        if (timestamp.has_value()) {
+            samples.push_back(*timestamp);
+        }
+    }
+    return samples;
+}
+
+[[nodiscard]] std::vector<TrafficSample> parse_inbound_samples(
+    const std::string_view output,
+    const std::string_view token)
+{
+    std::vector<TrafficSample> samples;
+    const std::string prefix{
+        std::string{inbound_traffic_prefix} + std::string{token} + ':'};
+    std::size_t beginning{};
+    while (beginning < output.size()) {
+        const std::size_t ending{output.find('\n', beginning)};
+        if (ending == std::string_view::npos) {
+            break;
+        }
+        const std::string_view line{output.substr(beginning, ending - beginning)};
+        beginning = ending + 1U;
+        if (!line.starts_with(prefix)) {
+            continue;
+        }
+        const std::string_view fields{line.substr(prefix.size())};
+        const std::size_t separator{fields.find(':')};
+        if (separator == std::string_view::npos) {
+            continue;
+        }
+        const auto sent{parse_signed(fields.substr(0, separator))};
+        const auto arrived{parse_signed(fields.substr(separator + 1U))};
+        if (sent.has_value() && arrived.has_value()) {
+            samples.push_back({*sent, *arrived});
+        }
+    }
+    return samples;
+}
+
+[[nodiscard]] std::int64_t monotonic_microseconds()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+[[nodiscard]] std::vector<std::int64_t> delays_in(
+    const std::vector<TrafficSample>& samples,
+    const std::int64_t beginning,
+    const std::int64_t ending)
+{
+    std::vector<std::int64_t> elapsed;
+    for (const TrafficSample& sample : samples) {
+        if (sample.sent_at >= beginning && sample.sent_at <= ending) {
+            elapsed.push_back(sample.observed_at - sample.sent_at);
+        }
+    }
+    std::sort(elapsed.begin(), elapsed.end());
+    return elapsed;
+}
+
+[[nodiscard]] std::size_t timestamps_in(
+    const std::vector<std::int64_t>& samples,
+    const std::int64_t beginning,
+    const std::int64_t ending)
+{
+    return static_cast<std::size_t>(std::count_if(samples.begin(), samples.end(),
+        [beginning, ending](const std::int64_t sample) {
+            return sample >= beginning && sample <= ending;
+        }));
+}
+
+[[nodiscard]] double directional_loss_fraction(
+    const std::vector<std::int64_t>& sent,
+    const std::vector<std::int64_t>& observed,
+    const std::int64_t beginning,
+    const std::int64_t ending,
+    std::size_t& count)
+{
+    count = timestamps_in(sent, beginning, ending);
+    const std::size_t received{timestamps_in(observed, beginning, ending)};
+    return count == 0U ? 0.0
+                       : static_cast<double>(count - std::min(count, received))
+                           / static_cast<double>(count);
 }
 
 TEST(SessionNetworkQualification, NaturalExitPreservesContextUdpAndCleanup)
@@ -1363,6 +1685,278 @@ TEST(SessionConnectivityQualification, ReportsDnsTcpAndUdpSeparately)
     EXPECT_NE(results.find("dns=passed"), std::string_view::npos) << results;
     EXPECT_NE(results.find("tcp=passed"), std::string_view::npos) << results;
     EXPECT_NE(results.find("udp=passed"), std::string_view::npos) << results;
+}
+
+TEST(TrafficShapingQualification, MeasuresDirectionalDelayJitterLossAndReset)
+{
+    if (!has_authorization()) {
+        GTEST_SKIP() << "set NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 only for an explicitly "
+                        "authorized local networking qualification";
+    }
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "run this CTest directly as root; the qualification harness "
+                        "does not invoke sudo";
+    }
+    Scenario scenario;
+    ASSERT_TRUE(scenario.valid());
+    ChildProcess session;
+    std::string session_output;
+    std::string session_error;
+    std::uint64_t session_inode{};
+    bool host_peer_received_datagram{};
+    bool udp_exchange_succeeded{};
+    ASSERT_TRUE(scenario.launch_and_wait_for_probe(
+        session,
+        "traffic",
+        session_output,
+        session_error,
+        session_inode,
+        host_peer_received_datagram,
+        udp_exchange_succeeded))
+        << "Workload did not report readiness for controlled UDP traffic\n"
+        << session_error << session_output;
+    ASSERT_TRUE(udp_exchange_succeeded);
+    UdpEchoPump echo_pump{
+        scenario.udp_descriptor(), scenario.token(), scenario.port()};
+    std::jthread output_drain_thread{[&](const std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            session.drain_output(session_output, session_error);
+            (void)poll(nullptr, 0, 20);
+        }
+        session.drain_output(session_output, session_error);
+    }};
+
+    const std::int64_t traffic_beginning{monotonic_microseconds()};
+    (void)poll(nullptr, 0, 1200);
+
+    const std::int64_t outbound_delay_command_beginning{monotonic_microseconds()};
+    std::string controller_output;
+    std::string controller_error;
+    const auto outbound_delay_status{run_controller_input(
+        scenario.work_directory(), "set outbound delay 80ms\nstatus\n",
+        controller_output, controller_error)};
+    const std::int64_t outbound_delay_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(outbound_delay_status.has_value()) << controller_error;
+    ASSERT_EQ(*outbound_delay_status, 0) << controller_error;
+    EXPECT_NE(controller_output.find("PROFILE_CHANGED\n"), std::string::npos)
+        << controller_output << controller_error;
+    EXPECT_NE(controller_output.find("shaping: applied\n"), std::string::npos)
+        << controller_output;
+    EXPECT_NE(controller_output.find("delay: 80 ms\n"), std::string::npos)
+        << controller_output;
+    (void)poll(nullptr, 0, 1500);
+
+    const std::int64_t outbound_reset_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto outbound_reset_status{run_controller_input(
+        scenario.work_directory(), "reset outbound delay\n",
+        controller_output, controller_error)};
+    const std::int64_t outbound_reset_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(outbound_reset_status.has_value()) << controller_error;
+    ASSERT_EQ(*outbound_reset_status, 0) << controller_error;
+    EXPECT_NE(controller_output.find("PROFILE_CHANGED\n"), std::string::npos)
+        << controller_output << controller_error;
+    (void)poll(nullptr, 0, 1200);
+
+    const std::int64_t inbound_delay_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto inbound_delay_status{run_controller_input(
+        scenario.work_directory(), "set inbound delay 120ms\n",
+        controller_output, controller_error)};
+    const std::int64_t inbound_delay_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(inbound_delay_status.has_value()) << controller_error;
+    ASSERT_EQ(*inbound_delay_status, 0) << controller_error;
+    (void)poll(nullptr, 0, 1500);
+
+    const std::int64_t inbound_reset_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto inbound_reset_status{run_controller_input(
+        scenario.work_directory(), "reset inbound delay\n",
+        controller_output, controller_error)};
+    const std::int64_t inbound_reset_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(inbound_reset_status.has_value()) << controller_error;
+    ASSERT_EQ(*inbound_reset_status, 0) << controller_error;
+    (void)poll(nullptr, 0, 1000);
+
+    const std::int64_t jitter_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto jitter_status{run_controller_input(
+        scenario.work_directory(), "set outbound jitter 30ms\n",
+        controller_output, controller_error)};
+    const std::int64_t jitter_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(jitter_status.has_value()) << controller_error;
+    ASSERT_EQ(*jitter_status, 0) << controller_error;
+    (void)poll(nullptr, 0, 2500);
+
+    const std::int64_t jitter_reset_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto jitter_reset_status{run_controller_input(
+        scenario.work_directory(), "reset outbound jitter\n",
+        controller_output, controller_error)};
+    const std::int64_t jitter_reset_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(jitter_reset_status.has_value()) << controller_error;
+    ASSERT_EQ(*jitter_reset_status, 0) << controller_error;
+
+    const std::int64_t outbound_loss_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto outbound_loss_status{run_controller_input(
+        scenario.work_directory(), "set outbound loss 40%\n",
+        controller_output, controller_error)};
+    const std::int64_t outbound_loss_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(outbound_loss_status.has_value()) << controller_error;
+    ASSERT_EQ(*outbound_loss_status, 0) << controller_error;
+    (void)poll(nullptr, 0, 8000);
+
+    const std::int64_t outbound_loss_reset_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto outbound_loss_reset_status{run_controller_input(
+        scenario.work_directory(), "reset outbound loss\n",
+        controller_output, controller_error)};
+    const std::int64_t outbound_loss_reset_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(outbound_loss_reset_status.has_value()) << controller_error;
+    ASSERT_EQ(*outbound_loss_reset_status, 0) << controller_error;
+    (void)poll(nullptr, 0, 1200);
+
+    const std::int64_t inbound_loss_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto inbound_loss_status{run_controller_input(
+        scenario.work_directory(), "set inbound loss 40%\n",
+        controller_output, controller_error)};
+    const std::int64_t inbound_loss_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(inbound_loss_status.has_value()) << controller_error;
+    ASSERT_EQ(*inbound_loss_status, 0) << controller_error;
+    (void)poll(nullptr, 0, 8000);
+
+    const std::int64_t inbound_loss_reset_beginning{monotonic_microseconds()};
+    controller_output.clear();
+    controller_error.clear();
+    const auto inbound_loss_reset_status{run_controller_input(
+        scenario.work_directory(), "reset inbound loss\n",
+        controller_output, controller_error)};
+    const std::int64_t inbound_loss_reset_confirmed{monotonic_microseconds()};
+    ASSERT_TRUE(inbound_loss_reset_status.has_value()) << controller_error;
+    ASSERT_EQ(*inbound_loss_reset_status, 0) << controller_error;
+    (void)poll(nullptr, 0, 1200);
+    const std::int64_t stop_beginning{monotonic_microseconds()};
+
+    controller_output.clear();
+    controller_error.clear();
+    const auto stop_status{run_controller_stop(
+        scenario.work_directory(), controller_output, controller_error)};
+    ASSERT_TRUE(stop_status.has_value()) << controller_error;
+    ASSERT_EQ(*stop_status, 0) << controller_error;
+    output_drain_thread.request_stop();
+    output_drain_thread.join();
+    const auto session_status{session.wait_for_exit(
+        session_output, session_error, 15000ms, &session_inode)};
+    ASSERT_TRUE(session_status.has_value()) << session_error;
+    EXPECT_EQ(*session_status, 0) << session_error;
+    ASSERT_TRUE(wait_for_cleanup(session_inode))
+        << "owned namespace/veth roots or the host lock remained after shaping";
+
+    const auto outbound_attempts{
+        parse_traffic_sends(session_output, scenario.token())};
+    const auto inbound_samples{
+        parse_inbound_samples(session_output, scenario.token())};
+    std::vector<TrafficSample> outbound_samples;
+    std::vector<std::int64_t> outbound_received;
+    for (const UdpEchoPump::Sample& sample : echo_pump.outbound_samples()) {
+        outbound_samples.push_back({sample.sent_at, sample.observed_at});
+        outbound_received.push_back(sample.sent_at);
+    }
+    std::vector<std::int64_t> inbound_received;
+    for (const TrafficSample& sample : inbound_samples) {
+        inbound_received.push_back(sample.sent_at);
+    }
+    const auto baseline_outbound{delays_in(
+        outbound_samples, traffic_beginning + 100000,
+        outbound_delay_command_beginning - 100000)};
+    const auto baseline_inbound{delays_in(
+        inbound_samples, traffic_beginning + 100000,
+        outbound_delay_command_beginning - 100000)};
+    const auto outbound_delay{delays_in(
+        outbound_samples, outbound_delay_confirmed + 100000,
+        outbound_reset_beginning - 100000)};
+    const auto reset_outbound{delays_in(
+        outbound_samples, outbound_reset_confirmed + 100000,
+        inbound_delay_beginning - 100000)};
+    const auto inbound_delay{delays_in(
+        inbound_samples, inbound_delay_confirmed + 100000,
+        inbound_reset_beginning - 100000)};
+    const auto reset_inbound{delays_in(
+        inbound_samples, inbound_reset_confirmed + 100000,
+        jitter_beginning - 100000)};
+    const auto jitter{delays_in(
+        outbound_samples, jitter_confirmed + 100000,
+        jitter_reset_beginning - 100000)};
+    const auto jitter_reset{delays_in(
+        outbound_samples, jitter_reset_confirmed + 100000,
+        outbound_loss_beginning - 100000)};
+    const auto inbound_attempts{echo_pump.inbound_sends()};
+    std::size_t outbound_loss_count{};
+    const double outbound_loss_fraction{directional_loss_fraction(
+        outbound_attempts, outbound_received,
+        outbound_loss_confirmed + 100000,
+        outbound_loss_reset_beginning - 100000, outbound_loss_count)};
+    std::size_t inbound_loss_count{};
+    const double inbound_loss_fraction{directional_loss_fraction(
+        inbound_attempts, inbound_received,
+        inbound_loss_confirmed + 100000,
+        inbound_loss_reset_beginning - 100000, inbound_loss_count)};
+    std::size_t outbound_loss_reset_count{};
+    const double outbound_loss_reset_fraction{directional_loss_fraction(
+        outbound_attempts, outbound_received,
+        outbound_loss_reset_confirmed + 100000,
+        inbound_loss_beginning - 100000, outbound_loss_reset_count)};
+    std::size_t inbound_loss_reset_count{};
+    const double inbound_loss_reset_fraction{directional_loss_fraction(
+        inbound_attempts, inbound_received,
+        inbound_loss_reset_confirmed + 100000,
+        stop_beginning - 100000, inbound_loss_reset_count)};
+
+    ASSERT_GE(baseline_outbound.size(), 8U) << "too few outbound baseline observations";
+    ASSERT_GE(baseline_inbound.size(), 8U) << "too few inbound baseline observations";
+    ASSERT_GE(outbound_delay.size(), 4U) << "too few outbound-delay observations";
+    ASSERT_GE(reset_outbound.size(), 4U) << "too few post-reset observations";
+    ASSERT_GE(inbound_delay.size(), 4U) << "too few inbound-delay observations";
+    ASSERT_GE(reset_inbound.size(), 4U) << "too few post-reset observations";
+    ASSERT_GE(jitter.size(), 8U) << "too few jitter observations";
+    ASSERT_GE(jitter_reset.size(), 4U) << "too few jitter-reset observations";
+    const std::int64_t outbound_baseline_median{
+        baseline_outbound[baseline_outbound.size() / 2U]};
+    const std::int64_t inbound_baseline_median{
+        baseline_inbound[baseline_inbound.size() / 2U]};
+    EXPECT_GE(outbound_delay[outbound_delay.size() / 2U],
+        outbound_baseline_median + 50000)
+        << "outbound one-way delay was not observed at the host receiver";
+    EXPECT_GE(inbound_delay[inbound_delay.size() / 2U],
+        inbound_baseline_median + 80000)
+        << "inbound one-way delay was not observed at the workload receiver";
+    EXPECT_LE(reset_outbound[reset_outbound.size() / 2U], outbound_baseline_median + 40000)
+        << "outbound delay remained after reset";
+    EXPECT_LE(reset_inbound[reset_inbound.size() / 2U], inbound_baseline_median + 40000)
+        << "inbound delay remained after reset";
+    EXPECT_GT(jitter.back() - jitter.front(), 5000)
+        << "outbound jitter did not produce a one-way delay spread";
+    EXPECT_GE(jitter_reset[jitter_reset.size() / 2U], outbound_baseline_median - 10000);
+    ASSERT_GE(outbound_loss_count, 20U) << "too few outbound-loss observations";
+    ASSERT_GE(inbound_loss_count, 20U) << "too few inbound-loss observations";
+    ASSERT_GE(outbound_loss_reset_count, 4U) << "too few outbound-loss-reset observations";
+    ASSERT_GE(inbound_loss_reset_count, 4U) << "too few inbound-loss-reset observations";
+    EXPECT_GE(outbound_loss_fraction, 0.15);
+    EXPECT_LE(outbound_loss_fraction, 0.70);
+    EXPECT_GE(inbound_loss_fraction, 0.15);
+    EXPECT_LE(inbound_loss_fraction, 0.70);
+    EXPECT_LE(outbound_loss_reset_fraction, 0.20);
+    EXPECT_LE(inbound_loss_reset_fraction, 0.20);
 }
 
 TEST(SessionNetworkQualification, ControllerStopReapsWorkloadBeforeCleanup)

@@ -71,9 +71,12 @@ cross-platform support are not current goals.
   `ControllerControlPlane` owns framing, a bounded serialized command queue,
   reply ownership, public running/stopping state, and the last helper-confirmed
   Network Profile. Its typed `set`/`reset` Profile Changes are dispatched
-  through independently validating Supervisor/helper conversations. Until a
-  real shaping backend exists, the production helper explicitly reports every
-  change as restored after failure, so status remains truthful. An attached Controller
+  through independently validating Supervisor/helper conversations. The
+  helper applies directional delay, jitter, and packet loss through bounded
+  `tc/netem` operations on the proven Session links, restores the preceding
+  confirmed profile after recoverable failure, and ends the Session if state
+  becomes unknown. Bandwidth remains unsupported; privileged directional
+  qualification is still pending. An attached Controller
   receives the complete typed Session Outcome after Supervisor cleanup and
   reports the Workload result independently from infrastructure failures.
 - Session paths and Unix sockets are validated for ownership, type, permissions,
@@ -100,7 +103,9 @@ cross-platform support are not current goals.
   cannot be confirmed. Scripted, filesystem, helper, and Workload tests cover
   the unprivileged contracts; end-to-end DNS/TCP/UDP behavior remains
   unqualified.
-- Typed outbound and inbound profiles exist, but no network shaping is applied.
+- Deterministic adapter tests cover directional delay, jitter, loss, rollback,
+  reset, and unsupported bandwidth; real privileged traffic qualification has
+  not been run for the shaping implementation.
 
 ## Candidate capabilities
 
@@ -110,7 +115,6 @@ current code whenever work begins.
 
 - Qualify the production Session DNS and scoped Internet connectivity paths
   across supported host resolver and firewall configurations.
-- Apply separate outbound and inbound shaping and allow live profile updates.
 - Record the settings timeline as JSON Lines for replay and reports.
 - Add a GUI over the same typed operations after the CLI/control path supports
   them.

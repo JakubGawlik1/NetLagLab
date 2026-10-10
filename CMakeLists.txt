@@ -25,6 +25,7 @@ add_library(
 )
 
 target_include_directories(netlaglab_network_environment PRIVATE src)
+target_link_libraries(netlaglab_network_environment PUBLIC netlaglab_core)
 target_compile_features(netlaglab_network_environment PUBLIC cxx_std_20)
 set_target_properties(
     netlaglab_network_environment

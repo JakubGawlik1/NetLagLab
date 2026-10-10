@@ -1,5 +1,7 @@
 #pragma once
 
+#include "netlaglab/network_profile.hpp"
+
 #include <memory>
 #include <optional>
 #include <string>
@@ -47,6 +49,12 @@ class NamespaceHandle;
 
 class CleanupResult;
 
+enum class ProfileApplyResult {
+    applied,
+    restored_after_failure,
+    state_unknown,
+};
+
 class WorkloadNamespaceEntry {
 public:
     WorkloadNamespaceEntry() noexcept = default;
@@ -90,6 +98,7 @@ public:
 
     [[nodiscard]] WorkloadNamespaceEntry workload_namespace() const noexcept;
     [[nodiscard]] std::optional<Failure> validate_connectivity() const;
+    [[nodiscard]] ProfileApplyResult apply_change(const ProfileChange& change);
     [[nodiscard]] CleanupResult cleanup() &&;
 
 private:

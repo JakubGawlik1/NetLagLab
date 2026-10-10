@@ -360,6 +360,12 @@ TEST(ControllerControlPlaneTest, PreservesAttachmentHelpStatusAndDetachBehavior)
         ControllerBytesReceivedEvent{"help\nstatus\ndetach\nignored\n"})};
     ASSERT_EQ(commands.size(), 4U);
     EXPECT_NE(sent_text(commands, 0)->text.find("HELP_BEGIN\n"), std::string::npos);
+    EXPECT_NE(sent_text(commands, 0)->text.find(
+                  "set - Set directional delay, jitter, or packet loss\n"),
+        std::string::npos);
+    EXPECT_NE(sent_text(commands, 0)->text.find(
+                  "Bandwidth changes are not supported.\n"),
+        std::string::npos);
     EXPECT_NE(
         sent_text(commands, 1)->text.find(
             "STATUS_BEGIN\nstate: running\npid: 1234\n"),

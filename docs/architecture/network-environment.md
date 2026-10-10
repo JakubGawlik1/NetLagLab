@@ -342,9 +342,10 @@ The standalone checkpoint builds a private static
 headers remain under `src/`; nothing is added to the public `include/netlaglab/`
 domain surface. The library contains the transaction coordinator and owner
 implementations, Linux/iproute2 adapter, host lock, command runner, typed
-inventory, and pure rtnetlink link/route decoders. It has no dependency on
-`netlaglab_core`, helper protocol, Workload execution, DNS, NAT, firewall, or
-traffic shaping, and this checkpoint does not link it into `netlaglab-helper`.
+inventory, pure rtnetlink link/route decoders, and the Session-owned shaping
+operation. It depends on `netlaglab_core` for the typed Network Profile and
+Profile Change contract, and is linked into `netlaglab-helper`; it remains
+independent of helper protocol and Workload execution.
 
 Default verification uses one `netlaglab_network_environment_tests` executable
 with separate test files for each seam and one

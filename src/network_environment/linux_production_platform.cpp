@@ -313,6 +313,20 @@ public:
         return run_command_capturing_stdout(executable_path, arguments, deadline);
     }
 
+    [[nodiscard]] CommandResult run_tool_in_namespace(
+        const std::string_view executable_path,
+        const std::span<const std::string> arguments,
+        const NamespaceHandle& namespace_handle,
+        const std::chrono::steady_clock::time_point deadline) override
+    {
+        const auto* handle{linux_handle(namespace_handle)};
+        if (handle == nullptr) {
+            return {CommandResultKind::system_failure, 0, {}};
+        }
+        return run_command_in_network_namespace(
+            executable_path, arguments, handle->descriptor(), deadline);
+    }
+
     [[nodiscard]] std::optional<bool> ipv4_forwarding_enabled() override
     {
         const int descriptor{open(
