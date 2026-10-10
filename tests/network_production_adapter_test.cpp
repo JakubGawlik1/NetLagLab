@@ -27,6 +27,7 @@ using detail::PreflightPlatform;
 using detail::ProductionPlatform;
 using detail::QueryStatus;
 using detail::RouteDumpStatus;
+using detail::RoutePolicyStatus;
 using detail::ToolQuery;
 
 class FakeHostLock final : public HostLock {
@@ -52,10 +53,20 @@ public:
         return QueryStatus::absent;
     }
     [[nodiscard]] AddressQuery query_addresses() override { return {true, {}}; }
+    [[nodiscard]] std::optional<bool> ipv4_forwarding_enabled() override
+    {
+        return true;
+    }
     [[nodiscard]] RouteDumpStatus query_routes(
         std::chrono::steady_clock::time_point) override
     {
         return RouteDumpStatus::complete;
+    }
+    [[nodiscard]] RoutePolicyStatus query_route_policy(
+        std::string_view,
+        std::chrono::steady_clock::time_point) override
+    {
+        return RoutePolicyStatus::supported;
     }
 };
 
@@ -103,6 +114,7 @@ struct RecordedLinkQuery {
 
 struct FakeProductionTrace {
     std::vector<RecordedCommand> recorded_commands;
+    std::vector<RecordedCommand> recorded_nft_commands;
     std::vector<RecordedLinkQuery> recorded_link_queries;
     std::shared_ptr<std::vector<std::string>> events{
         std::make_shared<std::vector<std::string>>()};
@@ -114,6 +126,11 @@ public:
     std::deque<NamespaceQuery> namespaces;
     std::deque<LinkQuery> host_links;
     std::deque<LinkQuery> namespace_links;
+    std::deque<CommandResult> nft_commands;
+    std::deque<bool> nft_apply_effects;
+    bool nft_table_present{};
+    bool nft_table_has_foreign_rule{};
+    std::string nft_table_comment;
     std::shared_ptr<FakeProductionTrace> trace{
         std::make_shared<FakeProductionTrace>()};
 
@@ -148,6 +165,86 @@ public:
         });
         CommandResult result{std::move(commands.front())};
         commands.pop_front();
+        return result;
+    }
+
+    [[nodiscard]] CommandResult run_nft(
+        const std::string_view executable_path,
+        const std::span<const std::string> arguments,
+        const bool capture_stdout,
+        std::chrono::steady_clock::time_point) override
+    {
+        trace->recorded_nft_commands.push_back({
+            std::string{executable_path},
+            {arguments.begin(), arguments.end()},
+            nullptr,
+            false,
+        });
+        if (capture_stdout && arguments.size() >= 3
+            && arguments[0] == "-n" && arguments[1] == "list"
+            && arguments[2] == "tables") {
+            return {
+                CommandResultKind::success,
+                0,
+                {},
+                nft_table_present ? "table ip netlaglab\n" : "",
+            };
+        }
+        if (capture_stdout && arguments.size() >= 3
+            && arguments[0] == "-n" && arguments[1] == "list"
+            && arguments[2] == "table") {
+            std::string table_output{
+                "table ip netlaglab {\n"
+                " comment \"" + nft_table_comment + "\"\n"
+                " chain postrouting {\n"
+                "  type nat hook postrouting priority srcnat; policy accept;\n"
+                "  comment \"" + nft_table_comment + "\"\n"
+                "  iifname \"nll-host\" ip saddr 10.200.0.2 masquerade comment \""
+                + nft_table_comment + "\"\n"};
+            if (nft_table_has_foreign_rule) {
+                table_output += "  ip saddr 192.0.2.1 drop\n";
+            }
+            table_output += " }\n}\n";
+            return nft_table_present
+                ? CommandResult{
+                    CommandResultKind::success,
+                    0,
+                    {},
+                    std::move(table_output),
+                }
+                : CommandResult{CommandResultKind::nonzero_exit, 1, {}};
+        }
+        CommandResult result{CommandResultKind::success, 0, {}};
+        if (!nft_commands.empty()) {
+            result = std::move(nft_commands.front());
+            nft_commands.pop_front();
+        }
+        const bool apply_effect{nft_apply_effects.empty()
+                ? true
+                : nft_apply_effects.front()};
+        if (!nft_apply_effects.empty()) {
+            nft_apply_effects.pop_front();
+        }
+        if (apply_effect && arguments.size() >= 2
+            && arguments[0] == "add" && arguments[1] == "table") {
+            nft_table_present = true;
+            for (const std::string& argument : arguments) {
+                const std::size_t marker{argument.find("nll-session-")};
+                if (marker == std::string::npos) {
+                    continue;
+                }
+                const std::size_t end{argument.find('"', marker)};
+                nft_table_comment = argument.substr(
+                    marker,
+                    end == std::string::npos ? std::string::npos : end - marker);
+                break;
+            }
+        } else if (apply_effect && arguments.size() >= 2
+                   && arguments[0] == "delete"
+                   && arguments[1] == "table") {
+            nft_table_present = false;
+            nft_table_comment.clear();
+        }
         return result;
     }
 
@@ -290,6 +387,23 @@ TEST(NetworkProductionAdapterTest, ConfiguresTheCompleteFixedTopology)
         observed->recorded_commands[8].arguments,
         (std::vector<std::string>{
             "route", "add", "default", "via", "10.200.0.1", "dev", "nll-app"}));
+    ASSERT_EQ(observed->recorded_nft_commands.size(), 8U);
+    EXPECT_EQ(observed->recorded_nft_commands[1].arguments[0], "add");
+    EXPECT_EQ(observed->recorded_nft_commands[1].arguments[1], "table");
+    EXPECT_EQ(observed->recorded_nft_commands[2].arguments[0], "add");
+    EXPECT_EQ(observed->recorded_nft_commands[2].arguments[1], "chain");
+    const auto& nat_rule{observed->recorded_nft_commands[3].arguments};
+    EXPECT_NE(
+        std::find(nat_rule.begin(), nat_rule.end(), "iifname"), nat_rule.end());
+    EXPECT_NE(
+        std::find(nat_rule.begin(), nat_rule.end(), "nll-host"), nat_rule.end());
+    EXPECT_NE(
+        std::find(nat_rule.begin(), nat_rule.end(), "10.200.0.2"), nat_rule.end());
+    EXPECT_NE(
+        std::find(nat_rule.begin(), nat_rule.end(), "masquerade"), nat_rule.end());
+    EXPECT_EQ(
+        observed->recorded_nft_commands[6].arguments,
+        (std::vector<std::string>{"delete", "table", "ip", "netlaglab"}));
     EXPECT_FALSE(observed->recorded_commands[3].enters_namespace);
     EXPECT_FALSE(observed->recorded_commands[4].enters_namespace);
     const NamespaceHandle* exact_namespace{
@@ -301,6 +415,39 @@ TEST(NetworkProductionAdapterTest, ConfiguresTheCompleteFixedTopology)
             observed->recorded_commands[index].inherited_namespace,
             exact_namespace);
     }
+}
+
+TEST(NetworkProductionAdapterTest, PreservesForeignObjectsAddedToOwnedTable)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    production->nft_table_has_foreign_rule = true;
+    const auto observed{production->trace};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+
+    CleanupResult cleanup{
+        std::move(std::get<PreparedNetworkEnvironment>(result)).cleanup()};
+    EXPECT_FALSE(cleanup.failures.empty());
+    EXPECT_TRUE(cleanup.residual.has_value());
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_nft_commands.begin(),
+        observed->recorded_nft_commands.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() >= 2
+                && command.arguments[0] == "delete"
+                && command.arguments[1] == "table";
+        }));
 }
 
 struct ConfigurationFailureCase {

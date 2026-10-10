@@ -54,8 +54,10 @@ cross-platform support are not current goals.
   capability for entering the exact retained namespace only to the forked
   child, and explicitly cleans prepared or residual ownership after Workload
   reaping. The path has deterministic unprivileged coverage but has not passed
-  privileged Session qualification. DNS mounts, forwarding, NAT, firewall
-  handling, and shaping remain unimplemented.
+  privileged Session qualification. IPv4 forwarding preflight and scoped nft
+  NAT are implemented; host firewall rules remain untouched, so forwarded
+  traffic depends on existing host policy. DNS mounts and shaping remain
+  incomplete, and privileged TCP/UDP qualification is pending.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.

@@ -42,8 +42,8 @@ and accepted feature documents before its interface is designed.
 | [Workload execution](workload-execution.md) | Workload parentage, namespace entry, user identity, execution context, and descendant ownership | Helper-owned launch enters the exact Session network namespace before identity drop; integrated privileged qualification remains open |
 | [Supervisor-helper protocol](supervisor-helper-protocol.md) | Privilege boundary, authentication, framing, start block, commands, acknowledgements, and events | Lifecycle, typed Profile Change conversations, and production Controller dispatch implemented; real privileged shaping remains absent |
 | [Controller control plane](controller-control-plane.md) | Attached commands, value grammar, serialization, status, stop, detach, and terminal responses | Event/action module, bounded queue, reply ownership, confirmed profile, stopping state, and complete Session Outcome implemented |
-| [Network environment](network-environment.md) | Network namespace, veth pair, addresses, routing, DNS mount, and readiness | Transaction, helper integration, host-local topology, and explicit cleanup implemented with unprivileged tests; Session-path privileged qualification remains open |
-| [Host networking and firewall](host-networking-and-firewall.md) | Forwarding preflight, NAT, firewall adapters, consent, and host-policy boundaries | Manually verified only; production adapters and recovery are not implemented |
+| [Network environment](network-environment.md) | Network namespace, veth pair, addresses, routing, DNS mount, and readiness | Transaction, helper integration, scoped nft NAT, forwarding preflight, host-local topology, and explicit cleanup implemented with unprivileged tests; privileged connectivity qualification remains open |
+| [Host networking and firewall](host-networking-and-firewall.md) | Forwarding preflight, NAT, firewall adapters, consent, and host-policy boundaries | Scoped nft NAT is implemented; host firewall policy is unchanged and privileged TCP/UDP qualification remains open |
 | [Traffic shaping](traffic-shaping.md) | Network Profile semantics, direction mapping, `tc/netem`, live deltas, and rollback | Typed validation implemented; runtime shaping is not implemented |
 | [Cleanup and recovery](cleanup-and-recovery.md) | Owned-resource cleanup, partial-failure rollback, descendant semantics, and interrupted persistent changes | Process/descriptor/socket cleanup, local Session network cleanup, host-lock ownership, and scripted rollback/residual ownership implemented; durable recovery remains target design |
 
@@ -68,8 +68,9 @@ flowchart LR
   losing it does not end the Session.
 
 The current implementation follows these process ownership boundaries and
-creates the fixed local network topology. It does not yet create a mount
-namespace or provide production DNS, Internet routing, NAT, or shaping.
+creates the fixed local network topology with scoped NAT. It does not yet create
+a mount namespace or provide production DNS or shaping; host firewall policy
+must already permit forwarded traffic.
 
 ## Cross-cutting invariants
 

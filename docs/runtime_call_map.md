@@ -37,10 +37,10 @@ The helper is the Workload's direct parent. The Supervisor never calls
 semantic helper events. The Supervisor owns and always attempts to reap only
 the `sudo` launcher PID.
 
-The helper prepares the fixed local network topology through the Network
-Environment transaction. The child enters its exact retained network namespace
-before dropping privileges. The helper itself remains in the host namespace.
-There is no mount namespace, Session DNS view, NAT, or shaping yet.
+The helper prepares the fixed local network topology and scoped nft NAT through
+the Network Environment transaction. The child enters its exact retained
+network namespace before dropping privileges. The helper itself remains in the
+host namespace. There is no mount namespace, Session DNS view, or shaping yet.
 
 ## `netlaglab run` call sequence
 

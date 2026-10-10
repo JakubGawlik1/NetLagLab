@@ -302,6 +302,17 @@ public:
             executable_path, arguments, handle->descriptor(), deadline);
     }
 
+    [[nodiscard]] CommandResult run_nft(
+        const std::string_view executable_path,
+        const std::span<const std::string> arguments,
+        const bool capture_stdout,
+        const std::chrono::steady_clock::time_point deadline) override
+    {
+        return capture_stdout
+            ? run_command_capturing_stdout(executable_path, arguments, deadline)
+            : run_command(executable_path, arguments, deadline);
+    }
+
     [[nodiscard]] NamespaceQuery query_namespace() override
     {
         const int raw_descriptor{

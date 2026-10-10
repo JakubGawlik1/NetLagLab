@@ -1,10 +1,12 @@
 #include "preflight.hpp"
 
+#include "command_runner.hpp"
 #include "file_descriptor.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cctype>
 #include <chrono>
 #include <climits>
 #include <cstddef>
@@ -18,6 +20,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <sys/file.h>
@@ -57,6 +60,28 @@ private:
     }
     return errno == ENOENT || errno == ENOTDIR ? QueryStatus::absent
                                                 : QueryStatus::failure;
+}
+
+[[nodiscard]] std::optional<bool> read_ipv4_forwarding()
+{
+    constexpr std::string_view path{"/proc/sys/net/ipv4/ip_forward"};
+    const int descriptor{open(path.data(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+    if (descriptor == -1) {
+        return std::nullopt;
+    }
+    netlaglab::FileDescriptor file{descriptor};
+    char bytes[3]{};
+    ssize_t count{};
+    do {
+        count = read(file.get(), bytes, sizeof(bytes));
+    } while (count == -1 && errno == EINTR);
+    if (count == 2 && bytes[1] == '\n' && (bytes[0] == '0' || bytes[0] == '1')) {
+        return bytes[0] == '1';
+    }
+    if (count == 1 && (bytes[0] == '0' || bytes[0] == '1')) {
+        return bytes[0] == '1';
+    }
+    return std::nullopt;
 }
 
 [[nodiscard]] bool prefix_length(const std::uint32_t mask, std::uint8_t& length)
@@ -228,6 +253,11 @@ public:
         return {true, std::move(result)};
     }
 
+    [[nodiscard]] std::optional<bool> ipv4_forwarding_enabled() override
+    {
+        return read_ipv4_forwarding();
+    }
+
     [[nodiscard]] RouteDumpStatus query_routes(
         const std::chrono::steady_clock::time_point deadline) override
     {
@@ -329,6 +359,121 @@ public:
                 std::span{buffer}.first(static_cast<std::size_t>(received)));
         }
         return decoder.status();
+    }
+
+    [[nodiscard]] RoutePolicyStatus query_route_policy(
+        const std::string_view ip_path,
+        const std::chrono::steady_clock::time_point deadline) override
+    {
+        const std::vector<std::string> arguments{"-4", "rule", "show"};
+        const CommandResult result{
+            run_command_capturing_stdout(ip_path, arguments, deadline)};
+        if (result.kind == CommandResultKind::timeout) {
+            return RoutePolicyStatus::timeout;
+        }
+        if (result.kind != CommandResultKind::success) {
+            return RoutePolicyStatus::failure;
+        }
+
+        constexpr std::array<std::string_view, 3> supported_rules{
+            "0: from all lookup local",
+            "32766: from all lookup main",
+            "32767: from all lookup default",
+        };
+        std::istringstream lines{result.standard_output};
+        std::string line;
+        std::size_t index{};
+        while (std::getline(lines, line)) {
+            std::istringstream words{line};
+            std::string normalized;
+            std::string word;
+            while (words >> word) {
+                if (!normalized.empty()) {
+                    normalized.push_back(' ');
+                }
+                normalized.append(word);
+            }
+            if (normalized.empty() || index >= supported_rules.size()
+                || normalized != supported_rules[index]) {
+                return RoutePolicyStatus::unsupported;
+            }
+            ++index;
+        }
+        if (index != supported_rules.size()) {
+            return RoutePolicyStatus::unsupported;
+        }
+
+        const std::vector<std::string> routes_arguments{
+            "-4", "-o", "route", "show", "table", "main", "default"};
+        const CommandResult routes{
+            run_command_capturing_stdout(ip_path, routes_arguments, deadline)};
+        if (routes.kind == CommandResultKind::timeout) {
+            return RoutePolicyStatus::timeout;
+        }
+        if (routes.kind != CommandResultKind::success) {
+            return RoutePolicyStatus::failure;
+        }
+        std::istringstream route_lines{routes.standard_output};
+        std::string route_line;
+        std::size_t default_route_count{};
+        while (std::getline(route_lines, route_line)) {
+            std::istringstream route_words{route_line};
+            std::vector<std::string> tokens;
+            std::string token;
+            while (route_words >> token) {
+                tokens.push_back(std::move(token));
+            }
+            if (tokens.empty()) {
+                continue;
+            }
+            ++default_route_count;
+            std::string interface_name;
+            bool has_gateway{};
+            for (std::size_t route_index{}; route_index < tokens.size(); ++route_index) {
+                if (tokens[route_index] == "via"
+                    && route_index + 1 < tokens.size()) {
+                    has_gateway = true;
+                }
+                if (tokens[route_index] == "dev"
+                    && route_index + 1 < tokens.size()) {
+                    interface_name = tokens[route_index + 1];
+                }
+            }
+            if (!has_gateway || interface_name.empty()
+                || interface_name.size() >= IFNAMSIZ
+                || !std::all_of(
+                    interface_name.begin(),
+                    interface_name.end(),
+                    [](const unsigned char character) {
+                        return std::isalnum(character) != 0 || character == '_'
+                            || character == '-' || character == '.';
+                    })) {
+                return RoutePolicyStatus::unsupported;
+            }
+
+            const std::vector<std::string> link_arguments{
+                "-d", "link", "show", "dev", interface_name};
+            const CommandResult link{
+                run_command_capturing_stdout(ip_path, link_arguments, deadline)};
+            if (link.kind == CommandResultKind::timeout) {
+                return RoutePolicyStatus::timeout;
+            }
+            if (link.kind != CommandResultKind::success) {
+                return RoutePolicyStatus::failure;
+            }
+            std::istringstream link_words{link.standard_output};
+            while (link_words >> token) {
+                if (token == "wireguard" || token == "tun" || token == "tap"
+                    || token == "ppp" || token == "gre" || token == "ipip"
+                    || token == "sit" || token == "xfrm" || token == "vti"
+                    || token == "link/tun" || token == "link/ppp") {
+                    return RoutePolicyStatus::unsupported;
+                }
+            }
+        }
+        return default_route_count == 0
+            ? RoutePolicyStatus::unsupported
+            : RoutePolicyStatus::supported;
     }
 };
 

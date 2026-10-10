@@ -19,7 +19,9 @@ enum class Operation {
     assign_namespace_address,
     bring_namespace_link_up,
     add_default_route,
+    configure_nat,
     remove_veth,
+    remove_nat,
     remove_namespace,
 };
 

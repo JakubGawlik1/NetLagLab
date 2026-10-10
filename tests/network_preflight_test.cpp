@@ -62,7 +62,7 @@ public:
     ToolQuery query_tool(const std::string_view path) override
     {
         calls->emplace_back(std::string{"tool:"} + std::string{path});
-        if (path == valid_tool_path) {
+        if (path == valid_tool_path || path == valid_nft_path) {
             return {QueryStatus::present, valid_tool_metadata};
         }
         return {tool_query_status, {}};
@@ -93,6 +93,20 @@ public:
         return route_status;
     }
 
+    RoutePolicyStatus query_route_policy(
+        std::string_view,
+        std::chrono::steady_clock::time_point) override
+    {
+        calls->emplace_back("route_policy");
+        return route_policy_status;
+    }
+
+    std::optional<bool> ipv4_forwarding_enabled() override
+    {
+        calls->emplace_back("ipv4_forwarding");
+        return forwarding_enabled;
+    }
+
     std::shared_ptr<std::vector<std::string>> calls{
         std::make_shared<std::vector<std::string>>()};
     bool lock_succeeds{true};
@@ -100,6 +114,7 @@ public:
     std::shared_ptr<bool> lock_alive{std::make_shared<bool>(false)};
     bool is_privileged{true};
     std::string valid_tool_path{"/usr/bin/ip"};
+    std::string valid_nft_path{"/usr/bin/nft"};
     FileMetadata valid_tool_metadata{true, 0, 0755};
     QueryStatus tool_query_status{QueryStatus::absent};
     QueryStatus namespace_status{QueryStatus::absent};
@@ -107,6 +122,8 @@ public:
     QueryStatus session_link_status{QueryStatus::absent};
     AddressQuery addresses{true, {}};
     RouteDumpStatus route_status{RouteDumpStatus::complete};
+    RoutePolicyStatus route_policy_status{RoutePolicyStatus::supported};
+    std::optional<bool> forwarding_enabled{true};
 };
 
 void append_bytes(std::vector<std::byte>& output, const void* data, std::size_t size)
@@ -185,6 +202,30 @@ TEST(NetworkPreflightTest, AcceptsOnlyClosedListRootOwnedSafeExecutables)
     EXPECT_FALSE(is_trusted_executable({true, 0, 0644}));
 }
 
+TEST(NetworkPreflightTest, RefusesWhenIpv4ForwardingIsDisabled)
+{
+    FakePreflightPlatform platform;
+    platform.forwarding_enabled = false;
+
+    const PreflightResult result{run_preflight(platform, {})};
+
+    EXPECT_FALSE(result.succeeded);
+    EXPECT_EQ(result.cause, Cause::unsupported_host_configuration);
+    EXPECT_EQ(platform.calls->back(), "ipv4_forwarding");
+}
+
+TEST(NetworkPreflightTest, RefusesWhenIpv4ForwardingCannotBeRead)
+{
+    FakePreflightPlatform platform;
+    platform.forwarding_enabled = std::nullopt;
+
+    const PreflightResult result{run_preflight(platform, {})};
+
+    EXPECT_FALSE(result.succeeded);
+    EXPECT_EQ(result.cause, Cause::system_failure);
+    EXPECT_EQ(platform.calls->back(), "ipv4_forwarding");
+}
+
 TEST(NetworkPreflightTest, CompletesEveryReadOnlyCheckInOrder)
 {
     FakePreflightPlatform platform;
@@ -197,6 +238,7 @@ TEST(NetworkPreflightTest, CompletesEveryReadOnlyCheckInOrder)
         *platform.calls,
         (std::vector<std::string>{
             "privilege",
+            "ipv4_forwarding",
             "tool:/usr/sbin/ip",
             "tool:/usr/bin/ip",
             "namespace",
@@ -204,6 +246,7 @@ TEST(NetworkPreflightTest, CompletesEveryReadOnlyCheckInOrder)
             "link:nll-app",
             "addresses",
             "routes",
+            "route_policy",
         }));
 }
 
@@ -301,6 +344,12 @@ TEST(NetworkPreflightTest, MapsToolAndInventoryFailuresToStableCauses)
     FakePreflightPlatform timed_out_routes;
     timed_out_routes.route_status = RouteDumpStatus::timeout;
     EXPECT_EQ(run_preflight(timed_out_routes, {}).cause, Cause::timeout);
+
+    FakePreflightPlatform unsupported_policy;
+    unsupported_policy.route_policy_status = RoutePolicyStatus::unsupported;
+    EXPECT_EQ(
+        run_preflight(unsupported_policy, {}).cause,
+        Cause::unsupported_host_configuration);
 }
 
 TEST(NetworkProductionPreparationTest, AcquiresLockBeforeTypedPreflightFailure)
@@ -430,6 +479,16 @@ TEST(NetworkRouteDumpTest, RejectsIntersectingRouteInAnyTable)
 
     RouteDumpDecoder decoder{sequence, port_id};
     EXPECT_EQ(decoder.consume(bytes), RouteDumpStatus::collision);
+}
+
+TEST(NetworkRouteDumpTest, RejectsSplitDefaultRoutesUsedBySomeVpnSetups)
+{
+    std::vector<std::byte> bytes;
+    append_route(bytes, 0x00000000U, 1, RT_TABLE_MAIN);
+
+    RouteDumpDecoder decoder{sequence, port_id};
+
+    EXPECT_EQ(decoder.consume(bytes), RouteDumpStatus::unsupported);
 }
 
 TEST(NetworkRouteDumpTest, RejectsNetlinkErrorsTruncationAndMalformedAttributes)

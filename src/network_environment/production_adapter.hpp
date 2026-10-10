@@ -48,6 +48,11 @@ public:
         std::span<const std::string> arguments,
         const NamespaceHandle& namespace_handle,
         std::chrono::steady_clock::time_point deadline) = 0;
+    [[nodiscard]] virtual CommandResult run_nft(
+        std::string_view executable_path,
+        std::span<const std::string> arguments,
+        bool capture_stdout,
+        std::chrono::steady_clock::time_point deadline) = 0;
     [[nodiscard]] virtual NamespaceQuery query_namespace() = 0;
     [[nodiscard]] virtual std::string namespace_file_argument(
         const NamespaceHandle& handle) const = 0;

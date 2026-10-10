@@ -20,6 +20,7 @@ using network_environment::Stage;
     case Stage::host_configuration: return "host configuration";
     case Stage::namespace_configuration: return "namespace configuration";
     case Stage::route_configuration: return "route configuration";
+    case Stage::nat_configuration: return "NAT configuration";
     case Stage::cleanup: return "cleanup";
     }
     return "unknown";
@@ -30,6 +31,8 @@ using network_environment::Stage;
     switch (cause) {
     case Cause::collision: return "collision";
     case Cause::unavailable_or_invalid_tool: return "unavailable or invalid tool";
+    case Cause::unsupported_host_configuration:
+        return "unsupported host forwarding or routing configuration";
     case Cause::system_failure: return "system failure";
     case Cause::command_exit: return "command exited unsuccessfully";
     case Cause::command_signal: return "command terminated by signal";

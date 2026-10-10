@@ -2,12 +2,13 @@
 
 ## Status
 
-NetLagLab currently performs no routing, forwarding, NAT, or firewall
-mutation. [Experiment 01](../experiment_01.md) manually verified that a scoped
-NAT setup and a compatible forwarding rule can provide Internet access, and
-that UFW can allow ICMP while still blocking forwarded TCP and UDP. The policy
-and consent rules below are accepted target design; production adapters are not
-implemented.
+The production Network Environment configures and owns one scoped IPv4 NAT
+table using `nft`. It requires host IPv4 forwarding to be enabled already and
+refuses unsupported routing policy, including common split-default VPN routes.
+It does not configure host forwarding filters. Forwarded TCP/UDP still depend
+on the host firewall allowing the traffic. [Experiment 01](../experiment_01.md)
+showed that UFW can allow ICMP while blocking forwarded TCP and UDP. Privileged
+TCP/UDP qualification remains separate from the controlled adapter tests.
 
 ## Safety boundary
 
@@ -35,10 +36,12 @@ on the user's behalf.
 
 ## NAT ownership
 
-The helper owns a dedicated nftables table named `netlaglab`. NAT must be
-scoped to the Session address rather than an unrestricted host range. The
-final output-interface match depends on the unresolved host-route decision in
-[Network environment](network-environment.md#host-route-selection-open-decision-q65).
+The helper owns a dedicated nftables table named `netlaglab`, tagged with a
+random Session ownership comment. The rule matches input from `nll-host` and
+source `10.200.0.2`, then applies masquerading as packets leave through the
+host's normal route selection. Cleanup verifies the table, chain, and rule all
+match the exact Session-owned definition before deleting the table. A
+pre-existing table with that name is a collision.
 
 Creating a separate nftables table gives NetLagLab a removable ownership
 boundary for its NAT objects. It does not give that table authority over UFW,
@@ -81,11 +84,10 @@ diagnostic evidence instead of speculative changes.
 
 ### No supported manager
 
-A Session-owned nftables table can provide scoped NAT. Whether and how
-forwarding filtering may be changed still requires an explicit supported
-adapter or a host configuration that already permits the traffic. An `accept`
-verdict in one nftables base chain cannot be assumed to bypass all other base
-chains.
+A Session-owned nftables table provides scoped NAT. Forwarding filtering must
+already permit the traffic; an `accept` verdict in one nftables base chain
+cannot be assumed to bypass all other base chains. No firewall adapter is
+implemented.
 
 ## Two-stage informed consent
 

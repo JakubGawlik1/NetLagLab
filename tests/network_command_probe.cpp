@@ -11,6 +11,13 @@ extern char** environ;
 
 int main(const int argc, char* argv[])
 {
+    if (argc == 3 && std::string_view{argv[1]} == "stdout") {
+        const std::string_view output{argv[2]};
+        return write(STDOUT_FILENO, output.data(), output.size())
+                == static_cast<ssize_t>(output.size())
+            ? 0
+            : 53;
+    }
     if (argc == 3 && std::string_view{argv[1]} == "exit") {
         int exit_code{};
         const std::string_view value{argv[2]};

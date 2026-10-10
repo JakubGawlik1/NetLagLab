@@ -15,12 +15,14 @@ enum class Stage {
     host_configuration,
     namespace_configuration,
     route_configuration,
+    nat_configuration,
     cleanup,
 };
 
 enum class Cause {
     collision,
     unavailable_or_invalid_tool,
+    unsupported_host_configuration,
     system_failure,
     command_exit,
     command_signal,

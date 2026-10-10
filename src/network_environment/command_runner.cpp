@@ -154,6 +154,7 @@ enum class NamespaceMode {
     const std::span<const std::string> arguments,
     const int namespace_descriptor,
     const NamespaceMode namespace_mode,
+    const bool capture_stdout,
     const std::chrono::steady_clock::time_point deadline)
 {
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -177,6 +178,17 @@ enum class NamespaceMode {
     FileDescriptor standard_error_reader{standard_error_pipe[0]};
     FileDescriptor standard_error_writer{standard_error_pipe[1]};
 
+    FileDescriptor standard_output_reader{-1};
+    FileDescriptor standard_output_writer{-1};
+    if (capture_stdout) {
+        int standard_output_pipe[2]{};
+        if (pipe2(standard_output_pipe, O_CLOEXEC) == -1) {
+            return {CommandResultKind::system_failure, errno, {}};
+        }
+        standard_output_reader = FileDescriptor{standard_output_pipe[0]};
+        standard_output_writer = FileDescriptor{standard_output_pipe[1]};
+    }
+
     int child_failure_pipe[2]{};
     if (pipe2(child_failure_pipe, O_CLOEXEC) == -1) {
         return {CommandResultKind::system_failure, errno, {}};
@@ -185,6 +197,7 @@ enum class NamespaceMode {
     FileDescriptor child_failure_writer{child_failure_pipe[1]};
 
     if (!make_nonblocking(standard_error_reader.get())
+        || (capture_stdout && !make_nonblocking(standard_output_reader.get()))
         || !make_nonblocking(child_failure_reader.get())) {
         return {CommandResultKind::system_failure, errno, {}};
     }
@@ -217,6 +230,16 @@ enum class NamespaceMode {
             }
             standard_error_writer.reset();
         }
+        if (capture_stdout) {
+            standard_output_reader.reset();
+            if (dup2(standard_output_writer.get(), STDOUT_FILENO) == -1) {
+                report_child_failure_and_exit(
+                    child_failure_writer.get(),
+                    ChildFailureKind::system_failure,
+                    errno);
+            }
+            standard_output_writer.reset();
+        }
         if (namespace_mode == NamespaceMode::inherit_descriptor) {
             const int descriptor_flags{fcntl(namespace_descriptor, F_GETFD)};
             if (descriptor_flags == -1
@@ -244,13 +267,17 @@ enum class NamespaceMode {
             errno);
     }
     standard_error_writer.reset();
+    standard_output_writer.reset();
     child_failure_writer.reset();
 
     std::string diagnostic;
     diagnostic.reserve(maximum_diagnostic_size);
+    std::string standard_output;
+    standard_output.reserve(maximum_diagnostic_size);
     ChildFailureMessage child_failure{};
     std::size_t child_failure_bytes{};
     bool standard_error_open{true};
+    bool standard_output_open{capture_stdout};
     bool child_failure_open{true};
     int status{};
 
@@ -271,6 +298,12 @@ enum class NamespaceMode {
                 standard_error_open,
                 diagnostic,
                 false)
+            || (capture_stdout
+                && !drain_standard_error(
+                    standard_output_reader.get(),
+                    standard_output_open,
+                    standard_output,
+                    false))
             || !drain_child_failure(
                 child_failure_reader.get(),
                 child_failure_open,
@@ -307,6 +340,13 @@ enum class NamespaceMode {
                 standard_error_open,
                 diagnostic,
                 true);
+            if (capture_stdout) {
+                (void)drain_standard_error(
+                    standard_output_reader.get(),
+                    standard_output_open,
+                    standard_output,
+                    true);
+            }
             if (termination_error != 0) {
                 return {
                     CommandResultKind::system_failure,
@@ -321,12 +361,13 @@ enum class NamespaceMode {
             };
         }
 
-        std::array<pollfd, 2> descriptors{{
+        std::array<pollfd, 3> descriptors{{
             {standard_error_open ? standard_error_reader.get() : -1, POLLIN, 0},
+            {standard_output_open ? standard_output_reader.get() : -1, POLLIN, 0},
             {child_failure_open ? child_failure_reader.get() : -1, POLLIN, 0},
         }};
         int timeout{poll_timeout(deadline)};
-        if (!standard_error_open && !child_failure_open) {
+        if (!standard_error_open && !standard_output_open && !child_failure_open) {
             timeout = std::min(timeout, 1);
         }
         const int poll_result{poll(
@@ -347,6 +388,12 @@ enum class NamespaceMode {
             standard_error_open,
             diagnostic,
             true)
+        || (capture_stdout
+            && !drain_standard_error(
+                standard_output_reader.get(),
+                standard_output_open,
+                standard_output,
+                true))
         || !drain_child_failure(
             child_failure_reader.get(),
             child_failure_open,
@@ -395,6 +442,7 @@ enum class NamespaceMode {
                        : CommandResultKind::nonzero_exit,
         exit_code,
         std::move(diagnostic),
+        std::move(standard_output),
     };
 }
 
@@ -404,7 +452,7 @@ CommandResult run_command(
     const std::chrono::steady_clock::time_point deadline)
 {
     return run_command_impl(
-        executable_path, arguments, -1, NamespaceMode::none, deadline);
+        executable_path, arguments, -1, NamespaceMode::none, false, deadline);
 }
 
 CommandResult run_command_with_inherited_descriptor(
@@ -421,7 +469,17 @@ CommandResult run_command_with_inherited_descriptor(
         arguments,
         inherited_descriptor,
         NamespaceMode::inherit_descriptor,
+        false,
         deadline);
+}
+
+CommandResult run_command_capturing_stdout(
+    const std::string_view executable_path,
+    const std::span<const std::string> arguments,
+    const std::chrono::steady_clock::time_point deadline)
+{
+    return run_command_impl(
+        executable_path, arguments, -1, NamespaceMode::none, true, deadline);
 }
 
 CommandResult run_command_in_network_namespace(
@@ -438,6 +496,7 @@ CommandResult run_command_in_network_namespace(
         arguments,
         namespace_descriptor,
         NamespaceMode::enter,
+        false,
         deadline);
 }
 

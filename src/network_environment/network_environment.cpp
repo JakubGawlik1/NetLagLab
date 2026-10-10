@@ -6,11 +6,15 @@
 #include "transaction_test_support.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <iomanip>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <sys/random.h>
 #include <type_traits>
 #include <utility>
 #include <variant>
@@ -53,6 +57,24 @@ struct VethIdentityPair {
     detail::LinkIdentity session;
 
     friend bool operator==(const VethIdentityPair&, const VethIdentityPair&) = default;
+};
+
+class NatProof {
+public:
+    explicit NatProof(std::string ownership_comment)
+        : ownership_comment_{std::move(ownership_comment)}
+    {
+    }
+
+    NatProof(NatProof&&) noexcept = default;
+    NatProof& operator=(NatProof&&) noexcept = default;
+    NatProof(const NatProof&) = delete;
+    NatProof& operator=(const NatProof&) = delete;
+
+private:
+    std::string ownership_comment_;
+
+    friend class ProductionAdapter;
 };
 
 class HostVethProof {
@@ -103,6 +125,7 @@ using VethState = std::variant<
     HostVethProof,
     PlacedVethProof,
     IdentityUnconfirmed>;
+using NatState = std::variant<std::monostate, NatProof, IdentityUnconfirmed>;
 using ProvenVeth = std::variant<HostVethProof, PlacedVethProof>;
 
 struct OperationResult {
@@ -122,6 +145,12 @@ struct VethMutationResult {
     VethState state;
 };
 
+struct NatMutationResult {
+    bool succeeded;
+    Cause cause;
+    NatState state;
+};
+
 struct NamespaceRemovalResult {
     Cause cause;
     NamespaceState state;
@@ -130,6 +159,11 @@ struct NamespaceRemovalResult {
 struct VethRemovalResult {
     Cause cause;
     VethState state;
+};
+
+struct NatRemovalResult {
+    Cause cause;
+    NatState state;
 };
 
 class MonotonicClock {
@@ -179,9 +213,15 @@ public:
         const NamespaceProof& namespace_proof,
         const PlacedVethProof& veth_proof,
         TimePoint deadline) = 0;
+    [[nodiscard]] virtual NatMutationResult configure_nat(
+        const PlacedVethProof& veth_proof,
+        TimePoint deadline) = 0;
     [[nodiscard]] virtual VethRemovalResult remove_veth(
         ProvenVeth proof,
         const NamespaceProof* namespace_proof,
+        TimePoint deadline) = 0;
+    [[nodiscard]] virtual NatRemovalResult remove_nat(
+        NatProof proof,
         TimePoint deadline) = 0;
     [[nodiscard]] virtual NamespaceRemovalResult remove_namespace(
         NamespaceProof proof,
@@ -328,6 +368,21 @@ public:
         return operation(Operation::add_default_route, deadline);
     }
 
+    [[nodiscard]] NatMutationResult configure_nat(
+        const PlacedVethProof&,
+        const TimePoint deadline) override
+    {
+        const ScriptStep step{next(Operation::configure_nat, deadline)};
+        NatState state;
+        if (step.outcome == Outcome::success
+            || step.outcome == Outcome::fail_new_state) {
+            state.emplace<NatProof>("scripted-owner");
+        } else if (step.outcome == Outcome::fail_identity_unconfirmed) {
+            state.emplace<IdentityUnconfirmed>();
+        }
+        return {step.outcome == Outcome::success, step.cause, std::move(state)};
+    }
+
     [[nodiscard]] VethRemovalResult remove_veth(
         ProvenVeth proof,
         const NamespaceProof*,
@@ -342,6 +397,21 @@ public:
                         std::move(retained));
                 },
                 std::move(proof));
+        } else if (step.outcome == Outcome::cleanup_identity_mismatch
+                   || step.outcome == Outcome::cleanup_identity_unconfirmed) {
+            state.emplace<IdentityUnconfirmed>();
+        }
+        return {step.cause, std::move(state)};
+    }
+
+    [[nodiscard]] NatRemovalResult remove_nat(
+        NatProof proof,
+        const TimePoint deadline) override
+    {
+        const ScriptStep step{next(Operation::remove_nat, deadline)};
+        NatState state;
+        if (step.outcome == Outcome::cleanup_retained) {
+            state.emplace<NatProof>(std::move(proof));
         } else if (step.outcome == Outcome::cleanup_identity_mismatch
                    || step.outcome == Outcome::cleanup_identity_unconfirmed) {
             state.emplace<IdentityUnconfirmed>();
@@ -419,10 +489,54 @@ public:
     {
         detail::PreflightResult result{
             detail::run_preflight(*platform_, deadline)};
-        if (result.succeeded) {
-            ip_path_ = std::move(result.ip_path);
+        if (!result.succeeded) {
+            return {false, result.cause};
         }
-        return {result.succeeded, result.cause};
+        ip_path_ = std::move(result.ip_path);
+
+        for (const std::string_view path : detail::trusted_nft_paths()) {
+            const detail::ToolQuery query{platform_->query_tool(path)};
+            if (query.status == detail::QueryStatus::failure) {
+                return {false, Cause::system_failure};
+            }
+            if (query.status == detail::QueryStatus::present
+                && detail::is_trusted_executable(query.metadata)) {
+                nft_path_ = path;
+                break;
+            }
+        }
+        if (nft_path_.empty()) {
+            return {false, Cause::unavailable_or_invalid_tool};
+        }
+
+        const std::vector<std::string> list_tables{
+            "-n", "list", "tables", "ip"};
+        const CommandResult tables{production_->run_nft(
+            nft_path_, list_tables, true, deadline)};
+        if (tables.kind == CommandResultKind::timeout) {
+            return {false, Cause::timeout};
+        }
+        if (tables.kind != CommandResultKind::success) {
+            return {false, command_cause(tables)};
+        }
+        if (contains_table(tables.standard_output, "netlaglab")) {
+            return {false, Cause::collision};
+        }
+
+        std::uint64_t random_value{};
+        ssize_t random_bytes{};
+        do {
+            random_bytes = getrandom(
+                &random_value, sizeof(random_value), GRND_NONBLOCK);
+        } while (random_bytes == -1 && errno == EINTR);
+        if (random_bytes != static_cast<ssize_t>(sizeof(random_value))) {
+            return {false, Cause::system_failure};
+        }
+        std::ostringstream comment;
+        comment << "nll-session-" << std::hex << std::setfill('0')
+                << std::setw(16) << random_value;
+        ownership_comment_ = comment.str();
+        return {true, Cause::system_failure};
     }
 
     [[nodiscard]] NamespaceMutationResult create_namespace(
@@ -618,6 +732,60 @@ public:
             ip_path_, arguments, *namespace_proof.exact_handle_, deadline));
     }
 
+    [[nodiscard]] NatMutationResult configure_nat(
+        const PlacedVethProof&,
+        const TimePoint deadline) override
+    {
+        const std::string comment{"\"" + ownership_comment_ + "\""};
+        const std::vector<std::string> table_arguments{
+            "add", "table", "ip", "netlaglab", "{", "comment",
+            comment + ";", "}"};
+        const CommandResult table{production_->run_nft(
+            nft_path_, table_arguments, false, deadline)};
+        if (table.kind != CommandResultKind::success) {
+            const NatObservation observation{
+                observe_nat(deadline, ownership_comment_)};
+            if (observation == NatObservation::owned) {
+                NatState state;
+                state.emplace<NatProof>(ownership_comment_);
+                return {false, command_cause(table), std::move(state)};
+            }
+            NatState state;
+            if (observation == NatObservation::foreign
+                || observation == NatObservation::failure) {
+                state.emplace<IdentityUnconfirmed>();
+            }
+            const Cause cause{observation == NatObservation::failure
+                    ? Cause::identity_unavailable
+                    : observation == NatObservation::foreign
+                    ? Cause::identity_mismatch
+                    : command_cause(table)};
+            return {false, cause, std::move(state)};
+        }
+
+        NatProof proof{ownership_comment_};
+        const std::vector<std::string> chain_arguments{
+            "add", "chain", "ip", "netlaglab", "postrouting", "{",
+            "type", "nat", "hook", "postrouting", "priority", "srcnat;",
+            "policy", "accept;", "comment", comment + ";", "}"};
+        const CommandResult chain{production_->run_nft(
+            nft_path_, chain_arguments, false, deadline)};
+        if (chain.kind != CommandResultKind::success) {
+            return {false, command_cause(chain), owned_nat_state(std::move(proof))};
+        }
+
+        const std::vector<std::string> rule_arguments{
+            "add", "rule", "ip", "netlaglab", "postrouting", "iifname",
+            "nll-host", "ip", "saddr", "10.200.0.2", "masquerade",
+            "comment", comment};
+        const CommandResult rule{production_->run_nft(
+            nft_path_, rule_arguments, false, deadline)};
+        if (rule.kind != CommandResultKind::success) {
+            return {false, command_cause(rule), owned_nat_state(std::move(proof))};
+        }
+        return {true, Cause::system_failure, owned_nat_state(std::move(proof))};
+    }
+
     [[nodiscard]] VethRemovalResult remove_veth(
         ProvenVeth proof,
         const NamespaceProof* namespace_proof,
@@ -625,6 +793,53 @@ public:
     {
         return remove_proven_veth(
             std::move(proof), namespace_proof, deadline);
+    }
+
+    [[nodiscard]] NatRemovalResult remove_nat(
+        NatProof proof,
+        const TimePoint deadline) override
+    {
+        const NatObservation before{
+            observe_nat(deadline, proof.ownership_comment_)};
+        if (before == NatObservation::absent) {
+            return {Cause::system_failure, {}};
+        }
+        if (before == NatObservation::foreign) {
+            NatState state;
+            state.emplace<IdentityUnconfirmed>();
+            return {Cause::identity_mismatch, std::move(state)};
+        }
+        if (before != NatObservation::owned) {
+            NatState state;
+            state.emplace<IdentityUnconfirmed>();
+            return {Cause::identity_unavailable, std::move(state)};
+        }
+
+        const std::vector<std::string> arguments{
+            "delete", "table", "ip", "netlaglab"};
+        const CommandResult command{production_->run_nft(
+            nft_path_, arguments, false, deadline)};
+        const NatObservation after{
+            observe_nat(deadline, proof.ownership_comment_)};
+        if (after == NatObservation::absent) {
+            return {Cause::system_failure, {}};
+        }
+        if (after == NatObservation::owned) {
+            return {
+                command.kind == CommandResultKind::success
+                    ? Cause::identity_mismatch
+                    : command_cause(command),
+                owned_nat_state(std::move(proof)),
+            };
+        }
+        NatState state;
+        state.emplace<IdentityUnconfirmed>();
+        return {
+            after == NatObservation::foreign
+                ? Cause::identity_mismatch
+                : Cause::identity_unavailable,
+            std::move(state),
+        };
     }
 
     [[nodiscard]] NamespaceRemovalResult remove_namespace(
@@ -674,6 +889,97 @@ public:
     }
 
 private:
+    enum class NatObservation {
+        absent,
+        owned,
+        foreign,
+        failure,
+    };
+
+    [[nodiscard]] static bool contains_table(
+        const std::string_view output,
+        const std::string_view expected)
+    {
+        std::istringstream lines{std::string{output}};
+        std::string family;
+        std::string table;
+        std::string name;
+        while (lines >> family >> table >> name) {
+            if (family == "table" && table == "ip" && name == expected) {
+                return true;
+            }
+            std::string remainder;
+            std::getline(lines, remainder);
+        }
+        return false;
+    }
+
+    [[nodiscard]] static bool is_owned_nat_table(
+        const std::string_view output,
+        const std::string_view expected_comment)
+    {
+        std::istringstream lines{std::string{output}};
+        std::vector<std::string> content;
+        std::string line;
+        while (std::getline(lines, line)) {
+            const std::size_t first{line.find_first_not_of(" \t\r")};
+            if (first == std::string::npos) {
+                continue;
+            }
+            const std::size_t last{line.find_last_not_of(" \t\r")};
+            content.push_back(line.substr(first, last - first + 1));
+        }
+        const std::string marker{"comment \"" + std::string{expected_comment} + "\""};
+        if (content.size() != 8U
+            || content[0] != "table ip netlaglab {"
+            || content[1] != marker
+            || content[2] != "chain postrouting {"
+            || content[3] != "type nat hook postrouting priority srcnat; policy accept;"
+            || content[4] != marker
+            || content[6] != "}"
+            || content[7] != "}") {
+            return false;
+        }
+        const std::array<std::string, 2> owned_rules{
+            "iifname \"nll-host\" ip saddr 10.200.0.2 masquerade " + marker,
+            "ip saddr 10.200.0.2 iifname \"nll-host\" masquerade " + marker,
+        };
+        return content[5] == owned_rules[0] || content[5] == owned_rules[1];
+    }
+
+    [[nodiscard]] NatObservation observe_nat(
+        const TimePoint deadline,
+        const std::string_view expected_comment)
+    {
+        const std::vector<std::string> list_tables{
+            "-n", "list", "tables", "ip"};
+        const CommandResult tables{production_->run_nft(
+            nft_path_, list_tables, true, deadline)};
+        if (tables.kind != CommandResultKind::success) {
+            return NatObservation::failure;
+        }
+        if (!contains_table(tables.standard_output, "netlaglab")) {
+            return NatObservation::absent;
+        }
+        const std::vector<std::string> list_table{
+            "-n", "list", "table", "ip", "netlaglab"};
+        const CommandResult table{production_->run_nft(
+            nft_path_, list_table, true, deadline)};
+        if (table.kind != CommandResultKind::success) {
+            return NatObservation::failure;
+        }
+        return is_owned_nat_table(table.standard_output, expected_comment)
+            ? NatObservation::owned
+            : NatObservation::foreign;
+    }
+
+    [[nodiscard]] static NatState owned_nat_state(NatProof proof)
+    {
+        NatState state;
+        state.emplace<NatProof>(std::move(proof));
+        return state;
+    }
+
     [[nodiscard]] static OperationResult command_result(
         const CommandResult& result)
     {
@@ -900,6 +1206,8 @@ private:
     std::unique_ptr<detail::ProductionPlatform> production_;
     std::shared_ptr<testing::ProductionTrace> trace_;
     std::string ip_path_;
+    std::string nft_path_;
+    std::string ownership_comment_;
 };
 
 class UnavailableProductionPlatform final : public detail::ProductionPlatform {
@@ -920,6 +1228,15 @@ public:
         TimePoint) override
     {
         return {CommandResultKind::system_failure, 0, {}};
+    }
+
+    [[nodiscard]] CommandResult run_nft(
+        std::string_view,
+        std::span<const std::string>,
+        bool,
+        TimePoint) override
+    {
+        return {CommandResultKind::success, 0, {}, {}};
     }
 
     [[nodiscard]] detail::NamespaceQuery query_namespace() override
@@ -980,6 +1297,11 @@ private:
     return std::holds_alternative<IdentityUnconfirmed>(state);
 }
 
+[[nodiscard]] bool is_unconfirmed(const NatState& state)
+{
+    return std::holds_alternative<IdentityUnconfirmed>(state);
+}
+
 [[nodiscard]] bool is_proven(const NamespaceState& state)
 {
     return std::holds_alternative<NamespaceProof>(state);
@@ -989,6 +1311,11 @@ private:
 {
     return std::holds_alternative<HostVethProof>(state)
         || std::holds_alternative<PlacedVethProof>(state);
+}
+
+[[nodiscard]] bool is_proven(const NatState& state)
+{
+    return std::holds_alternative<NatProof>(state);
 }
 
 } // namespace
@@ -1003,6 +1330,7 @@ struct PreparationRuntime {
 
 struct OwnerState {
     std::unique_ptr<PreparationRuntime> runtime;
+    NatState nat_root;
     NamespaceState namespace_root;
     VethState veth_root;
 };
@@ -1063,7 +1391,8 @@ namespace {
 
 [[nodiscard]] bool has_residual(const detail::OwnerState& state)
 {
-    return !std::holds_alternative<std::monostate>(state.namespace_root)
+    return !std::holds_alternative<std::monostate>(state.nat_root)
+        || !std::holds_alternative<std::monostate>(state.namespace_root)
         || !std::holds_alternative<std::monostate>(state.veth_root);
 }
 
@@ -1090,7 +1419,8 @@ namespace {
     }
 
     const bool began_with_unconfirmed{
-        is_unconfirmed(state->namespace_root) || is_unconfirmed(state->veth_root)};
+        is_unconfirmed(state->nat_root) || is_unconfirmed(state->namespace_root)
+        || is_unconfirmed(state->veth_root)};
     const TimePoint transaction_deadline{
         state->runtime->clock->now() + transaction_limit};
     const auto remove_veth = [&]() {
@@ -1110,6 +1440,21 @@ namespace {
             result.failures.push_back({Stage::cleanup, removal.cause});
         }
     };
+
+    if (is_proven(state->nat_root)) {
+        if (state->runtime->clock->now() >= transaction_deadline) {
+            result.failures.push_back({Stage::cleanup, Cause::timeout});
+        } else {
+            NatRemovalResult removal{state->runtime->adapter->remove_nat(
+                std::move(std::get<NatProof>(state->nat_root)),
+                operation_deadline(
+                    state->runtime->clock->now(), transaction_deadline))};
+            state->nat_root = std::move(removal.state);
+            if (!std::holds_alternative<std::monostate>(state->nat_root)) {
+                result.failures.push_back({Stage::cleanup, removal.cause});
+            }
+        }
+    }
 
     if (is_proven(state->veth_root)) {
         remove_veth();
@@ -1369,6 +1714,16 @@ PreparationResult prepare_network_environment(PreparationInput input)
             [&](const TimePoint value) {
                 return state->runtime->adapter->add_default_route(
                     namespace_proof, placed_veth, value);
+            })}) {
+        return std::move(*failure);
+    }
+    if (auto failure{run_configuration(
+            Stage::nat_configuration,
+            [&](const TimePoint value) {
+                NatMutationResult result{
+                    state->runtime->adapter->configure_nat(placed_veth, value)};
+                state->nat_root = std::move(result.state);
+                return OperationResult{result.succeeded, result.cause};
             })}) {
         return std::move(*failure);
     }

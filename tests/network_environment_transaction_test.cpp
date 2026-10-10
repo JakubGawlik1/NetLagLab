@@ -28,6 +28,7 @@ const std::vector<Operation> setup_operations{
     Operation::assign_namespace_address,
     Operation::bring_namespace_link_up,
     Operation::add_default_route,
+    Operation::configure_nat,
 };
 
 std::vector<ScriptStep> successful_setup()
@@ -36,6 +37,7 @@ std::vector<ScriptStep> successful_setup()
     for (const Operation operation : setup_operations) {
         script.push_back({operation});
     }
+    script.push_back({Operation::remove_nat, Outcome::removed});
     return script;
 }
 
@@ -59,6 +61,8 @@ TEST(NetworkEnvironmentTransactionTest, PreparesAndExplicitlyCleansCompleteEnvir
             {Operation::assign_namespace_address},
             {Operation::bring_namespace_link_up},
             {Operation::add_default_route},
+            {Operation::configure_nat},
+            {Operation::remove_nat, Outcome::removed},
             {Operation::remove_veth, Outcome::removed},
             {Operation::remove_namespace, Outcome::removed},
         },
@@ -83,6 +87,8 @@ TEST(NetworkEnvironmentTransactionTest, PreparesAndExplicitlyCleansCompleteEnvir
             Operation::assign_namespace_address,
             Operation::bring_namespace_link_up,
             Operation::add_default_route,
+            Operation::configure_nat,
+            Operation::remove_nat,
             Operation::remove_veth,
             Operation::remove_namespace,
         }));
@@ -227,6 +233,11 @@ INSTANTIATE_TEST_SUITE_P(
         SetupFailureCase{
             Operation::add_default_route,
             Stage::route_configuration,
+            {Operation::remove_veth, Operation::remove_namespace},
+        },
+        SetupFailureCase{
+            Operation::configure_nat,
+            Stage::nat_configuration,
             {Operation::remove_veth, Operation::remove_namespace},
         }));
 
@@ -721,6 +732,7 @@ INSTANTIATE_TEST_SUITE_P(
     ::testing::Values(
         Cause::collision,
         Cause::unavailable_or_invalid_tool,
+        Cause::unsupported_host_configuration,
         Cause::system_failure,
         Cause::command_exit,
         Cause::command_signal,

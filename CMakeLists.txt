@@ -241,6 +241,7 @@ if(BUILD_TESTING)
             PROPERTIES
                 LABELS privileged
                 RUN_SERIAL TRUE
+                SKIP_RETURN_CODE 77
         )
     endif()
 

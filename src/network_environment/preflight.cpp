@@ -19,6 +19,12 @@ constexpr std::array<std::string_view, 4> ip_paths{
     "/sbin/ip",
     "/bin/ip",
 };
+constexpr std::array<std::string_view, 4> nft_paths{
+    "/usr/sbin/nft",
+    "/usr/bin/nft",
+    "/sbin/nft",
+    "/bin/nft",
+};
 
 [[nodiscard]] std::uint32_t prefix_mask(const std::uint8_t length)
 {
@@ -106,9 +112,14 @@ template<typename Value>
         ntohl(destination),
         route.rtm_dst_len,
     };
-    return prefixes_overlap(prefix, session_subnet)
-        ? RouteDumpStatus::collision
-        : RouteDumpStatus::pending;
+    if (prefix.length == 1
+        && (prefix.address == 0x00000000U || prefix.address == 0x80000000U)) {
+        return RouteDumpStatus::unsupported;
+    }
+    if (prefixes_overlap(prefix, session_subnet)) {
+        return RouteDumpStatus::collision;
+    }
+    return RouteDumpStatus::pending;
 }
 
 } // namespace
@@ -137,12 +148,25 @@ std::span<const std::string_view> trusted_ip_paths()
     return ip_paths;
 }
 
+std::span<const std::string_view> trusted_nft_paths()
+{
+    return nft_paths;
+}
+
 PreflightResult run_preflight(
     PreflightPlatform& platform,
     const std::chrono::steady_clock::time_point deadline)
 {
     if (!platform.privileged()) {
         return {false, Cause::system_failure, {}};
+    }
+
+    const std::optional<bool> forwarding{platform.ipv4_forwarding_enabled()};
+    if (!forwarding) {
+        return {false, Cause::system_failure, {}};
+    }
+    if (!*forwarding) {
+        return {false, Cause::unsupported_host_configuration, {}};
     }
 
     std::string selected_tool;
@@ -196,10 +220,24 @@ PreflightResult run_preflight(
     if (routes == RouteDumpStatus::collision) {
         return {false, Cause::collision, {}};
     }
+    if (routes == RouteDumpStatus::unsupported) {
+        return {false, Cause::unsupported_host_configuration, {}};
+    }
     if (routes == RouteDumpStatus::timeout) {
         return {false, Cause::timeout, {}};
     }
     if (routes != RouteDumpStatus::complete) {
+        return {false, Cause::system_failure, {}};
+    }
+    const RoutePolicyStatus route_policy{
+        platform.query_route_policy(selected_tool, deadline)};
+    if (route_policy == RoutePolicyStatus::timeout) {
+        return {false, Cause::timeout, {}};
+    }
+    if (route_policy == RoutePolicyStatus::unsupported) {
+        return {false, Cause::unsupported_host_configuration, {}};
+    }
+    if (route_policy != RoutePolicyStatus::supported) {
         return {false, Cause::system_failure, {}};
     }
     return {true, Cause::system_failure, std::move(selected_tool)};

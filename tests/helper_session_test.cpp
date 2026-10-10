@@ -34,6 +34,8 @@ std::vector<ScriptStep> successful_preparation()
         {Operation::assign_namespace_address},
         {Operation::bring_namespace_link_up},
         {Operation::add_default_route},
+        {Operation::configure_nat},
+        {Operation::remove_nat, Outcome::removed},
         {Operation::remove_veth, Outcome::removed},
         {Operation::remove_namespace, Outcome::removed},
     };
@@ -185,8 +187,10 @@ TEST(HelperSessionTest, PreparesLaunchesReapsAndCleansInOrder)
     EXPECT_EQ(operations.actions[6], "cleanup succeeded");
     EXPECT_TRUE(operations.lock_was_held_after_reap);
     EXPECT_FALSE(trace->host_lock_alive);
-    EXPECT_EQ(trace->operations[10], Operation::remove_veth);
-    EXPECT_EQ(trace->operations[11], Operation::remove_namespace);
+    EXPECT_EQ(trace->operations[10], Operation::configure_nat);
+    EXPECT_EQ(trace->operations[11], Operation::remove_nat);
+    EXPECT_EQ(trace->operations[12], Operation::remove_veth);
+    EXPECT_EQ(trace->operations[13], Operation::remove_namespace);
 }
 
 TEST(HelperSessionTest, PreparationFailureRetriesResidualWithoutLaunching)
@@ -237,8 +241,8 @@ TEST(HelperSessionTest, ExecFailureCleansBeforeReportingAndPreservesConventional
 TEST(HelperSessionTest, CleanupFailureKeepsWorkloadResultAndFailsSession)
 {
     auto script{successful_preparation()};
-    script[10] = {Operation::remove_veth, Outcome::cleanup_retained, Cause::command_exit};
-    script.push_back({Operation::remove_veth, Outcome::removed});
+    script[11] = {Operation::remove_nat, Outcome::cleanup_retained, Cause::command_exit};
+    script.push_back({Operation::remove_nat, Outcome::removed});
     auto trace{std::make_shared<SharedTrace>()};
     ScriptedHelperSession operations{std::move(script), trace};
     std::ostringstream error;

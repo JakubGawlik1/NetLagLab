@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -28,14 +29,23 @@ struct FileMetadata {
 
 [[nodiscard]] bool is_trusted_executable(FileMetadata metadata);
 [[nodiscard]] std::span<const std::string_view> trusted_ip_paths();
+[[nodiscard]] std::span<const std::string_view> trusted_nft_paths();
 
 enum class RouteDumpStatus {
     pending,
     complete,
     collision,
+    unsupported,
     netlink_error,
     timeout,
     malformed,
+};
+
+enum class RoutePolicyStatus {
+    supported,
+    unsupported,
+    failure,
+    timeout,
 };
 
 class RouteDumpDecoder {
@@ -89,7 +99,11 @@ public:
     [[nodiscard]] virtual QueryStatus query_namespace_name() = 0;
     [[nodiscard]] virtual QueryStatus query_link_name(std::string_view name) = 0;
     [[nodiscard]] virtual AddressQuery query_addresses() = 0;
+    [[nodiscard]] virtual std::optional<bool> ipv4_forwarding_enabled() = 0;
     [[nodiscard]] virtual RouteDumpStatus query_routes(
+        std::chrono::steady_clock::time_point deadline) = 0;
+    [[nodiscard]] virtual RoutePolicyStatus query_route_policy(
+        std::string_view ip_path,
         std::chrono::steady_clock::time_point deadline) = 0;
 };
 

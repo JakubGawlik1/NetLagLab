@@ -22,13 +22,24 @@ A shared trace keeps semantic calls and absolute deadlines observable after the
 dependencies move into an owner.
 
 The production entry point now acquires the root-owned host lock before its
-read-only preflight. That preflight validates root execution and a root-owned,
-non-writable fixed-path `ip`; checks the fixed namespace path and both host link
-names; inventories host IPv4 address prefixes; and performs a bounded,
-validated `RTM_GETROUTE` dump across all routing tables. Controlled tests cover
+read-only preflight. That preflight validates root execution and root-owned,
+non-writable fixed-path `ip` and `nft` executables; requires IPv4 forwarding
+already enabled; checks the fixed namespace path and both host link names;
+inventories host IPv4 address prefixes; performs a bounded, validated
+`RTM_GETROUTE` dump across all routing tables; and refuses nonstandard IPv4
+policy rules, missing gateway defaults, and common tunnel uplinks. Controlled tests cover
 exact, broader, and narrower overlaps, permitted default routes, multiple
 tables, multipart completion, netlink errors, truncation, malformed attributes,
 typed failures, and the absence of later mutation after rejection.
+
+The production adapter configures source masquerading in a dedicated nftables
+`ip netlaglab` table. Its rule matches input from `nll-host` and source
+`10.200.0.2`; a random table comment is retained as cleanup proof. Partial
+setup is reconciled and rolled back, and cleanup deletes the table only after
+verifying the table, chain, and rule match the owned definition. Host firewall
+policy is not modified, so the host must already permit forwarded traffic.
+Adapter tests cover command
+arguments and table cleanup; privileged TCP/UDP qualification has not been run.
 
 The same private library contains a bounded command runner that executes an
 exact path with separate arguments and an empty environment, enforces an
@@ -113,9 +124,9 @@ The helper performs the setup as a transaction. The required mechanisms are:
 3. Move `nll-app` into the Session namespace.
 4. Assign addresses and bring up `nll-host`, `nll-app`, and namespace loopback.
 5. Add the namespace default route through `10.200.0.1`.
-6. Prepare the private mount view used to expose a Session-specific read-only
+6. Install Session-owned NAT in the dedicated nftables table.
+7. Prepare the private mount view used to expose a Session-specific read-only
    `/etc/resolv.conf` to the Workload.
-7. Install Session-owned NAT and any explicitly approved firewall exception.
 8. Apply the unrestricted initial Network Profile.
 9. Launch the Workload inside the network and mount environment.
 
@@ -132,8 +143,11 @@ collisions, and proves that the required inventory can be read. It does not
 claim in advance that the kernel or current capabilities will permit namespace
 creation, veth creation, or `setns()`; failure of one of those mechanisms is a
 `system failure` at the first corresponding mutation and follows normal
-rollback. It also does not require `net.ipv4.ip_forward` to be enabled: that
-prerequisite belongs to later host-routing, NAT, and firewall integration.
+rollback. It requires `net.ipv4.ip_forward` to already be enabled and verifies
+standard IPv4 policy routing plus at least one gateway default route. Split
+default routes and common tunnel interfaces are refused. These checks do not
+prove that a host firewall permits forwarded traffic, and the helper does not
+modify firewall policy.
 Namespace paths, host link names, and address prefixes use narrow system query
 interfaces; routes in all host tables use a validated read-only rtnetlink dump.
 Mutating iproute2 commands are not used as substitutes for collision preflight.
