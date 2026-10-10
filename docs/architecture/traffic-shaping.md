@@ -3,14 +3,12 @@
 ## Status
 
 The code contains typed outbound and inbound profile settings, validation, and
-an integrated Controller-to-helper Profile Change path. Status owns the last
-helper-confirmed profile. The production restore-only adapter cannot confirm a
-change, so status remains unrestricted and reports `shaping: not applied`.
-Delay, jitter, and loss were exercised manually with `tc/netem`; bandwidth
-limiting was not established by that experiment.
-
-The semantics and Profile Change rules below are accepted target design. Runtime
-qdisc application and live updates are not implemented.
+an integrated Controller-to-helper Profile Change path. The helper applies live
+directional delay with `tc/netem` on the Session's proven veth endpoints. Status
+reflects only helper-confirmed changes. Jitter, packet loss, and bandwidth are
+not applied and cannot be acknowledged as applied. Deterministic scripted tests
+cover the operation and rollback contract; privileged Session qualification has
+not been run for this implementation.
 
 ## Network Profile meaning
 
@@ -30,6 +28,12 @@ routing, NAT, DNS, or firewall setup.
 
 The MVP has no initial-profile or configuration-file CLI. Live `set` and
 `reset` operations begin only after the Session becomes active.
+
+Each active direction uses one root `netem` qdisc with fixed delay. A reset of
+the last delay removes that qdisc and restores the interface's unrestricted
+`noqueue` state. If a command fails ambiguously, the helper inspects the qdisc
+and either confirms the requested or previous delay, attempts bounded rollback,
+or fails the Session when it cannot establish the state.
 
 ## Traffic direction
 

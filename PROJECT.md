@@ -71,9 +71,10 @@ cross-platform support are not current goals.
   `ControllerControlPlane` owns framing, a bounded serialized command queue,
   reply ownership, public running/stopping state, and the last helper-confirmed
   Network Profile. Its typed `set`/`reset` Profile Changes are dispatched
-  through independently validating Supervisor/helper conversations. Until a
-  real shaping backend exists, the production helper explicitly reports every
-  change as restored after failure, so status remains truthful. An attached Controller
+  through independently validating Supervisor/helper conversations. The helper
+  applies live directional delay to proven Session links with bounded rollback;
+  jitter, packet loss, and bandwidth remain unsupported. Status remains limited
+  to helper-confirmed state. An attached Controller
   receives the complete typed Session Outcome after Supervisor cleanup and
   reports the Workload result independently from infrastructure failures.
 - Session paths and Unix sockets are validated for ownership, type, permissions,
@@ -97,7 +98,10 @@ cross-platform support are not current goals.
   phases and is reconciled under the host lock before fixed-name preflight.
   Scripted, filesystem, helper, and Workload tests cover the unprivileged
   contracts; end-to-end DNS/TCP/UDP behavior remains unqualified.
-- Typed outbound and inbound profiles exist, but no network shaping is applied.
+- Live outbound and inbound fixed delay is applied with `tc/netem` to proven
+  Session links. Deterministic tests cover confirmation and rollback; privileged
+  Session packet qualification is still outstanding. Jitter, packet loss, and
+  bandwidth are not implemented.
 
 ## Candidate capabilities
 

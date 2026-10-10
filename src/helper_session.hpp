@@ -19,8 +19,22 @@ public:
         const WorkloadStandardDescriptors& standard_descriptors,
         const network_environment::WorkloadNamespaceEntry& namespace_entry) = 0;
     [[nodiscard]] virtual bool send(const HelperConversationEvent& event) = 0;
-    [[nodiscard]] virtual int supervise(WorkloadProcess workload) = 0;
+    [[nodiscard]] virtual int supervise(
+        WorkloadProcess workload,
+        network_environment::PreparedNetworkEnvironment& environment) = 0;
     [[nodiscard]] virtual bool stop_and_reap(WorkloadProcess& workload) = 0;
+};
+
+class NetworkEnvironmentProfileChangeAdapter final : public ProfileChangeAdapter {
+public:
+    explicit NetworkEnvironmentProfileChangeAdapter(
+        network_environment::PreparedNetworkEnvironment& environment);
+
+    [[nodiscard]] ProfileChangeCompletion apply(const ProfileChange& change) override;
+
+private:
+    network_environment::PreparedNetworkEnvironment& environment_;
+    NetworkProfile confirmed_{};
 };
 
 [[nodiscard]] int run_helper_session(

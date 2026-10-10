@@ -218,6 +218,13 @@ public:
         const NamespaceProof& namespace_proof,
         const PlacedVethProof& veth_proof,
         TimePoint deadline) = 0;
+    [[nodiscard]] virtual DelayChangeResult set_delay(
+        const NamespaceProof& namespace_proof,
+        const PlacedVethProof& veth_proof,
+        ShapingDirection direction,
+        std::optional<std::uint64_t> current,
+        std::optional<std::uint64_t> requested,
+        TimePoint deadline) = 0;
     [[nodiscard]] virtual ConnectivityMutationResult configure_connectivity(
         TimePoint deadline) = 0;
     [[nodiscard]] virtual ConnectivityRemovalResult remove_connectivity(
@@ -395,6 +402,23 @@ public:
         return operation(Operation::add_default_route, deadline);
     }
 
+    [[nodiscard]] DelayChangeResult set_delay(
+        const NamespaceProof&,
+        const PlacedVethProof&,
+        ShapingDirection,
+        std::optional<std::uint64_t>,
+        std::optional<std::uint64_t>,
+        const TimePoint deadline) override
+    {
+        const ScriptStep step{next(Operation::set_delay, deadline)};
+        if (step.outcome == Outcome::success) {
+            return DelayChangeResult::applied;
+        }
+        return step.outcome == Outcome::fail_unchanged
+            ? DelayChangeResult::restored_after_failure
+            : DelayChangeResult::state_unknown;
+    }
+
     [[nodiscard]] ConnectivityMutationResult configure_connectivity(
         const TimePoint deadline) override
     {
@@ -539,6 +563,8 @@ struct TrustedToolLookup {
     } else if (tool == "firewall-cmd") {
         paths = {"/usr/bin/firewall-cmd", "/usr/sbin/firewall-cmd",
                  "/bin/firewall-cmd", "/sbin/firewall-cmd"};
+    } else if (tool == "tc") {
+        paths = {"/usr/sbin/tc", "/usr/bin/tc", "/sbin/tc", "/bin/tc"};
     } else {
         return {};
     }
@@ -781,6 +807,180 @@ public:
         };
         return command_result(production_->run_ip_in_namespace(
             ip_path_, arguments, *namespace_proof.exact_handle_, deadline));
+    }
+
+    [[nodiscard]] DelayChangeResult set_delay(
+        const NamespaceProof& namespace_proof,
+        const PlacedVethProof& veth_proof,
+        const ShapingDirection direction,
+        const std::optional<std::uint64_t> current,
+        const std::optional<std::uint64_t> requested,
+        const TimePoint deadline) override
+    {
+        if (!veth_proof.identity_ || !namespace_proof.exact_handle_) {
+            return DelayChangeResult::state_unknown;
+        }
+        const bool outbound{direction == ShapingDirection::outbound};
+        const std::string_view device{outbound ? "nll-app" : "nll-host"};
+        const VethObservation observed{observe_veth(true, &namespace_proof, deadline)};
+        if (!observed.complete || !observed.identity
+            || *observed.identity != *veth_proof.identity_) {
+            return DelayChangeResult::state_unknown;
+        }
+        const std::optional<std::string> tc_path{tool_path("tc")};
+        if (!tc_path) {
+            return current.has_value()
+                ? DelayChangeResult::state_unknown
+                : DelayChangeResult::restored_after_failure;
+        }
+
+        const auto inspect = [&]() -> std::optional<std::string> {
+            const std::vector<std::string> arguments{
+                "qdisc", "show", "dev", std::string{device}};
+            const TimePoint query_deadline{std::chrono::steady_clock::now()
+                                           + operation_limit};
+            const CommandResult result = outbound
+                ? production_->run_ip_in_namespace(
+                      *tc_path, arguments, *namespace_proof.exact_handle_, query_deadline)
+                : production_->run_tool(*tc_path, arguments, query_deadline);
+            if (result.kind != CommandResultKind::success) return std::nullopt;
+            return result.standard_output;
+        };
+        const auto sole_line = [](const std::optional<std::string>& output)
+            -> std::optional<std::string_view> {
+            if (!output) return std::nullopt;
+            std::optional<std::string_view> result;
+            std::size_t line_start{};
+            while (line_start < output->size()) {
+                const std::size_t line_end{output->find('\n', line_start)};
+                std::string_view line{output->data() + line_start,
+                    (line_end == std::string::npos ? output->size() : line_end)
+                        - line_start};
+                const std::size_t content_start{line.find_first_not_of(" \t\r")};
+                if (content_start != std::string_view::npos) {
+                    line.remove_prefix(content_start);
+                    const std::size_t content_end{line.find_last_not_of(" \t\r")};
+                    line = line.substr(0U, content_end + 1U);
+                    if (result) return std::nullopt;
+                    result = line;
+                }
+                if (line_end == std::string::npos) break;
+                line_start = line_end + 1U;
+            }
+            return result;
+        };
+        const auto tokens = [](const std::string_view line) {
+            std::vector<std::string_view> result;
+            std::size_t start{};
+            while (start < line.size()) {
+                start = line.find_first_not_of(" \t\r", start);
+                if (start == std::string_view::npos) break;
+                const std::size_t end{line.find_first_of(" \t\r", start)};
+                result.push_back(line.substr(start,
+                    (end == std::string_view::npos ? line.size() : end) - start));
+                if (end == std::string_view::npos) break;
+                start = end + 1U;
+            }
+            return result;
+        };
+        const auto numeric_token = [](const std::string_view token) {
+            return !token.empty() && std::all_of(token.begin(), token.end(),
+                [](const char character) {
+                    return character >= '0' && character <= '9';
+                });
+        };
+        const auto unrestricted = [&](const std::optional<std::string>& output) {
+            const auto line{sole_line(output)};
+            if (!line) return false;
+            const auto fields{tokens(*line)};
+            return fields.size() == 6U && fields[0] == "qdisc"
+                && fields[1] == "noqueue" && fields[2] == "0:"
+                && fields[3] == "root" && fields[4] == "refcnt"
+                && numeric_token(fields[5]);
+        };
+        const auto owned_qdisc = [&](const std::optional<std::string>& output) {
+            if (!output) return false;
+            std::size_t line_start{};
+            while (line_start < output->size()) {
+                const std::size_t line_end{output->find('\n', line_start)};
+                const std::string_view line{output->data() + line_start,
+                    (line_end == std::string::npos ? output->size() : line_end)
+                        - line_start};
+                const auto fields{tokens(line)};
+                if (fields.size() >= 4U && fields[0] == "qdisc"
+                    && fields[1] == "netem" && fields[2] == "4e4c:"
+                    && fields[3] == "root") {
+                    return true;
+                }
+                if (line_end == std::string::npos) break;
+                line_start = line_end + 1U;
+            }
+            return false;
+        };
+        const auto matches = [&](const std::optional<std::string>& output,
+                                 const std::optional<std::uint64_t> value) {
+            if (!output) return false;
+            if (!value) return unrestricted(output);
+            const auto line{sole_line(output)};
+            if (!line) return false;
+            const auto fields{tokens(*line)};
+            if (fields.size() != 10U || fields[0] != "qdisc"
+                || fields[1] != "netem" || fields[2] != "4e4c:"
+                || fields[3] != "root" || fields[4] != "refcnt"
+                || !numeric_token(fields[5]) || fields[6] != "limit"
+                || !numeric_token(fields[7]) || fields[8] != "delay") {
+                return false;
+            }
+            const std::string milliseconds{std::to_string(*value) + "ms"};
+            const std::string decimal_milliseconds{
+                std::to_string(*value) + ".0ms"};
+            return fields[9] == milliseconds || fields[9] == decimal_milliseconds;
+        };
+        if (!matches(inspect(), current)) return DelayChangeResult::state_unknown;
+
+        const auto realize = [&](const std::optional<std::uint64_t> value,
+                                 const std::string_view operation,
+                                 const TimePoint command_deadline) {
+            std::vector<std::string> arguments{"qdisc"};
+            if (value) {
+                arguments.insert(arguments.end(), {std::string{operation}, "dev",
+                    std::string{device}, "root", "handle", "4e4c:", "netem", "delay",
+                    std::to_string(*value) + "ms"});
+            } else {
+                arguments.insert(arguments.end(), {"del", "dev", std::string{device},
+                    "root", "handle", "4e4c:"});
+            }
+            return outbound
+                ? production_->run_ip_in_namespace(
+                      *tc_path, arguments, *namespace_proof.exact_handle_, command_deadline)
+                : production_->run_tool(*tc_path, arguments, command_deadline);
+        };
+        const std::string_view attempt_operation{
+            requested ? (current ? "change" : "add") : "del"};
+        const CommandResult attempt{realize(requested, attempt_operation, deadline)};
+        if (attempt.kind == CommandResultKind::success) return DelayChangeResult::applied;
+        const std::optional<std::string> after_attempt{inspect()};
+        if (matches(after_attempt, requested)) return DelayChangeResult::applied;
+        if (matches(after_attempt, current)) {
+            return DelayChangeResult::restored_after_failure;
+        }
+        if (!after_attempt) return DelayChangeResult::state_unknown;
+        std::string_view rollback_operation{"del"};
+        if (current) {
+            if (owned_qdisc(after_attempt)) rollback_operation = "change";
+            else if (unrestricted(after_attempt)) rollback_operation = "add";
+            else return DelayChangeResult::state_unknown;
+        } else if (!owned_qdisc(after_attempt)) {
+            return DelayChangeResult::state_unknown;
+        }
+        const CommandResult rollback{realize(
+            current, rollback_operation,
+            std::chrono::steady_clock::now() + operation_limit)};
+        (void)rollback;
+        if (matches(inspect(), current)) {
+            return DelayChangeResult::restored_after_failure;
+        }
+        return DelayChangeResult::state_unknown;
     }
 
     [[nodiscard]] ConnectivityMutationResult configure_connectivity(
@@ -2004,6 +2204,8 @@ struct OwnerState {
     NamespaceState namespace_root;
     VethState veth_root;
     ConnectivityState connectivity_root;
+    std::optional<std::uint64_t> outbound_delay;
+    std::optional<std::uint64_t> inbound_delay;
 };
 
 struct PreparationAccess {
@@ -2223,6 +2425,34 @@ PreparedNetworkEnvironment::~PreparedNetworkEnvironment() noexcept
 WorkloadNamespaceEntry PreparedNetworkEnvironment::workload_namespace() const noexcept
 {
     return WorkloadNamespaceEntry{detail::OwnerAccess::namespace_handle(*this)};
+}
+
+DelayChangeResult PreparedNetworkEnvironment::set_delay(
+    const ShapingDirection direction,
+    const std::optional<std::uint64_t> requested)
+{
+    if (!state_ || !is_proven(state_->namespace_root)
+        || !std::holds_alternative<PlacedVethProof>(state_->veth_root)) {
+        return DelayChangeResult::state_unknown;
+    }
+    std::optional<std::uint64_t>& current = direction == ShapingDirection::outbound
+        ? state_->outbound_delay : state_->inbound_delay;
+    if (current == requested) {
+        return DelayChangeResult::applied;
+    }
+    const DelayChangeResult result{state_->runtime->adapter->set_delay(
+        std::get<NamespaceProof>(state_->namespace_root),
+        std::get<PlacedVethProof>(state_->veth_root),
+        direction,
+        current,
+        requested,
+        state_->runtime->clock->now() + operation_limit)};
+    if (result == DelayChangeResult::applied) {
+        current = requested;
+    } else if (result == DelayChangeResult::state_unknown) {
+        current.reset();
+    }
+    return result;
 }
 
 CleanupResult PreparedNetworkEnvironment::cleanup() &&

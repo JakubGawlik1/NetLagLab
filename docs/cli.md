@@ -56,19 +56,20 @@ Delay and jitter use milliseconds by default and accept `ms` or `s`. Bandwidth u
 by default and accepts `kbps` or `mbps`; it must be greater than zero. Loss uses percent by
 default, accepts `%`, and must be between 0 and 100 inclusive. Units may be attached or
 separated. Commands and names are lowercase; spaces and tabs may surround and separate tokens.
-The production helper currently responds with
-`ERROR Profile change could not be applied; previous profile remains active.` because the real
-traffic-shaping adapter is not implemented. The request still crosses the typed privilege
-boundary and completes deterministically. `help` does not advertise these commands until the
-production backend can apply them successfully.
+The production helper applies `delay` changes with `tc/netem` on the proven Session interfaces:
+outbound uses `nll-app` egress and inbound uses `nll-host` egress. Resetting the final delay in a
+direction removes its qdisc. Jitter, loss, and bandwidth remain unsupported; requests for those
+settings are rejected without changing the confirmed profile. If a failed delay change cannot
+be reconciled or rolled back, the Session terminates with an infrastructure failure.
 
 Controller lines are limited to 1024 raw bytes before trimming. At most 32 parsed commands may
 wait behind the operation in flight. Ordinary syntax errors return a fixed `ERROR` response and
 do not consume queue capacity. An oversized command or queue overflow reports a fixed error and
 disconnects the Controller without cancelling an already dispatched Profile Change.
 
-The status output says `shaping: not applied`. NetLagLab does not apply the displayed network
-profile in this stage of the project.
+Status reports the last helper-confirmed profile. It shows `shaping: applied` after a successful
+delay change, including after resetting the delay; a Session with no applied shaping remains
+`shaping: not applied`. Automated contract tests do not qualify privileged packet behavior.
 
 Only one controller can be connected at a time. After a successful `detach`, another
 `netlaglab attach` can connect to the same session. End-of-file on the controller's standard input

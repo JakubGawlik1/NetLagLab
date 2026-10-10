@@ -1,5 +1,7 @@
 #include "helper_session.hpp"
 
+#include "netlaglab/network_profile.hpp"
+
 #include <ostream>
 #include <string_view>
 #include <variant>
@@ -151,12 +153,63 @@ int run_helper_session(
         (void)operations.stop_and_reap(*launch.process);
         launch.process.reset();
     } else {
-        supervision_status = operations.supervise(std::move(*launch.process));
+        supervision_status = operations.supervise(std::move(*launch.process), *prepared);
     }
 
     const bool cleanup_succeeded{cleanup_prepared(*prepared, error)};
     const bool cleanup_reported{report_cleanup(cleanup_succeeded, operations)};
     return cleanup_succeeded && cleanup_reported ? supervision_status : 125;
+}
+
+NetworkEnvironmentProfileChangeAdapter::NetworkEnvironmentProfileChangeAdapter(
+    network_environment::PreparedNetworkEnvironment& environment)
+    : environment_{environment}
+{
+}
+
+ProfileChangeCompletion NetworkEnvironmentProfileChangeAdapter::apply(
+    const ProfileChange& change)
+{
+    ProfileChangeApplication application{apply_profile_change(confirmed_, change)};
+    const auto* candidate{std::get_if<NetworkProfile>(&application)};
+    if (candidate == nullptr) return ProfileChangeCompletion::restored_after_failure;
+
+    const bool supported{std::holds_alternative<SetDelay>(change)
+        || (std::holds_alternative<ResetSetting>(change)
+            && std::get<ResetSetting>(change).setting == NetworkSetting::delay)};
+    if (!supported) return ProfileChangeCompletion::restored_after_failure;
+    if (candidate->outbound.jitter != confirmed_.outbound.jitter
+        || candidate->inbound.jitter != confirmed_.inbound.jitter
+        || candidate->outbound.packet_loss_percent
+            != confirmed_.outbound.packet_loss_percent
+        || candidate->inbound.packet_loss_percent
+            != confirmed_.inbound.packet_loss_percent
+        || candidate->outbound.bandwidth_kbps != confirmed_.outbound.bandwidth_kbps
+        || candidate->inbound.bandwidth_kbps != confirmed_.inbound.bandwidth_kbps) {
+        return ProfileChangeCompletion::restored_after_failure;
+    }
+    const bool outbound_changed{candidate->outbound.delay != confirmed_.outbound.delay};
+    const bool inbound_changed{candidate->inbound.delay != confirmed_.inbound.delay};
+    if (!outbound_changed && !inbound_changed) return ProfileChangeCompletion::applied;
+    if (outbound_changed && inbound_changed) return ProfileChangeCompletion::state_unknown;
+    const auto direction = outbound_changed
+        ? network_environment::ShapingDirection::outbound
+        : network_environment::ShapingDirection::inbound;
+    const auto requested = outbound_changed
+        ? candidate->outbound.delay : candidate->inbound.delay;
+    const auto result{environment_.set_delay(
+        direction,
+        requested.count() == 0
+            ? std::nullopt
+            : std::optional<std::uint64_t>{
+                  static_cast<std::uint64_t>(requested.count())})};
+    if (result == network_environment::DelayChangeResult::applied) {
+        confirmed_ = *candidate;
+        return ProfileChangeCompletion::applied;
+    }
+    return result == network_environment::DelayChangeResult::restored_after_failure
+        ? ProfileChangeCompletion::restored_after_failure
+        : ProfileChangeCompletion::state_unknown;
 }
 
 } // namespace netlaglab

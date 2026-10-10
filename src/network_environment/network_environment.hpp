@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <variant>
@@ -47,6 +48,9 @@ class NamespaceHandle;
 
 class CleanupResult;
 
+enum class ShapingDirection { outbound, inbound };
+enum class DelayChangeResult { applied, restored_after_failure, state_unknown };
+
 class WorkloadNamespaceEntry {
 public:
     WorkloadNamespaceEntry() noexcept = default;
@@ -89,6 +93,9 @@ public:
     ~PreparedNetworkEnvironment() noexcept;
 
     [[nodiscard]] WorkloadNamespaceEntry workload_namespace() const noexcept;
+    [[nodiscard]] DelayChangeResult set_delay(
+        ShapingDirection direction,
+        std::optional<std::uint64_t> delay_milliseconds);
     [[nodiscard]] CleanupResult cleanup() &&;
 
 private:

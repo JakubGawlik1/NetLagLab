@@ -150,6 +150,7 @@ public:
     }
 
     std::deque<CommandResult> commands;
+    std::deque<CommandResult> tc_commands;
     std::deque<CommandResult> tool_commands;
     std::vector<RecordedCommand> recorded_tools;
     std::optional<bool> forwarding_enabled{true};
@@ -210,6 +211,11 @@ public:
             &namespace_handle,
             true,
         });
+        if (executable_path.ends_with("/tc")) {
+            CommandResult result{std::move(tc_commands.front())};
+            tc_commands.pop_front();
+            return result;
+        }
         CommandResult result{std::move(commands.front())};
         commands.pop_front();
         return result;
@@ -220,6 +226,17 @@ public:
         const std::span<const std::string> arguments,
         std::chrono::steady_clock::time_point) override
     {
+        if (arguments.size() >= 2U && arguments[0] == "qdisc") {
+            CommandResult result{std::move(tc_commands.front())};
+            tc_commands.pop_front();
+            trace->recorded_tools.push_back({
+                std::string{executable_path},
+                {arguments.begin(), arguments.end()},
+                nullptr,
+                false,
+            });
+            return result;
+        }
         recorded_tools.push_back({
             std::string{executable_path},
             {arguments.begin(), arguments.end()},
@@ -549,6 +566,124 @@ TEST(NetworkProductionAdapterTest, ConfiguresTheCompleteFixedTopology)
             "iifname", "\"nll-host\"", "ip", "saddr", "10.200.0.2/32",
             "counter", "masquerade", "comment",
             "\"netlaglab:" + nat_rule->arguments[3].substr(10) + "\""}));
+}
+
+TEST(NetworkProductionAdapterTest, AppliesOutboundDelayThroughTheOwnedNamespace)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    const std::string noqueue{"qdisc noqueue 0: root refcnt 2\n"};
+    production->tc_commands = {
+        {CommandResultKind::success, 0, {}, noqueue},
+        {CommandResultKind::success, 0, {}},
+    };
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+    queue_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+
+    EXPECT_EQ(environment->set_delay(ShapingDirection::outbound, 100U),
+              DelayChangeResult::applied);
+    const auto shaping_command{std::find_if(
+        observed->recorded_commands.begin(), observed->recorded_commands.end(),
+        [](const RecordedCommand& command) {
+            return command.executable == "/usr/sbin/tc"
+                && command.arguments.size() > 1U
+                && command.arguments[1] == "add";
+        })};
+    ASSERT_NE(shaping_command, observed->recorded_commands.end());
+    EXPECT_TRUE(shaping_command->enters_namespace);
+    EXPECT_EQ(shaping_command->arguments,
+              (std::vector<std::string>{"qdisc", "add", "dev", "nll-app",
+                  "root", "handle", "4e4c:", "netem", "delay", "100ms"}));
+}
+
+TEST(NetworkProductionAdapterTest, AppliesInboundDelayThroughHostTc)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    const std::string noqueue{"qdisc noqueue 0: root refcnt 2\n"};
+    production->tc_commands = {
+        {CommandResultKind::success, 0, {}, noqueue},
+        {CommandResultKind::success, 0, {}},
+    };
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+    queue_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    EXPECT_EQ(environment->set_delay(ShapingDirection::inbound, 50U),
+              DelayChangeResult::applied);
+
+    const auto inbound_command{std::find_if(
+        observed->recorded_tools.begin(), observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 3U && command.arguments[0] == "qdisc"
+                && command.arguments[1] == "add"
+                && command.arguments[3] == "nll-host";
+        })};
+    ASSERT_NE(inbound_command, observed->recorded_tools.end());
+    EXPECT_EQ(inbound_command->executable, "/usr/sbin/tc");
+    EXPECT_EQ(inbound_command->arguments.back(), "50ms");
+}
+
+TEST(NetworkProductionAdapterTest, DoesNotMatchDelayFromAnotherQdiscLine)
+{
+    const std::string noqueue{"qdisc noqueue 0: root refcnt 2\n"};
+    const std::array<std::string, 2> unsupported_states{
+        "qdisc netem 4e4c: root refcnt 2 limit 1000 delay 110.0ms\n"
+            "qdisc netem 1: parent 4e4c:1 limit 1000 delay 10.0ms\n",
+        "qdisc netem 4e4c: root refcnt 2 limit 1000 delay 10.0ms 2.0ms loss 1%\n",
+    };
+    for (const std::string& unsupported_state : unsupported_states) {
+        auto production{std::make_unique<FakeProductionPlatform>()};
+        for (int index{}; index < 11; ++index) {
+            production->commands.push_back({CommandResultKind::success, 0, {}});
+        }
+        production->tc_commands = {
+            {CommandResultKind::success, 0, {}, noqueue},
+            {CommandResultKind::nonzero_exit, 1, {}},
+            {CommandResultKind::success, 0, {}, unsupported_state},
+            {CommandResultKind::success, 0, {}},
+            {CommandResultKind::success, 0, {}, noqueue},
+        };
+        queue_namespace_creation(*production);
+        queue_namespace_cleanup(*production);
+        queue_host_pair(*production);
+        queue_placed_pair(*production);
+        queue_placed_pair(*production);
+        queue_absent_placed_pair(*production);
+        queue_placed_pair(*production);
+
+        PreparationResult result{testing::prepare_with_production_platform(
+            std::make_unique<PassingPreflight>(), std::move(production))};
+        auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+        ASSERT_NE(environment, nullptr);
+
+        EXPECT_EQ(environment->set_delay(ShapingDirection::outbound, 10U),
+                  DelayChangeResult::restored_after_failure);
+    }
 }
 
 TEST(NetworkProductionAdapterTest, RefusesCustomIpv4PolicyRouting)

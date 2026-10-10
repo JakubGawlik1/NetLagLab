@@ -4,6 +4,8 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <memory>
 #include <optional>
@@ -20,6 +22,7 @@ namespace {
 
 using namespace network_environment;
 using namespace network_environment::testing;
+using namespace std::chrono_literals;
 
 std::vector<ScriptStep> successful_preparation()
 {
@@ -104,7 +107,9 @@ public:
         return true;
     }
 
-    int supervise(WorkloadProcess workload) override
+    int supervise(
+        WorkloadProcess workload,
+        PreparedNetworkEnvironment&) override
     {
         actions.push_back("supervise");
         if (simulate_supervisor_loss) {
@@ -148,6 +153,68 @@ public:
     std::vector<Operation> operations_at_start_failure;
     std::vector<int> workload_exit_codes;
 };
+
+TEST(HelperSessionTest, ProfileChangeAdapterAppliesAndResetsDirectionalDelay)
+{
+    const auto trace{std::make_shared<SharedTrace>()};
+    auto preparation{prepare_scripted_network_environment(
+        {{Operation::preflight}, {Operation::create_namespace},
+         {Operation::create_veth}, {Operation::move_peer},
+         {Operation::assign_host_address}, {Operation::bring_host_link_up},
+         {Operation::bring_loopback_up}, {Operation::assign_namespace_address},
+         {Operation::bring_namespace_link_up}, {Operation::add_default_route},
+         {Operation::set_delay}, {Operation::set_delay}, {Operation::set_delay}},
+        trace)};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&preparation)};
+    ASSERT_NE(environment, nullptr);
+    NetworkEnvironmentProfileChangeAdapter adapter{*environment};
+
+    EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::outbound, 100ms}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::inbound, 250ms}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(ResetSetting{TrafficDirection::outbound,
+                                         NetworkSetting::delay}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(trace->operations,
+              (std::vector<Operation>{
+                  Operation::preflight, Operation::create_namespace,
+                  Operation::create_veth, Operation::move_peer,
+                  Operation::assign_host_address, Operation::bring_host_link_up,
+                  Operation::bring_loopback_up, Operation::assign_namespace_address,
+                  Operation::bring_namespace_link_up, Operation::add_default_route,
+                  Operation::set_delay, Operation::set_delay, Operation::set_delay}));
+}
+
+TEST(HelperSessionTest, ProfileChangeAdapterPreservesConfirmedStateOnFailure)
+{
+    const auto trace{std::make_shared<SharedTrace>()};
+    auto preparation{prepare_scripted_network_environment(
+        {{Operation::preflight}, {Operation::create_namespace},
+         {Operation::create_veth}, {Operation::move_peer},
+         {Operation::assign_host_address}, {Operation::bring_host_link_up},
+         {Operation::bring_loopback_up}, {Operation::assign_namespace_address},
+         {Operation::bring_namespace_link_up}, {Operation::add_default_route},
+         {Operation::set_delay, Outcome::success},
+         {Operation::set_delay, Outcome::fail_unchanged},
+         {Operation::set_delay, Outcome::fail_new_state}},
+        trace)};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&preparation)};
+    ASSERT_NE(environment, nullptr);
+    NetworkEnvironmentProfileChangeAdapter adapter{*environment};
+
+    EXPECT_EQ(adapter.apply(SetJitter{TrafficDirection::outbound, 5ms}),
+              ProfileChangeCompletion::restored_after_failure);
+    EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::inbound, 30ms}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::inbound, 60ms}),
+              ProfileChangeCompletion::restored_after_failure);
+    EXPECT_EQ(adapter.apply(ResetSetting{TrafficDirection::inbound,
+                                         NetworkSetting::delay}),
+              ProfileChangeCompletion::state_unknown);
+    EXPECT_EQ(std::count(trace->operations.begin(), trace->operations.end(),
+                         Operation::set_delay), 3);
+}
 
 WorkloadContext true_context()
 {

@@ -378,23 +378,14 @@ struct InvokingIds {
     return workload.wait().has_value();
 }
 
-class RestoreOnlyProfileChangeAdapter final
-    : public netlaglab::ProfileChangeAdapter {
-public:
-    netlaglab::ProfileChangeCompletion apply(
-        const netlaglab::ProfileChange&) override
-    {
-        return netlaglab::ProfileChangeCompletion::restored_after_failure;
-    }
-};
-
 [[nodiscard]] int supervise_workload(
     const int supervisor_descriptor,
     netlaglab::WorkloadProcess workload,
+    netlaglab::network_environment::PreparedNetworkEnvironment& environment,
     std::ostream& error)
 {
     netlaglab::HelperRuntimeConversation conversation;
-    RestoreOnlyProfileChangeAdapter profile_change_adapter;
+    netlaglab::NetworkEnvironmentProfileChangeAdapter profile_change_adapter{environment};
     while (true) {
         const netlaglab::WorkloadPollResult workload_result{workload.poll()};
         if (workload_result.state == netlaglab::WorkloadPollState::error) {
@@ -539,9 +530,12 @@ public:
             netlaglab::helper_conversation_event_message(event));
     }
 
-    [[nodiscard]] int supervise(netlaglab::WorkloadProcess workload) override
+    [[nodiscard]] int supervise(
+        netlaglab::WorkloadProcess workload,
+        netlaglab::network_environment::PreparedNetworkEnvironment& environment) override
     {
-        return supervise_workload(supervisor_descriptor_, std::move(workload), error_);
+        return supervise_workload(
+            supervisor_descriptor_, std::move(workload), environment, error_);
     }
 
     [[nodiscard]] bool stop_and_reap(
