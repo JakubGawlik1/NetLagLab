@@ -7,8 +7,11 @@
 #include <cstring>
 #include <fcntl.h>
 #include <grp.h>
+#include <sched.h>
 #include <string_view>
+#include <sys/mount.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <utility>
@@ -97,6 +100,39 @@ namespace {
         return {false, WTERMSIG(status)};
     }
     return {false, 0};
+}
+
+[[nodiscard]] bool mount_read_only_snapshot(
+    const int descriptor,
+    const char* const target)
+{
+    struct stat status {};
+    if (stat(target, &status) == -1 || !S_ISREG(status.st_mode)) {
+        return false;
+    }
+    const std::string source{"/proc/self/fd/" + std::to_string(descriptor)};
+    if (mount(source.c_str(), target, nullptr, MS_BIND, nullptr) == -1) {
+        return false;
+    }
+    return mount(
+               nullptr,
+               target,
+               nullptr,
+               MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC,
+               nullptr)
+           == 0;
+}
+
+[[nodiscard]] bool install_resolver_view(const WorkloadResolverView& view)
+{
+    if (unshare(CLONE_NEWNS) == -1
+        || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1) {
+        return false;
+    }
+    return mount_read_only_snapshot(
+               view.resolv_conf_descriptor(), "/etc/resolv.conf")
+           && mount_read_only_snapshot(
+               view.nsswitch_conf_descriptor(), "/etc/nsswitch.conf");
 }
 
 } // namespace
@@ -190,7 +226,8 @@ WorkloadLaunchResult launch_workload(
     const WorkloadContext& context,
     const WorkloadIdentity& identity,
     const WorkloadStandardDescriptors& standard_descriptors,
-    const network_environment::WorkloadNamespaceEntry* namespace_entry)
+    const network_environment::WorkloadNamespaceEntry* namespace_entry,
+    const WorkloadResolverView* resolver_view)
 {
     if (context.arguments.empty()) {
         return {.process = std::nullopt, .failure_exit_code = 125};
@@ -235,6 +272,9 @@ WorkloadLaunchResult launch_workload(
         }
 
         if (namespace_entry != nullptr && !namespace_entry->enter()) {
+            report_child_failure_and_exit(error_writer.get(), 125);
+        }
+        if (resolver_view != nullptr && !install_resolver_view(*resolver_view)) {
             report_child_failure_and_exit(error_writer.get(), 125);
         }
 

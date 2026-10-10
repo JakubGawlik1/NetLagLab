@@ -2,6 +2,7 @@
 
 #include "workload_context.hpp"
 #include "network_environment/network_environment.hpp"
+#include "workload_resolver_view.hpp"
 
 #include <array>
 #include <optional>
@@ -74,6 +75,7 @@ struct WorkloadLaunchResult {
     const WorkloadContext& context,
     const WorkloadIdentity& identity,
     const WorkloadStandardDescriptors& standard_descriptors = {},
-    const network_environment::WorkloadNamespaceEntry* namespace_entry = nullptr);
+    const network_environment::WorkloadNamespaceEntry* namespace_entry = nullptr,
+    const WorkloadResolverView* resolver_view = nullptr);
 
 } // namespace netlaglab

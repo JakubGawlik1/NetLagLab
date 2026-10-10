@@ -20,6 +20,7 @@ using network_environment::Stage;
     case Stage::host_configuration: return "host configuration";
     case Stage::namespace_configuration: return "namespace configuration";
     case Stage::route_configuration: return "route configuration";
+    case Stage::internet_connectivity: return "Internet connectivity";
     case Stage::cleanup: return "cleanup";
     }
     return "unknown";
@@ -37,6 +38,8 @@ using network_environment::Stage;
     case Cause::identity_unavailable: return "identity unavailable";
     case Cause::identity_mismatch: return "identity mismatch";
     case Cause::incomplete_cleanup: return "incomplete cleanup";
+    case Cause::unsupported_host_configuration:
+        return "unsupported host configuration";
     }
     return "unknown";
 }

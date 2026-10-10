@@ -9,6 +9,7 @@
 #include "socket_io.hpp"
 #include "workload_context.hpp"
 #include "workload_process.hpp"
+#include "workload_resolver_view.hpp"
 
 #include <cerrno>
 #include <charconv>
@@ -483,6 +484,35 @@ public:
     [[nodiscard]] netlaglab::network_environment::PreparationResult prepare()
         override
     {
+        netlaglab::ResolverViewReadResult resolver_config{
+            netlaglab::read_host_resolver_view()};
+        if (!resolver_config.configuration.has_value()) {
+            error_ << "NetLagLab helper: DNS preflight failed: "
+                   << resolver_config.failure << '\n';
+            return netlaglab::network_environment::PreparationFailure{
+                .primary = {
+                    netlaglab::network_environment::Stage::preflight,
+                    netlaglab::network_environment::Cause::unsupported_host_configuration,
+                },
+                .rollback_failures = {},
+                .residual = std::nullopt,
+            };
+        }
+        netlaglab::WorkloadResolverViewResult resolver_view{
+            netlaglab::create_workload_resolver_view(*resolver_config.configuration)};
+        if (!resolver_view.view.has_value()) {
+            error_ << "NetLagLab helper: DNS preflight failed: "
+                   << resolver_view.failure << '\n';
+            return netlaglab::network_environment::PreparationFailure{
+                .primary = {
+                    netlaglab::network_environment::Stage::preflight,
+                    netlaglab::network_environment::Cause::system_failure,
+                },
+                .rollback_failures = {},
+                .residual = std::nullopt,
+            };
+        }
+        resolver_view_.emplace(std::move(*resolver_view.view));
         return netlaglab::network_environment::prepare_network_environment();
     }
 
@@ -494,7 +524,11 @@ public:
         override
     {
         return netlaglab::launch_workload(
-            context, identity, standard_descriptors, &namespace_entry);
+            context,
+            identity,
+            standard_descriptors,
+            &namespace_entry,
+            resolver_view_.has_value() ? &*resolver_view_ : nullptr);
     }
 
     [[nodiscard]] bool send(
@@ -519,6 +553,7 @@ public:
 private:
     int supervisor_descriptor_;
     std::ostream& error_;
+    std::optional<netlaglab::WorkloadResolverView> resolver_view_;
 };
 
 int usage_error(const std::string_view message)

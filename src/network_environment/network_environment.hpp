@@ -15,6 +15,7 @@ enum class Stage {
     host_configuration,
     namespace_configuration,
     route_configuration,
+    internet_connectivity,
     cleanup,
 };
 
@@ -28,6 +29,7 @@ enum class Cause {
     identity_unavailable,
     identity_mismatch,
     incomplete_cleanup,
+    unsupported_host_configuration,
 };
 
 struct Failure {

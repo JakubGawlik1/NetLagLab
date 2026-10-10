@@ -1,16 +1,22 @@
 #include "network_environment/production_adapter.hpp"
 #include "network_environment/production_test_support.hpp"
+#include "network_environment/recovery_journal.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <csignal>
 #include <deque>
 #include <memory>
+#include <optional>
+#include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace netlaglab::network_environment {
 namespace {
@@ -34,6 +40,11 @@ class FakeHostLock final : public HostLock {
 
 class PassingPreflight final : public PreflightPlatform {
 public:
+    explicit PassingPreflight(const bool namespace_conflict = false)
+        : namespace_conflict_{namespace_conflict}
+    {
+    }
+
     [[nodiscard]] HostLockResult acquire_host_lock() override
     {
         return {std::make_unique<FakeHostLock>()};
@@ -45,7 +56,7 @@ public:
     }
     [[nodiscard]] QueryStatus query_namespace_name() override
     {
-        return QueryStatus::absent;
+        return namespace_conflict_ ? QueryStatus::present : QueryStatus::absent;
     }
     [[nodiscard]] QueryStatus query_link_name(std::string_view) override
     {
@@ -57,6 +68,9 @@ public:
     {
         return RouteDumpStatus::complete;
     }
+
+private:
+    bool namespace_conflict_;
 };
 
 class FakeNamespaceHandle final : public NamespaceHandle {
@@ -103,14 +117,50 @@ struct RecordedLinkQuery {
 
 struct FakeProductionTrace {
     std::vector<RecordedCommand> recorded_commands;
+    std::vector<RecordedCommand> recorded_tools;
     std::vector<RecordedLinkQuery> recorded_link_queries;
+    std::vector<std::string> consent_requests;
     std::shared_ptr<std::vector<std::string>> events{
         std::make_shared<std::vector<std::string>>()};
 };
 
 class FakeProductionPlatform final : public ProductionPlatform {
 public:
+    FakeProductionPlatform()
+    {
+        std::array<char, 64> path{};
+        constexpr std::string_view prefix{"/tmp/netlaglab-production-XXXXXX"};
+        std::copy(prefix.begin(), prefix.end(), path.begin());
+        const char* const directory{mkdtemp(path.data())};
+        if (directory != nullptr) {
+            recovery_directory_path_ = directory;
+            recovery_directory_descriptor_ = open(
+                directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        }
+    }
+
+    ~FakeProductionPlatform() override
+    {
+        if (recovery_directory_descriptor_ != -1) {
+            close(recovery_directory_descriptor_);
+        }
+        if (!recovery_directory_path_.empty()) {
+            std::filesystem::remove_all(recovery_directory_path_);
+        }
+    }
+
     std::deque<CommandResult> commands;
+    std::deque<CommandResult> tool_commands;
+    std::vector<RecordedCommand> recorded_tools;
+    std::optional<bool> forwarding_enabled{true};
+    std::optional<bool> legacy_rules{false};
+    bool consent_granted{true};
+    std::string ufw_status_output{"Status: inactive\n"};
+    std::string ufw_rules_output;
+    std::string firewalld_state_output{"not running\n"};
+    std::string firewalld_zone{"public"};
+    bool firewalld_policy_exists{};
+    std::string nft_table_name;
     std::deque<NamespaceQuery> namespaces;
     std::deque<LinkQuery> host_links;
     std::deque<LinkQuery> namespace_links;
@@ -149,6 +199,114 @@ public:
         CommandResult result{std::move(commands.front())};
         commands.pop_front();
         return result;
+    }
+
+    [[nodiscard]] CommandResult run_tool(
+        const std::string_view executable_path,
+        const std::span<const std::string> arguments,
+        std::chrono::steady_clock::time_point) override
+    {
+        recorded_tools.push_back({
+            std::string{executable_path},
+            {arguments.begin(), arguments.end()},
+            nullptr,
+            false,
+        });
+        trace->recorded_tools.push_back(recorded_tools.back());
+        if (!tool_commands.empty()) {
+            CommandResult result{std::move(tool_commands.front())};
+            tool_commands.pop_front();
+            return result;
+        }
+        const std::string_view command{
+            arguments.empty() ? std::string_view{} : std::string_view{arguments.front()}};
+        if (command == "status") {
+            if (arguments.size() > 1U && arguments[1] == "numbered") {
+                return {CommandResultKind::success, 0, {}, ufw_rules_output};
+            }
+            return {CommandResultKind::success, 0, {}, ufw_status_output};
+        }
+        if (command == "--state") {
+            const bool running{firewalld_state_output == "running\n"};
+            return {running ? CommandResultKind::success
+                            : CommandResultKind::nonzero_exit,
+                    running ? 0 : 252, {}, firewalld_state_output};
+        }
+        if (command.starts_with("--get-zone-of-interface=")) {
+            return {CommandResultKind::success, 0, {}, firewalld_zone + "\n"};
+        }
+        if (command.starts_with("--new-policy=")) {
+            firewalld_policy_exists = true;
+            return {CommandResultKind::success, 0, {}, {}};
+        }
+        if (command.starts_with("--info-policy=")) {
+            if (!firewalld_policy_exists) {
+                return {CommandResultKind::nonzero_exit, 2, "INVALID_POLICY", {}};
+            }
+            return {CommandResultKind::success, 0, {},
+                    "ingress-zones: " + firewalld_zone
+                        + "\negress-zones: ANY\nrich rules:\n"
+                          " rule family=\"ipv4\" source address=\"10.200.0.2/32\" accept\n"};
+        }
+        if (command.starts_with("--delete-policy=")) {
+            firewalld_policy_exists = false;
+            return {CommandResultKind::success, 0, {}, {}};
+        }
+        if (command == "list" && arguments.size() == 2U
+            && arguments[1] == "ruleset") {
+            return {CommandResultKind::success, 0, {}, {}};
+        }
+        if (command == "list" && arguments.size() == 4U
+            && arguments[1] == "table") {
+            if (arguments[3] == nft_table_name) {
+                return {CommandResultKind::success, 0, {},
+                        "table ip " + arguments[3] + " {}\n"};
+            }
+            return {CommandResultKind::nonzero_exit, 1, "No such file", {}};
+        }
+        if (command == "add" && arguments.size() == 4U
+            && arguments[1] == "table") {
+            nft_table_name = arguments[3];
+        }
+        if (command == "delete" && arguments.size() == 4U
+            && arguments[1] == "table") {
+            nft_table_name.clear();
+        }
+        if (arguments.size() > 1U && arguments[0] == "route"
+            && arguments[1] == "allow") {
+            const std::string marker{arguments.back()};
+            ufw_rules_output = "[ 1] 10.200.0.2 on nll-host ALLOW FWD # "
+                               + marker + "\n";
+        } else if (arguments.size() > 1U && arguments[0] == "route"
+                   && arguments[1] == "delete") {
+            ufw_rules_output.clear();
+        }
+        return {CommandResultKind::success, 0, {}, {}};
+    }
+
+    [[nodiscard]] std::optional<bool> ipv4_forwarding_enabled() override
+    {
+        return forwarding_enabled;
+    }
+
+    [[nodiscard]] std::optional<bool> legacy_iptables_rules_present() override
+    {
+        return legacy_rules;
+    }
+
+    [[nodiscard]] bool request_firewall_consent(
+        const std::string_view rule,
+        std::chrono::steady_clock::time_point) override
+    {
+        trace->consent_requests.emplace_back(rule);
+        return consent_granted;
+    }
+
+    [[nodiscard]] int open_recovery_directory() override
+    {
+        return recovery_directory_descriptor_ == -1
+            ? -1
+            : dup(recovery_directory_descriptor_);
     }
 
     [[nodiscard]] NamespaceQuery query_namespace() override
@@ -194,6 +352,10 @@ public:
         namespace_links.pop_front();
         return result;
     }
+
+private:
+    std::string recovery_directory_path_;
+    int recovery_directory_descriptor_{-1};
 };
 
 LinkQuery present_link(
@@ -301,6 +463,197 @@ TEST(NetworkProductionAdapterTest, ConfiguresTheCompleteFixedTopology)
             observed->recorded_commands[index].inherited_namespace,
             exact_namespace);
     }
+    const auto nat_rule{std::find_if(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add"
+                && command.arguments[1] == "rule";
+        })};
+    ASSERT_NE(nat_rule, observed->recorded_tools.end());
+    EXPECT_EQ(
+        nat_rule->arguments,
+        (std::vector<std::string>{
+            "add", "rule", "ip", nat_rule->arguments[3], "postrouting", "ip",
+            "saddr", "10.200.0.2/32", "counter", "masquerade", "comment",
+            "\"netlaglab:" + nat_rule->arguments[3].substr(10) + "\""}));
+}
+
+TEST(NetworkProductionAdapterTest, RefusesFirewallMutationWithoutInteractiveConsent)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->ufw_status_output = "Status: active\n";
+    production->consent_granted = false;
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    const PreparationFailure& failure{std::get<PreparationFailure>(result)};
+    EXPECT_EQ(failure.primary.stage, Stage::internet_connectivity);
+    EXPECT_TRUE(failure.rollback_failures.empty());
+    ASSERT_EQ(observed->consent_requests.size(), 1U);
+    EXPECT_NE(observed->consent_requests.front().find("nll-host"), std::string::npos);
+    EXPECT_NE(observed->consent_requests.front().find("10.200.0.2"), std::string::npos);
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add"
+                && (command.arguments[1] == "table"
+                    || command.arguments[1] == "rule");
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, AddsAndRemovesOnlyTheConsentedUfwRule)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->ufw_status_output = "Status: active\n";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    CleanupResult cleanup{std::move(
+        std::get<PreparedNetworkEnvironment>(result)).cleanup()};
+    EXPECT_TRUE(cleanup.failures.empty());
+    EXPECT_FALSE(cleanup.residual.has_value());
+    ASSERT_EQ(observed->consent_requests.size(), 1U);
+    EXPECT_NE(observed->consent_requests.front().find("nll-host"), std::string::npos);
+    const auto allow{std::find_if(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "route"
+                && command.arguments[1] == "allow";
+        })};
+    ASSERT_NE(allow, observed->recorded_tools.end());
+    EXPECT_EQ(
+        allow->arguments,
+        (std::vector<std::string>{
+            "route", "allow", "in", "on", "nll-host", "from", "10.200.0.2",
+            "comment", allow->arguments.back()}));
+    const auto remove{std::find_if(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "route"
+                && command.arguments[1] == "delete";
+        })};
+    ASSERT_NE(remove, observed->recorded_tools.end());
+    EXPECT_EQ(allow->arguments[allow->arguments.size() - 1U],
+              remove->arguments.back());
+}
+
+TEST(NetworkProductionAdapterTest, AddsAndRemovesScopedFirewalldPolicy)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->firewalld_state_output = "running\n";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    CleanupResult cleanup{std::move(
+        std::get<PreparedNetworkEnvironment>(result)).cleanup()};
+    EXPECT_TRUE(cleanup.failures.empty());
+    EXPECT_FALSE(cleanup.residual.has_value());
+    ASSERT_EQ(observed->consent_requests.size(), 1U);
+    EXPECT_NE(observed->consent_requests.front().find("public"), std::string::npos);
+    EXPECT_NE(observed->consent_requests.front().find("10.200.0.2/32"), std::string::npos);
+    EXPECT_TRUE(std::any_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return !command.arguments.empty()
+                && command.arguments[0].starts_with("--new-policy=netlaglab-");
+        }));
+    EXPECT_TRUE(std::any_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return !command.arguments.empty()
+                && command.arguments[0].starts_with("--delete-policy=netlaglab-");
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, ReconcilesJournalBeforeRejectingFixedNameCollision)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    const int journal_directory{production->open_recovery_directory()};
+    ASSERT_NE(journal_directory, -1);
+    const detail::RecoveryRecord record{
+        detail::RecoveryBackend::nftables,
+        detail::RecoveryPhase::applied,
+        "0123456789abcdef0123456789abcdef",
+    };
+    production->nft_table_name = "netlaglab_" + record.token;
+    ASSERT_TRUE(detail::write_recovery_record(
+        journal_directory, ::geteuid(), record));
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(true), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(
+        std::get<PreparationFailure>(result).primary.cause,
+        Cause::collision);
+    const auto table_deletion{std::find_if(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() == 4U
+                && command.arguments[0] == "delete"
+                && command.arguments[1] == "table";
+        })};
+    std::string tool_log;
+    for (const RecordedCommand& command : observed->recorded_tools) {
+        for (const std::string& argument : command.arguments) {
+            tool_log += argument + ' ';
+        }
+        tool_log.push_back('\n');
+    }
+    ASSERT_NE(table_deletion, observed->recorded_tools.end()) << tool_log;
+    EXPECT_EQ(table_deletion->arguments[3], "netlaglab_" + record.token);
+    EXPECT_EQ(
+        detail::read_recovery_record(journal_directory, ::geteuid()).status,
+        detail::RecoveryReadStatus::empty);
+    close(journal_directory);
 }
 
 struct ConfigurationFailureCase {

@@ -88,6 +88,43 @@ TEST(NetworkEnvironmentTransactionTest, PreparesAndExplicitlyCleansCompleteEnvir
         }));
 }
 
+TEST(NetworkEnvironmentTransactionTest, RollsBackConnectivityBeforeNetworkRoots)
+{
+    auto trace{std::make_shared<testing::SharedTrace>()};
+    auto script{successful_setup()};
+    script.push_back({Operation::configure_connectivity, Outcome::fail_new_state});
+    script.push_back({Operation::remove_connectivity, Outcome::removed});
+    script.push_back({Operation::remove_veth, Outcome::removed});
+    script.push_back({Operation::remove_namespace, Outcome::removed});
+
+    PreparationResult result{testing::prepare_scripted_network_environment(
+        std::move(script), trace)};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    const PreparationFailure& failure{std::get<PreparationFailure>(result)};
+    EXPECT_EQ(failure.primary.stage, Stage::internet_connectivity);
+    EXPECT_TRUE(failure.rollback_failures.empty());
+    EXPECT_FALSE(failure.residual.has_value());
+    EXPECT_EQ(
+        trace->operations,
+        (std::vector<Operation>{
+            Operation::preflight,
+            Operation::create_namespace,
+            Operation::create_veth,
+            Operation::move_peer,
+            Operation::assign_host_address,
+            Operation::bring_host_link_up,
+            Operation::bring_loopback_up,
+            Operation::assign_namespace_address,
+            Operation::bring_namespace_link_up,
+            Operation::add_default_route,
+            Operation::configure_connectivity,
+            Operation::remove_connectivity,
+            Operation::remove_veth,
+            Operation::remove_namespace,
+        }));
+}
+
 TEST(NetworkEnvironmentTransactionTest, PreparedOwnerRetainsHostLockUntilCleanup)
 {
     auto trace{std::make_shared<testing::SharedTrace>()};

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -29,6 +30,11 @@ public:
     [[nodiscard]] virtual NamespaceIdentity identity() const = 0;
 };
 
+class ConnectivityHandle {
+public:
+    virtual ~ConnectivityHandle() = default;
+};
+
 struct NamespaceQuery {
     InventoryStatus status;
     std::unique_ptr<NamespaceHandle> handle;
@@ -48,6 +54,16 @@ public:
         std::span<const std::string> arguments,
         const NamespaceHandle& namespace_handle,
         std::chrono::steady_clock::time_point deadline) = 0;
+    [[nodiscard]] virtual CommandResult run_tool(
+        std::string_view executable_path,
+        std::span<const std::string> arguments,
+        std::chrono::steady_clock::time_point deadline) = 0;
+    [[nodiscard]] virtual std::optional<bool> ipv4_forwarding_enabled() = 0;
+    [[nodiscard]] virtual std::optional<bool> legacy_iptables_rules_present() = 0;
+    [[nodiscard]] virtual bool request_firewall_consent(
+        std::string_view rule,
+        std::chrono::steady_clock::time_point deadline) = 0;
+    [[nodiscard]] virtual int open_recovery_directory() = 0;
     [[nodiscard]] virtual NamespaceQuery query_namespace() = 0;
     [[nodiscard]] virtual std::string namespace_file_argument(
         const NamespaceHandle& handle) const = 0;

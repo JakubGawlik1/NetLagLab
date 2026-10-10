@@ -18,6 +18,7 @@
 #include <ifaddrs.h>
 #include <iostream>
 #include <net/if.h>
+#include <netdb.h>
 #include <memory>
 #include <optional>
 #include <poll.h>
@@ -61,6 +62,8 @@ constexpr std::string_view ready_prefix{"NLL_SESSION_PROBE_READY:"};
 constexpr std::string_view probe_stdout{"NLL_SESSION_PROBE_STDOUT\n"};
 constexpr std::string_view probe_stderr{"NLL_SESSION_PROBE_STDERR\n"};
 constexpr std::string_view udp_result_prefix{"NLL_SESSION_PROBE_UDP:"};
+constexpr std::string_view connectivity_result_prefix{
+    "NLL_SESSION_PROBE_CONNECTIVITY:"};
 
 [[nodiscard]] int report_probe_failure(
     const int status,
@@ -299,6 +302,159 @@ extern "C" void handle_termination(int)
     return succeeded;
 }
 
+[[nodiscard]] std::optional<sockaddr_in> first_ipv4_resolver()
+{
+    std::ifstream resolver{ "/etc/resolv.conf" };
+    std::string line;
+    while (std::getline(resolver, line)) {
+        std::istringstream input{line};
+        std::string directive;
+        std::string address;
+        std::string extra;
+        if (!(input >> directive >> address) || directive != "nameserver"
+            || (input >> extra)) {
+            continue;
+        }
+        sockaddr_in result{};
+        result.sin_family = AF_INET;
+        if (inet_pton(AF_INET, address.c_str(), &result.sin_addr) == 1) {
+            return result;
+        }
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] bool resolve_qualification_name(sockaddr_in& address)
+{
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* results{};
+    if (getaddrinfo("example.com", nullptr, &hints, &results) != 0) {
+        return false;
+    }
+    const bool found{results != nullptr && results->ai_addrlen >= sizeof(sockaddr_in)};
+    if (found) {
+        address = *reinterpret_cast<const sockaddr_in*>(results->ai_addr);
+    }
+    freeaddrinfo(results);
+    return found;
+}
+
+[[nodiscard]] std::vector<unsigned char> make_dns_query()
+{
+    std::vector<unsigned char> query{
+        0x4e, 0x4c, 0x01, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    };
+    constexpr std::string_view name{"example.com"};
+    std::size_t beginning{};
+    while (beginning < name.size()) {
+        const std::size_t ending{name.find('.', beginning)};
+        const std::size_t length{ending == std::string_view::npos
+                ? name.size() - beginning
+                : ending - beginning};
+        if (length == 0U || length > 63U) {
+            return {};
+        }
+        query.push_back(static_cast<unsigned char>(length));
+        for (const char character : name.substr(beginning, length)) {
+            query.push_back(static_cast<unsigned char>(character));
+        }
+        if (ending == std::string_view::npos) {
+            break;
+        }
+        beginning = ending + 1U;
+    }
+    query.insert(query.end(), {0, 0, 1, 0, 1});
+    return query;
+}
+
+[[nodiscard]] bool perform_dns_over_udp_probe()
+{
+    const std::optional<sockaddr_in> resolver{first_ipv4_resolver()};
+    const std::vector<unsigned char> query{make_dns_query()};
+    if (!resolver.has_value() || query.empty()) {
+        return false;
+    }
+    sockaddr_in destination{*resolver};
+    destination.sin_port = htons(53);
+    const int descriptor{socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    if (descriptor == -1) {
+        return false;
+    }
+    const ssize_t sent{sendto(
+        descriptor,
+        query.data(),
+        query.size(),
+        0,
+        reinterpret_cast<const sockaddr*>(&destination),
+        sizeof(destination))};
+    if (sent != static_cast<ssize_t>(query.size())) {
+        (void)close(descriptor);
+        return false;
+    }
+    pollfd watched{descriptor, POLLIN, 0};
+    int ready{};
+    do {
+        ready = poll(&watched, 1, 5000);
+    } while (ready == -1 && errno == EINTR);
+    std::array<unsigned char, 2048> response{};
+    sockaddr_in source{};
+    socklen_t source_size{sizeof(source)};
+    const ssize_t received{ready > 0 && (watched.revents & POLLIN) != 0
+            ? recvfrom(
+                  descriptor,
+                  response.data(),
+                  response.size(),
+                  0,
+                  reinterpret_cast<sockaddr*>(&source),
+                  &source_size)
+            : -1};
+    (void)close(descriptor);
+    return received >= 12
+        && source_size == sizeof(source)
+        && source.sin_family == AF_INET
+        && source.sin_addr.s_addr == destination.sin_addr.s_addr
+        && source.sin_port == destination.sin_port
+        && response[0] == query[0] && response[1] == query[1]
+        && (response[2] & 0x80U) != 0U && (response[3] & 0x0fU) == 0U;
+}
+
+[[nodiscard]] bool perform_tcp_connectivity_probe(sockaddr_in address)
+{
+    address.sin_port = htons(443);
+    const int descriptor{socket(
+        AF_INET, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)};
+    if (descriptor == -1) {
+        return false;
+    }
+    const int connected{connect(
+        descriptor,
+        reinterpret_cast<const sockaddr*>(&address),
+        sizeof(address))};
+    if (connected == 0) {
+        (void)close(descriptor);
+        return true;
+    }
+    if (errno != EINPROGRESS) {
+        (void)close(descriptor);
+        return false;
+    }
+    pollfd watched{descriptor, POLLOUT, 0};
+    int ready{};
+    do {
+        ready = poll(&watched, 1, 5000);
+    } while (ready == -1 && errno == EINTR);
+    int error{};
+    socklen_t error_size{sizeof(error)};
+    const bool succeeded{ready > 0 && (watched.revents & POLLOUT) != 0
+        && getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error, &error_size) == 0
+        && error == 0};
+    (void)close(descriptor);
+    return succeeded;
+}
+
 [[nodiscard]] int run_workload_probe(const int argc, char* argv[])
 {
     if (argc != 5) {
@@ -307,7 +463,7 @@ extern "C" void handle_termination(int)
     const std::string_view mode{argv[2]};
     const std::string_view port_text{argv[3]};
     const std::string_view token{argv[4]};
-    if (mode != "natural" && mode != "hold") {
+    if (mode != "natural" && mode != "hold" && mode != "connectivity") {
         return report_probe_failure(81, "unexpected probe mode");
     }
     std::uint64_t port_value{};
@@ -355,6 +511,19 @@ extern "C" void handle_termination(int)
         if (sigaction(SIGTERM, &action, nullptr) == -1) {
             return report_probe_failure(86, "could not install SIGTERM handler");
         }
+    }
+    if (mode == "connectivity") {
+        sockaddr_in resolved{};
+        const bool dns_succeeded{resolve_qualification_name(resolved)};
+        const bool tcp_succeeded{dns_succeeded
+                && perform_tcp_connectivity_probe(resolved)};
+        const bool udp_succeeded{perform_dns_over_udp_probe()};
+        std::cout << connectivity_result_prefix << token << ":dns="
+                  << (dns_succeeded ? "passed" : "failed") << ",tcp="
+                  << (dns_succeeded
+                          ? (tcp_succeeded ? "passed" : "failed")
+                          : "unqualified")
+                  << ",udp=" << (udp_succeeded ? "passed" : "failed") << '\n';
     }
     std::cout << ready_prefix << token << ':' << session_inode << '\n'
               << probe_stdout << udp_result_prefix << token << ':'
@@ -1025,7 +1194,8 @@ public:
         std::string& stderr_text,
         std::uint64_t& session_inode,
         bool& host_peer_received_datagram,
-        bool& udp_exchange_succeeded) const
+        bool& udp_exchange_succeeded,
+        const std::chrono::milliseconds timeout = 20000ms) const
     {
         if (!process.start(
                 run_arguments(mode), work_directory(), std::string{stdin_value} + "\n")) {
@@ -1038,7 +1208,8 @@ public:
             stderr_text,
             session_inode,
             host_peer_received_datagram,
-            udp_exchange_succeeded);
+            udp_exchange_succeeded,
+            timeout);
     }
 
 private:
@@ -1144,6 +1315,54 @@ TEST(SessionNetworkQualification, NaturalExitPreservesContextUdpAndCleanup)
     }
     EXPECT_TRUE(host_peer_received_datagram)
         << "Workload received an echo but the host peer did not report its request";
+}
+
+TEST(SessionConnectivityQualification, ReportsDnsTcpAndUdpSeparately)
+{
+    if (!has_authorization()) {
+        GTEST_SKIP() << "set NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 only for an explicitly "
+                        "authorized local networking qualification";
+    }
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "run this CTest directly as root; the qualification harness "
+                        "does not invoke sudo";
+    }
+    Scenario scenario;
+    ASSERT_TRUE(scenario.valid());
+    ChildProcess session;
+    std::string output;
+    std::string error;
+    std::uint64_t session_inode{};
+    bool host_peer_received_datagram{};
+    bool local_udp_succeeded{};
+    ASSERT_TRUE(scenario.launch_and_wait_for_probe(
+        session,
+        "connectivity",
+        output,
+        error,
+        session_inode,
+        host_peer_received_datagram,
+        local_udp_succeeded,
+        60000ms)) << "Workload connectivity probe did not reach readiness\n"
+                   << error << output;
+
+    const std::optional<int> status{session.wait_for_exit(
+        output, error, 60000ms, &session_inode)};
+    ASSERT_TRUE(status.has_value()) << "Session did not finish\n" << error;
+    ASSERT_EQ(*status, 37) << error;
+    ASSERT_TRUE(wait_for_cleanup(session_inode))
+        << "owned namespace/veth roots or the host lock remained after qualification";
+    const std::string result_prefix{
+        std::string{connectivity_result_prefix} + scenario.token() + ":"};
+    const std::size_t result_at{output.find(result_prefix)};
+    ASSERT_NE(result_at, std::string::npos)
+        << "Workload did not report protocol-specific results\n" << output;
+    const std::size_t line_end{output.find('\n', result_at)};
+    ASSERT_NE(line_end, std::string::npos);
+    const std::string_view results{output.data() + result_at, line_end - result_at};
+    EXPECT_NE(results.find("dns=passed"), std::string_view::npos) << results;
+    EXPECT_NE(results.find("tcp=passed"), std::string_view::npos) << results;
+    EXPECT_NE(results.find("udp=passed"), std::string_view::npos) << results;
 }
 
 TEST(SessionNetworkQualification, ControllerStopReapsWorkloadBeforeCleanup)

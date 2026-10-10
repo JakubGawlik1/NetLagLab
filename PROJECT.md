@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-10-08
+Last verified: 2026-10-10
 
 ## How to use this file
 
@@ -59,9 +59,9 @@ cross-platform support are not current goals.
   Natural exit also verified its exit result and cleanup, then skipped the UDP
   exchange assertion because the packet reached `nll-host` but no reply reached
   the host peer. This is a recorded host receive-path limitation, not a passing
-  UDP qualification; no firewall changes were made. See
-  `docs/architecture/mvp-implementation-audit.md` for the run result. DNS
-  mounts, forwarding, NAT, firewall handling, and shaping remain unimplemented.
+  UDP qualification; no firewall changes were made and DNS/TCP/UDP connectivity
+  has not been qualified. See `docs/architecture/mvp-implementation-audit.md`
+  for the run result.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.
@@ -87,6 +87,16 @@ cross-platform support are not current goals.
   invoking UID/GID/supplementary groups, and explicit standard-descriptor
   semantics. It enters the exact Session network namespace while retaining the
   host's mount namespace.
+- The helper snapshots supported host IPv4 resolver settings, rejects
+  unsupported resolver behavior, and creates sealed resolver/NSS files. The
+  Workload mounts them read-only in a private mount namespace before restoring
+  invoking credentials. The production Network Environment requires host IPv4
+  forwarding to be already enabled, creates source-scoped NAT in a unique
+  nftables table, and supports scoped UFW or firewalld policy changes after
+  controlling-terminal consent. A root-owned durable journal records mutation
+  phases and is reconciled under the host lock before fixed-name preflight.
+  Scripted, filesystem, helper, and Workload tests cover the unprivileged
+  contracts; end-to-end DNS/TCP/UDP behavior remains unqualified.
 - Typed outbound and inbound profiles exist, but no network shaping is applied.
 
 ## Candidate capabilities
@@ -95,8 +105,8 @@ These bullets describe desired capabilities, not milestones or fixed task
 boundaries. Their grouping and order should be reconsidered with the user from
 current code whenever work begins.
 
-- Provide production Internet routing, scoped NAT/firewall handling, and DNS
-  for the Session network namespace.
+- Qualify the production Session DNS and scoped Internet connectivity paths
+  across supported host resolver and firewall configurations.
 - Apply separate outbound and inbound shaping and allow live profile updates.
 - Record the settings timeline as JSON Lines for replay and reports.
 - Add a GUI over the same typed operations after the CLI/control path supports

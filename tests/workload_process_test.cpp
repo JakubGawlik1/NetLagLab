@@ -1,4 +1,5 @@
 #include "workload_process.hpp"
+#include "workload_resolver_view.hpp"
 #include "file_descriptor.hpp"
 #include "socket_io.hpp"
 
@@ -121,6 +122,22 @@ TEST(WorkloadProcessTest, NamespaceEntryFailurePreventsExec)
 
     WorkloadLaunchResult launch{
         launch_workload(context, current_identity(), {}, &unavailable_namespace)};
+
+    EXPECT_FALSE(launch.process.has_value());
+    EXPECT_EQ(launch.failure_exit_code, 125);
+}
+
+TEST(WorkloadProcessTest, ResolverViewSetupFailurePreventsExec)
+{
+    const WorkloadContext context{
+        .working_directory = "/",
+        .arguments = {"/bin/true"},
+        .environment = {"PATH=/bin"},
+    };
+    const WorkloadResolverView invalid_view{FileDescriptor{-1}, FileDescriptor{-1}};
+
+    WorkloadLaunchResult launch{launch_workload(
+        context, current_identity(), {}, nullptr, &invalid_view)};
 
     EXPECT_FALSE(launch.process.has_value());
     EXPECT_EQ(launch.failure_exit_code, 125);

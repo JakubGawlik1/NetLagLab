@@ -21,6 +21,7 @@ add_library(
         src/network_environment/link_inventory.cpp
         src/network_environment/network_environment.cpp
         src/network_environment/preflight.cpp
+        src/network_environment/recovery_journal.cpp
 )
 
 target_include_directories(netlaglab_network_environment PRIVATE src)
@@ -81,6 +82,7 @@ add_executable(
     src/socket_io.cpp
     src/workload_context.cpp
     src/workload_process.cpp
+    src/workload_resolver_view.cpp
 )
 
 target_compile_features(netlaglab-helper PRIVATE cxx_std_20)
@@ -161,6 +163,7 @@ if(BUILD_TESTING)
         tests/network_environment_transaction_test.cpp
         tests/network_link_inventory_test.cpp
         tests/network_preflight_test.cpp
+        tests/recovery_journal_test.cpp
         tests/network_production_adapter_test.cpp
     )
     target_include_directories(
@@ -443,8 +446,10 @@ if(BUILD_TESTING)
         src/process_status.cpp
         src/workload_context.cpp
         src/workload_process.cpp
+        src/workload_resolver_view.cpp
         src/socket_io.cpp
         tests/workload_process_test.cpp
+        tests/workload_resolver_view_test.cpp
         tests/process_status_test.cpp
     )
     target_include_directories(netlaglab_process_tests PRIVATE src)
@@ -479,6 +484,7 @@ if(BUILD_TESTING)
         src/helper_session.cpp
         src/workload_context.cpp
         src/workload_process.cpp
+        src/workload_resolver_view.cpp
         tests/helper_session_test.cpp
     )
     target_include_directories(netlaglab_helper_session_tests PRIVATE src)

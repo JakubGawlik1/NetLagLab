@@ -1,8 +1,10 @@
 #include "production_adapter.hpp"
 
 #include "file_descriptor.hpp"
+#include "recovery_journal.hpp"
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <climits>
@@ -17,6 +19,7 @@
 #include <poll.h>
 #include <sched.h>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -300,6 +303,114 @@ public:
         }
         return run_command_in_network_namespace(
             executable_path, arguments, handle->descriptor(), deadline);
+    }
+
+    [[nodiscard]] CommandResult run_tool(
+        const std::string_view executable_path,
+        const std::span<const std::string> arguments,
+        const std::chrono::steady_clock::time_point deadline) override
+    {
+        return run_command_capturing_stdout(executable_path, arguments, deadline);
+    }
+
+    [[nodiscard]] std::optional<bool> ipv4_forwarding_enabled() override
+    {
+        const int descriptor{open(
+            "/proc/sys/net/ipv4/ip_forward", O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+        if (descriptor == -1) {
+            return std::nullopt;
+        }
+        netlaglab::FileDescriptor file{descriptor};
+        std::array<char, 8> value{};
+        const ssize_t count{read(file.get(), value.data(), value.size())};
+        if (count <= 0) {
+            return std::nullopt;
+        }
+        const std::string_view setting{value.data(), static_cast<std::size_t>(count)};
+        if (setting == "1\n" || setting == "1") return true;
+        if (setting == "0\n" || setting == "0") return false;
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<bool> legacy_iptables_rules_present() override
+    {
+        const int descriptor{open(
+            "/proc/net/ip_tables_names", O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
+        if (descriptor == -1) {
+            return errno == ENOENT ? std::optional<bool>{false} : std::nullopt;
+        }
+        netlaglab::FileDescriptor file{descriptor};
+        std::array<char, 256> names{};
+        const ssize_t count{read(file.get(), names.data(), names.size())};
+        if (count < 0 || static_cast<std::size_t>(count) == names.size()) {
+            return std::nullopt;
+        }
+        return count > 0;
+    }
+
+    [[nodiscard]] bool request_firewall_consent(
+        const std::string_view rule,
+        const std::chrono::steady_clock::time_point deadline) override
+    {
+        const int descriptor{open("/dev/tty", O_RDWR | O_CLOEXEC | O_NOCTTY)};
+        if (descriptor == -1) {
+            return false;
+        }
+        netlaglab::FileDescriptor terminal{descriptor};
+        const std::string prompt{
+            "NetLagLab requests this temporary firewall exception:\n  "
+            + std::string{rule}
+            + "\nIt will be removed during Session cleanup. Apply it? [y/N] "};
+        std::size_t written{};
+        while (written < prompt.size()) {
+            const ssize_t count{write(
+                terminal.get(), prompt.data() + written, prompt.size() - written)};
+            if (count > 0) {
+                written += static_cast<std::size_t>(count);
+            } else if (count == -1 && errno == EINTR) {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        std::array<char, 8> response{};
+        std::size_t received{};
+        while (received < response.size()) {
+            const auto remaining{deadline - std::chrono::steady_clock::now()};
+            if (remaining <= std::chrono::steady_clock::duration::zero()) {
+                return false;
+            }
+            const auto milliseconds{
+                std::chrono::ceil<std::chrono::milliseconds>(remaining)};
+            const int timeout{milliseconds.count() > INT_MAX
+                    ? INT_MAX
+                    : static_cast<int>(milliseconds.count())};
+            pollfd wait_descriptor{terminal.get(), POLLIN, 0};
+            int poll_result{};
+            do {
+                poll_result = poll(&wait_descriptor, 1, timeout);
+            } while (poll_result == -1 && errno == EINTR);
+            if (poll_result <= 0 || (wait_descriptor.revents & POLLIN) == 0) {
+                return false;
+            }
+            const ssize_t count{read(
+                terminal.get(), response.data() + received,
+                response.size() - received)};
+            if (count <= 0) {
+                return false;
+            }
+            received += static_cast<std::size_t>(count);
+            if (std::find(response.begin(), response.begin() + received, '\n')
+                != response.begin() + received) {
+                break;
+            }
+        }
+        return received == 2U && response[0] == 'y' && response[1] == '\n';
+    }
+
+    [[nodiscard]] int open_recovery_directory() override
+    {
+        return netlaglab::network_environment::detail::open_recovery_directory();
     }
 
     [[nodiscard]] NamespaceQuery query_namespace() override
