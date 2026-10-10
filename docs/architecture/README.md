@@ -38,10 +38,10 @@ and accepted feature documents before its interface is designed.
 | Feature | Responsibility | Current state |
 |---|---|---|
 | [Session lifecycle](session-lifecycle.md) | Session scope, startup, termination, result precedence, and host-wide exclusivity | Helper-owned local network preparation, Workload lifetime, and explicit cleanup implemented; privileged Session qualification remains open |
-| [Workload execution](workload-execution.md) | Workload parentage, namespace entry, user identity, execution context, and descendant ownership | Helper-owned launch enters the exact Session network namespace before identity drop; integrated privileged qualification remains open |
+| [Workload execution](workload-execution.md) | Workload parentage, namespace entry, user identity, execution context, and descendant ownership | Helper-owned launch enters the exact Session network namespace and installs a private read-only DNS/NSS view before identity drop; privileged DNS qualification remains open |
 | [Supervisor-helper protocol](supervisor-helper-protocol.md) | Privilege boundary, authentication, framing, start block, commands, acknowledgements, and events | Lifecycle, typed Profile Change conversations, and production Controller dispatch implemented; real privileged shaping remains absent |
 | [Controller control plane](controller-control-plane.md) | Attached commands, value grammar, serialization, status, stop, detach, and terminal responses | Event/action module, bounded queue, reply ownership, confirmed profile, stopping state, and complete Session Outcome implemented |
-| [Network environment](network-environment.md) | Network namespace, veth pair, addresses, routing, DNS mount, and readiness | Transaction, helper integration, host-local topology, and explicit cleanup implemented with unprivileged tests; Session-path privileged qualification remains open |
+| [Network environment](network-environment.md) | Network namespace, veth pair, addresses, routing, DNS mount, and readiness | Transaction, Session topology, and private DNS snapshot implemented with controlled tests; privileged DNS qualification remains open |
 | [Host networking and firewall](host-networking-and-firewall.md) | Forwarding preflight, NAT, firewall adapters, consent, and host-policy boundaries | Manually verified only; production adapters and recovery are not implemented |
 | [Traffic shaping](traffic-shaping.md) | Network Profile semantics, direction mapping, `tc/netem`, live deltas, and rollback | Typed validation implemented; runtime shaping is not implemented |
 | [Cleanup and recovery](cleanup-and-recovery.md) | Owned-resource cleanup, partial-failure rollback, descendant semantics, and interrupted persistent changes | Process/descriptor/socket cleanup plus standalone host-lock ownership and scripted network rollback/residual ownership implemented; production network cleanup and durable recovery remain target design |
@@ -67,8 +67,9 @@ flowchart LR
   losing it does not end the Session.
 
 The current implementation follows these process ownership boundaries and
-creates the fixed local network topology. It does not yet create a mount
-namespace or provide production DNS, Internet routing, NAT, or shaping.
+creates the fixed local network topology. It also installs a private read-only
+resolver/NSS view for supported host IPv4 DNS configurations. Internet routing,
+NAT, firewall integration, and shaping remain unimplemented.
 
 ## Cross-cutting invariants
 
@@ -88,13 +89,11 @@ namespace or provide production DNS, Internet routing, NAT, or shaping.
 
 ## Open decisions
 
-Three decisions are deliberately unresolved:
+Two decisions are deliberately unresolved:
 
-1. **DNS contents (Q64):** whether to use a read-only resolver snapshot or a
-   host-side DNS proxy.
-2. **Host route selection (Q65):** whether forwarded Workload traffic follows
+1. **Host route selection (Q65):** whether forwarded Workload traffic follows
    current host routing dynamically or uses an uplink pinned at Session start.
-3. **Persistent recovery journal (Q47):** the final path, schema, transaction
+2. **Persistent recovery journal (Q47):** the final path, schema, transaction
    protocol, and reconciliation behavior for persistent firewall changes.
 
 The profile-mutation path has an implemented typed conversation, Controller

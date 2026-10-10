@@ -76,7 +76,11 @@ public:
         EXPECT_TRUE(trace_->host_lock_alive);
         (void)namespace_entry;
         if (launch_failure.has_value()) {
-            return {.process = std::nullopt, .failure_exit_code = *launch_failure};
+            return {
+                .process = std::nullopt,
+                .failure_exit_code = *launch_failure,
+                .diagnostic = launch_diagnostic,
+            };
         }
         return launch_workload(context, identity, standard_descriptors);
     }
@@ -142,6 +146,7 @@ public:
     std::shared_ptr<SharedTrace> trace_;
     std::vector<std::string> actions;
     std::optional<int> launch_failure;
+    std::string launch_diagnostic;
     bool active_delivery_succeeds{true};
     bool simulate_supervisor_loss{};
     bool lock_was_held_after_reap{};
@@ -220,6 +225,27 @@ TEST(HelperSessionTest, ExecFailureCleansBeforeReportingAndPreservesConventional
     EXPECT_EQ(operations.actions,
               (std::vector<std::string>{"prepare", "launch", "start failed",
                                         "cleanup succeeded"}));
+    EXPECT_FALSE(trace->host_lock_alive);
+}
+
+TEST(HelperSessionTest, DnsMountFailureReportsDiagnosticAndCleansBeforeActivation)
+{
+    auto trace{std::make_shared<SharedTrace>()};
+    ScriptedHelperSession operations{successful_preparation(), trace};
+    operations.launch_failure = 125;
+    operations.launch_diagnostic =
+        "NetLagLab helper: failed to install the private read-only DNS mount view.";
+    std::ostringstream error;
+
+    const int result{run_helper_session(
+        operations, true_context(), current_identity(), {}, error)};
+
+    EXPECT_EQ(result, 0);
+    EXPECT_EQ(operations.actions,
+              (std::vector<std::string>{"prepare", "launch", "start failed",
+                                        "cleanup succeeded"}));
+    EXPECT_EQ(operations.operations_at_start_failure.size(), 10U);
+    EXPECT_EQ(error.str(), operations.launch_diagnostic + '\n');
     EXPECT_FALSE(trace->host_lock_alive);
 }
 

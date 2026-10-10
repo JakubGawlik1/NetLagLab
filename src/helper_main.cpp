@@ -493,8 +493,22 @@ public:
         const netlaglab::network_environment::WorkloadNamespaceEntry& namespace_entry)
         override
     {
+        const netlaglab::session_dns::SnapshotResult dns_snapshot{
+            netlaglab::session_dns::read_host_dns_snapshot()};
+        if (!dns_snapshot.snapshot.has_value()) {
+            return {
+                .process = std::nullopt,
+                .failure_exit_code = 125,
+                .diagnostic = "NetLagLab helper: DNS setup refused: "
+                    + dns_snapshot.error,
+            };
+        }
         return netlaglab::launch_workload(
-            context, identity, standard_descriptors, &namespace_entry);
+            context,
+            identity,
+            standard_descriptors,
+            &namespace_entry,
+            &*dns_snapshot.snapshot);
     }
 
     [[nodiscard]] bool send(

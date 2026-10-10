@@ -17,6 +17,17 @@
 namespace netlaglab {
 namespace {
 
+enum class ChildFailureKind : int {
+    generic,
+    private_dns_mount,
+};
+
+struct ChildFailureMessage {
+    int exit_code;
+    ChildFailureKind kind;
+    int system_error;
+};
+
 [[nodiscard]] int exec_failure_exit_code(const int error_code)
 {
     if (error_code == ENOENT || error_code == ENOTDIR) {
@@ -71,12 +82,15 @@ namespace {
 
 [[noreturn]] void report_child_failure_and_exit(
     const int descriptor,
-    const int exit_code)
+    const int exit_code,
+    const ChildFailureKind failure_kind = ChildFailureKind::generic,
+    const int system_error = 0)
 {
-    const char* data{reinterpret_cast<const char*>(&exit_code)};
+    const ChildFailureMessage failure{exit_code, failure_kind, system_error};
+    const char* data{reinterpret_cast<const char*>(&failure)};
     std::size_t written{};
-    while (written < sizeof(exit_code)) {
-        const ssize_t result{write(descriptor, data + written, sizeof(exit_code) - written)};
+    while (written < sizeof(failure)) {
+        const ssize_t result{write(descriptor, data + written, sizeof(failure) - written)};
         if (result > 0) {
             written += static_cast<std::size_t>(result);
         } else if (result == -1 && errno == EINTR) {
@@ -190,15 +204,30 @@ WorkloadLaunchResult launch_workload(
     const WorkloadContext& context,
     const WorkloadIdentity& identity,
     const WorkloadStandardDescriptors& standard_descriptors,
-    const network_environment::WorkloadNamespaceEntry* namespace_entry)
+    const network_environment::WorkloadNamespaceEntry* namespace_entry,
+    const session_dns::Snapshot* dns_snapshot)
 {
     if (context.arguments.empty()) {
-        return {.process = std::nullopt, .failure_exit_code = 125};
+        return {.process = std::nullopt, .failure_exit_code = 125, .diagnostic = {}};
     }
 
     std::vector<std::string> candidates{executable_candidates(context)};
     if (candidates.empty()) {
-        return {.process = std::nullopt, .failure_exit_code = 127};
+        return {.process = std::nullopt, .failure_exit_code = 127, .diagnostic = {}};
+    }
+
+    std::optional<session_dns::PrivateDnsMount> dns_mount;
+    if (dns_snapshot != nullptr) {
+        int error_number{};
+        dns_mount = session_dns::PrivateDnsMount::prepare(*dns_snapshot, error_number);
+        if (!dns_mount.has_value()) {
+            return {
+                .process = std::nullopt,
+                .failure_exit_code = 125,
+                .diagnostic = "NetLagLab helper: failed to prepare the private DNS files: "
+                    + std::string{std::strerror(error_number)} + '.',
+            };
+        }
     }
 
     std::vector<char*> argument_pointers;
@@ -217,7 +246,7 @@ WorkloadLaunchResult launch_workload(
 
     int error_pipe[2]{};
     if (pipe2(error_pipe, O_CLOEXEC) == -1) {
-        return {.process = std::nullopt, .failure_exit_code = 125};
+        return {.process = std::nullopt, .failure_exit_code = 125, .diagnostic = {}};
     }
     FileDescriptor error_reader{error_pipe[0]};
     FileDescriptor error_writer{error_pipe[1]};
@@ -225,7 +254,7 @@ WorkloadLaunchResult launch_workload(
 
     const pid_t child_pid{fork()};
     if (child_pid == -1) {
-        return {.process = std::nullopt, .failure_exit_code = 125};
+        return {.process = std::nullopt, .failure_exit_code = 125, .diagnostic = {}};
     }
 
     if (child_pid == 0) {
@@ -236,6 +265,14 @@ WorkloadLaunchResult launch_workload(
 
         if (namespace_entry != nullptr && !namespace_entry->enter()) {
             report_child_failure_and_exit(error_writer.get(), 125);
+        }
+        if (dns_mount.has_value()) {
+            int error_number{};
+            if (!dns_mount->install_in_child(error_number)) {
+                report_child_failure_and_exit(
+                    error_writer.get(), 125,
+                    ChildFailureKind::private_dns_mount, error_number);
+            }
         }
 
         struct sigaction default_action {};
@@ -300,38 +337,52 @@ WorkloadLaunchResult launch_workload(
         if ((last_error == ENOENT || last_error == ENOTDIR) && permission_denied) {
             last_error = EACCES;
         }
-        report_child_failure_and_exit(error_writer.get(), exec_failure_exit_code(last_error));
+        report_child_failure_and_exit(
+            error_writer.get(), exec_failure_exit_code(last_error));
     }
 
     error_writer.reset();
-    int failure_exit_code{};
-    char* data{reinterpret_cast<char*>(&failure_exit_code)};
+    ChildFailureMessage failure{};
+    char* data{reinterpret_cast<char*>(&failure)};
     std::size_t received{};
-    while (received < sizeof(failure_exit_code)) {
+    while (received < sizeof(failure)) {
         const ssize_t result{read(
-            error_reader.get(), data + received, sizeof(failure_exit_code) - received)};
+            error_reader.get(), data + received, sizeof(failure) - received)};
         if (result > 0) {
             received += static_cast<std::size_t>(result);
         } else if (result == 0) {
             break;
         } else if (errno != EINTR) {
             received = 1;
-            failure_exit_code = 125;
+            failure.exit_code = 125;
             break;
         }
     }
 
     if (received == 0) {
-        return {.process = WorkloadProcess{child_pid}};
+        return {
+            .process = WorkloadProcess{child_pid},
+            .failure_exit_code = 0,
+            .diagnostic = {},
+        };
     }
 
     int status{};
     while (waitpid(child_pid, &status, 0) == -1 && errno == EINTR) {
     }
-    if (received != sizeof(failure_exit_code)) {
-        failure_exit_code = 125;
+    if (received != sizeof(failure)) {
+        failure = {125, ChildFailureKind::generic, EIO};
     }
-    return {.process = std::nullopt, .failure_exit_code = failure_exit_code};
+    std::string diagnostic;
+    if (failure.kind == ChildFailureKind::private_dns_mount) {
+        diagnostic = "NetLagLab helper: failed to install the private read-only DNS "
+            "mount view: " + std::string{std::strerror(failure.system_error)} + '.';
+    }
+    return {
+        .process = std::nullopt,
+        .failure_exit_code = failure.exit_code,
+        .diagnostic = std::move(diagnostic),
+    };
 }
 
 } // namespace netlaglab

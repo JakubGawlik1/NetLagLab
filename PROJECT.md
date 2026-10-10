@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-10-08
+Last verified: 2026-10-10
 
 ## How to use this file
 
@@ -60,8 +60,15 @@ cross-platform support are not current goals.
   exchange assertion because the packet reached `nll-host` but no reply reached
   the host peer. This is a recorded host receive-path limitation, not a passing
   UDP qualification; no firewall changes were made. See
-  `docs/architecture/mvp-implementation-audit.md` for the run result. DNS
-  mounts, forwarding, NAT, firewall handling, and shaping remain unimplemented.
+  `docs/architecture/mvp-implementation-audit.md` for the run result.
+- Before Workload activation, the helper reads and validates a bounded snapshot
+  from root-owned resolver files. The Workload receives read-only resolver and
+  NSS files in a private mount namespace; host lookups use `files dns`. The
+  helper refuses symlinked, loopback, systemd-resolved, and unsupported
+  split-DNS configurations rather than inventing a public resolver. The
+  controlled DNS fixture test is opt-in and has not been run on a privileged
+  host. Internet NAT, firewall
+  handling, and shaping remain unimplemented.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.
@@ -85,8 +92,8 @@ cross-platform support are not current goals.
   host-wide lock, signalling, and reaping.
 - The Workload receives the original bounded argv/environment/cwd snapshot,
   invoking UID/GID/supplementary groups, and explicit standard-descriptor
-  semantics. It enters the exact Session network namespace while retaining the
-  host's mount namespace.
+  semantics. It enters the exact Session network namespace and uses a private
+  mount namespace for DNS while retaining the host's other mount paths.
 - Typed outbound and inbound profiles exist, but no network shaping is applied.
 
 ## Candidate capabilities

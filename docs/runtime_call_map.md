@@ -1,6 +1,6 @@
 # Current runtime call map
 
-Last verified against the working-tree code: 2026-10-08.
+Last verified against the working-tree code: 2026-10-10.
 
 This document maps the implemented process, socket, ownership, and cleanup
 flow. It does not treat accepted target architecture as implemented behavior.
@@ -18,6 +18,8 @@ flow. It does not treat accepted target architecture as implemented behavior.
 | `netlaglab_controller_protocol_tests` | Controller framing, escaping, and typed-command tests. |
 | `netlaglab_controller_outcome_tests` | Structured terminal Session Outcome protocol and attach-presentation tests. |
 | `netlaglab_process_tests` | Local unprivileged Workload-launch tests using `netlaglab-workload-probe`. |
+| `netlaglab_session_dns_tests` | Resolver snapshot bounds, validation, and private NSS rewrite tests. |
+| `netlaglab_session_dns_privileged_tests` | Opt-in private mount and controlled DNS fixture qualification. |
 | `netlaglab_helper_session_tests` | Controlled helper-boundary tests for preparation, launch, supervision, and cleanup ordering without privileged mutations. |
 
 ## Process and IPC topology
@@ -38,9 +40,11 @@ semantic helper events. The Supervisor owns and always attempts to reap only
 the `sudo` launcher PID.
 
 The helper prepares the fixed local network topology through the Network
-Environment transaction. The child enters its exact retained network namespace
-before dropping privileges. The helper itself remains in the host namespace.
-There is no mount namespace, Session DNS view, NAT, or shaping yet.
+Environment transaction. Before launch, it validates a bounded host DNS
+snapshot. The child enters its exact retained network namespace, creates a
+private mount namespace, and installs read-only resolver/NSS files before
+dropping privileges. The helper itself remains in the host namespaces.
+Internet NAT, firewall integration, and shaping are not implemented.
 
 ## `netlaglab run` call sequence
 
@@ -100,11 +104,15 @@ netlaglab-helper main
        at START_BEGIN)
     -> prepare the Network Environment transaction and acquire its host lock
        through explicit cleanup
+    -> read and validate root-owned /etc/resolv.conf and /etc/nsswitch.conf
     -> launch_workload
+       -> prepare sealed in-memory resolver and NSS files
        -> pipe2(O_CLOEXEC) for exec-success evidence
        -> fork
        -> child: PR_SET_PDEATHSIG(SIGKILL)
        -> child: setns() through capability for the exact retained handle
+       -> child: unshare(CLONE_NEWNS) and make mount propagation private
+       -> child: bind resolver/NSS files read-only at their /etc paths
        -> child: restore default SIGINT
        -> child: map transferred/inherited/closed stdin, stdout, and stderr
        -> child: setgroups -> setgid -> setuid
@@ -288,17 +296,22 @@ Supervisor. New Supervisors do not emit the legacy lines.
   invalid ordering, and bounds;
 - process: exec-success handshake, first `PATH=`, missing/non-executable
   mapping, argv/environment/cwd preservation, and fast exit;
+- DNS: bounded resolver parsing, unsupported proxy/split-DNS refusal, private
+  `hosts: files dns` rewrite, and setup-failure cleanup; the opt-in controlled
+  DNS fixture remains unrun;
 - network profile: the existing eight validation cases.
 
 ## Deliberately incomplete runtime connections
 
-1. No network or mount namespace, veth, routes, DNS view, NAT, firewall
-   adapter, qdisc, or live Network Profile mutation is created.
+1. Session network setup and the private DNS mount view are implemented.
+   Internet NAT, firewall adapters, qdisc, and live Network Profile mutation
+   are not created.
 2. The typed Profile Change path is integrated, but the production restore-only
    adapter performs no shaping; status therefore still says `shaping: not applied`.
 3. No durable firewall recovery journal exists. Q47 remains open.
-4. DNS contents (Q64) and host-route/NAT policy (Q65) remain open, so Internet
-   connectivity setup must not be implemented implicitly.
+4. DNS snapshot contents (Q64) are decided by ADR-0009. Host-route/NAT policy
+   (Q65) remains open, so Internet connectivity setup must not be implemented
+   implicitly.
 5. The privileged end-to-end happy path and terminal/pipe behavior through the
    actual local `sudo` policy require a separate explicitly authorized check.
 

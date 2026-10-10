@@ -2,6 +2,7 @@
 
 #include "workload_context.hpp"
 #include "network_environment/network_environment.hpp"
+#include "session_dns.hpp"
 
 #include <array>
 #include <optional>
@@ -68,12 +69,14 @@ private:
 struct WorkloadLaunchResult {
     std::optional<WorkloadProcess> process;
     int failure_exit_code{};
+    std::string diagnostic;
 };
 
 [[nodiscard]] WorkloadLaunchResult launch_workload(
     const WorkloadContext& context,
     const WorkloadIdentity& identity,
     const WorkloadStandardDescriptors& standard_descriptors = {},
-    const network_environment::WorkloadNamespaceEntry* namespace_entry = nullptr);
+    const network_environment::WorkloadNamespaceEntry* namespace_entry = nullptr,
+    const session_dns::Snapshot* dns_snapshot = nullptr);
 
 } // namespace netlaglab

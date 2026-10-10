@@ -8,8 +8,10 @@ namespace and veth proofs, setup transaction, and explicit cleanup. The helper
 passes a narrow capability for entering the exact retained namespace to the
 forked Workload child; the long-lived helper remains in the host network
 namespace. The production Session path has deterministic coverage but has not
-yet passed the separate privileged qualification. DNS contents and host route
-selection remain deliberately open.
+yet passed the separate privileged qualification. A bounded resolver snapshot
+and private read-only DNS/NSS view are implemented; the controlled DNS fixture
+is opt-in and has not been run in this checkout. Host route selection remains
+open.
 
 The private transaction foundation is implemented and tested without
 privilege. One preparation operation drives the complete fixed semantic setup
@@ -113,8 +115,8 @@ The helper performs the setup as a transaction. The required mechanisms are:
 3. Move `nll-app` into the Session namespace.
 4. Assign addresses and bring up `nll-host`, `nll-app`, and namespace loopback.
 5. Add the namespace default route through `10.200.0.1`.
-6. Prepare the private mount view used to expose a Session-specific read-only
-   `/etc/resolv.conf` to the Workload.
+6. Snapshot supported host IPv4 DNS configuration and prepare a private
+   read-only resolver/NSS view for the Workload.
 7. Install Session-owned NAT and any explicitly approved firewall exception.
 8. Apply the unrestricted initial Network Profile.
 9. Launch the Workload inside the network and mount environment.
@@ -454,24 +456,29 @@ The manual experiment established that:
 These findings are evidence for the target design, not implemented NetLagLab
 behavior.
 
-## DNS mechanism and open contents decision (Q64)
+## DNS snapshot (Q64)
 
 A network namespace changes interfaces, routes, ports, and network stack
-state; it does not by itself replace filesystem paths. The accepted mechanism
-is therefore a private mount namespace for the Workload with a read-only bind
-mount at `/etc/resolv.conf`.
+The accepted decision is to build a bounded snapshot from root-owned regular
+host resolver files and install it through read-only bind mounts of
+`/etc/resolv.conf` and `/etc/nsswitch.conf` in the Workload's private mount
+namespace. The private `hosts` NSS entry is always `files dns`; other NSS
+entries are preserved. The host's files and mount namespace are unchanged.
 
-What populates that file remains open:
+The supported resolver subset has at most three unicast IPv4 nameservers,
+validated search/domain entries, and an allowlist of resolver options. The
+helper refuses resolver/NSS symlinks, loopback and link-local nameservers,
+systemd-resolved routing, NSS `resolve` modules, split-DNS search routing, NSS
+include directives, and unknown resolver directives. It does not add a public
+fallback. Snapshot or mount failure is a pre-activation failure; the helper
+cleans the prepared Network Environment before reporting it. The decision and
+trade-off are recorded in
+[ADR-0009](../adr/0009-use-a-bounded-session-dns-snapshot.md).
 
-1. **Resolver snapshot:** build a bounded, validated, root-owned snapshot from
-   host resolver files once per Session. This is smaller but may lose dynamic
-   VPN split-DNS behavior.
-2. **Host-side DNS proxy:** expose a resolver through the host endpoint. This
-   can preserve more host/VPN behavior but adds another privileged service,
-   protocol, and lifecycle.
-
-An implementation slice that requires working DNS must obtain this decision.
-It must not silently inject a public resolver such as Google or Cloudflare.
+An opt-in privileged test resolves a name through a controlled local DNS
+fixture and compares the host resolver files before and after. That test has
+been built but not run here, so the production mount and lookup path remains
+unqualified on a real privileged host.
 
 ## Host route selection open decision (Q65)
 

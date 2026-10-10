@@ -76,6 +76,7 @@ add_executable(
     src/helper_session.cpp
     src/helper_main.cpp
     src/process_status.cpp
+    src/session_dns.cpp
     src/session_socket.cpp
     src/session_validation.cpp
     src/socket_io.cpp
@@ -132,6 +133,32 @@ if(BUILD_TESTING)
 
     include(GoogleTest)
     gtest_discover_tests(netlaglab_core_tests)
+
+    add_executable(
+        netlaglab_session_dns_tests
+        src/session_dns.cpp
+        tests/session_dns_test.cpp
+    )
+    target_include_directories(netlaglab_session_dns_tests PRIVATE src)
+    target_link_libraries(
+        netlaglab_session_dns_tests
+        PRIVATE GTest::gtest_main
+    )
+    target_compile_features(netlaglab_session_dns_tests PRIVATE cxx_std_20)
+    set_target_properties(
+        netlaglab_session_dns_tests
+        PROPERTIES CXX_EXTENSIONS OFF
+    )
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(
+            netlaglab_session_dns_tests
+            PRIVATE
+                -Wall
+                -Wextra
+                -Wpedantic
+        )
+    endif()
+    gtest_discover_tests(netlaglab_session_dns_tests)
 
     add_executable(
         netlaglab-network-command-probe
@@ -249,6 +276,63 @@ if(BUILD_TESTING)
                 LABELS privileged
                 RUN_SERIAL TRUE
                 TIMEOUT 60
+        )
+
+        add_executable(netlaglab_session_dns_probe tests/session_dns_probe.cpp)
+        target_compile_features(netlaglab_session_dns_probe PRIVATE cxx_std_20)
+        set_target_properties(
+            netlaglab_session_dns_probe
+            PROPERTIES CXX_EXTENSIONS OFF
+        )
+
+        add_executable(
+            netlaglab_session_dns_privileged_tests
+            src/session_dns.cpp
+            src/workload_context.cpp
+            src/workload_process.cpp
+            tests/session_dns_privileged_test.cpp
+        )
+        target_include_directories(
+            netlaglab_session_dns_privileged_tests
+            PRIVATE src
+        )
+        target_link_libraries(
+            netlaglab_session_dns_privileged_tests
+            PRIVATE
+                GTest::gtest_main
+                netlaglab_network_environment
+        )
+        target_compile_definitions(
+            netlaglab_session_dns_privileged_tests
+            PRIVATE DNS_PROBE_PATH="$<TARGET_FILE:netlaglab_session_dns_probe>"
+        )
+        add_dependencies(
+            netlaglab_session_dns_privileged_tests
+            netlaglab_session_dns_probe
+        )
+        target_compile_features(
+            netlaglab_session_dns_privileged_tests
+            PRIVATE cxx_std_20
+        )
+        set_target_properties(
+            netlaglab_session_dns_privileged_tests
+            PROPERTIES CXX_EXTENSIONS OFF
+        )
+        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(
+                netlaglab_session_dns_privileged_tests
+                PRIVATE
+                    -Wall
+                    -Wextra
+                    -Wpedantic
+            )
+        endif()
+        gtest_discover_tests(
+            netlaglab_session_dns_privileged_tests
+            PROPERTIES
+                LABELS privileged
+                RUN_SERIAL TRUE
+                TIMEOUT 30
         )
 
         add_executable(
@@ -441,6 +525,7 @@ if(BUILD_TESTING)
     add_executable(
         netlaglab_process_tests
         src/process_status.cpp
+        src/session_dns.cpp
         src/workload_context.cpp
         src/workload_process.cpp
         src/socket_io.cpp
@@ -477,6 +562,7 @@ if(BUILD_TESTING)
     add_executable(
         netlaglab_helper_session_tests
         src/helper_session.cpp
+        src/session_dns.cpp
         src/workload_context.cpp
         src/workload_process.cpp
         tests/helper_session_test.cpp

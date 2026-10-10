@@ -136,6 +136,9 @@ int run_helper_session(
     WorkloadLaunchResult launch{operations.launch(
         context, identity, standard_descriptors, namespace_entry)};
     if (!launch.process.has_value()) {
+        if (!launch.diagnostic.empty()) {
+            error << launch.diagnostic << '\n';
+        }
         const bool failure_reported{
             operations.send(ActivationFailedEvent{launch.failure_exit_code})};
         const bool cleanup_succeeded{cleanup_prepared(*prepared, error)};

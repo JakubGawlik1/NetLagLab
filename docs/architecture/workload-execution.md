@@ -4,8 +4,8 @@
 
 The helper now forks, launches, signals, and reaps the directly managed
 Workload. The child enters the exact retained Session network namespace before
-restoring the invoking identity and transmitted execution context. A mount
-namespace and DNS view are not implemented.
+creating a private mount namespace and installing its read-only DNS/NSS view.
+It then restores the invoking identity and transmitted execution context.
 
 ## Ownership boundary
 
@@ -27,6 +27,8 @@ start block. The helper then performs:
 fork
   -> establish PR_SET_PDEATHSIG
   -> enter the exact retained Session network namespace
+  -> create a private mount namespace with private propagation
+  -> bind sealed resolver and NSS snapshots read-only at /etc/resolv.conf and /etc/nsswitch.conf
   -> map standard descriptors
   -> restore supplementary groups, GID, and UID
   -> set PR_SET_NO_NEW_PRIVS
@@ -35,8 +37,13 @@ fork
 ```
 
 An exec-status pipe distinguishes successful execution from `125`, `126`, or
-`127` start failure. The Workload uses the Session network namespace. No mount
-namespace, Session DNS view, Internet NAT, or traffic shaping is installed yet.
+`127` start failure. The helper snapshots bounded, supported host IPv4 DNS
+configuration before forking and creates immutable in-memory backing files.
+The child mounts those files only in its private mount namespace before
+dropping privileges. Host resolver files and the helper's mount namespace are
+unchanged. Unsupported resolver policy or a mount failure prevents activation;
+the helper reports a diagnostic and cleans the prepared Network Environment.
+The Workload still has no Internet NAT or traffic shaping.
 
 ## Accepted target launch sequence
 
