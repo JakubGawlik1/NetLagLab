@@ -82,6 +82,19 @@ TEST(NetworkCommandRunnerTest, CapturesStandardError)
     EXPECT_EQ(result.standard_error, std::string(10, 'x'));
 }
 
+TEST(NetworkCommandRunnerTest, CapturesAndBoundsStandardOutput)
+{
+    const std::vector<std::string> arguments{"stdout", "131072"};
+
+    const CommandResult result{run_command_capturing_stdout(
+        NETWORK_COMMAND_PROBE_PATH,
+        arguments,
+        std::chrono::steady_clock::now() + std::chrono::seconds{2})};
+
+    EXPECT_EQ(result.kind, CommandResultKind::success);
+    EXPECT_EQ(result.standard_output, std::string(4096, 'y'));
+}
+
 TEST(NetworkCommandRunnerTest, DistinguishesNonzeroExitFromSignalTermination)
 {
     const CommandResult exited{run_command(

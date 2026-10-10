@@ -41,7 +41,8 @@ cross-platform support are not current goals.
   `RTM_GETROUTE` dump across all host routing tables. The command runner
   executes one exact path with separate arguments and an empty environment,
   enforces an absolute deadline, always reaps its child, and retains at most
-  4 KiB of standard-error diagnostics while draining the remainder. The
+  4 KiB of standard-error diagnostics while draining the remainder. A separate
+  mode captures bounded stdout for trusted inspection commands. The
   production adapter can create the fixed namespace and veth roots, retain an
   exact `nsfs` handle, prove the veth identities with validated `RTM_GETLINK`
   replies on both sides of that handle, and reconcile ambiguous mutation and
@@ -50,12 +51,18 @@ cross-platform support are not current goals.
   the namespace default route. Namespace-side commands enter through the exact
   retained handle in bounded short-lived children; successful completion alone
   returns the prepared owner, while configuration failure rolls back the proven
-  roots. The helper now prepares the topology before Workload launch, passes a
+  roots. Startup also reconciles the root-owned, versioned
+  `/var/lib/netlaglab/recovery.state` journal under the host lock before
+  preflight. A unique transaction comment binds the journal to one exact UFW
+  route rule; durable phase updates use file and directory synchronization,
+  while ambiguous or mismatched live state preserves the record and refuses
+  startup. Persistent firewall rule installation is not yet implemented. The
+  helper now prepares the topology before Workload launch, passes a
   capability for entering the exact retained namespace only to the forked
   child, and explicitly cleans prepared or residual ownership after Workload
   reaping. The path has deterministic unprivileged coverage but has not passed
   privileged Session qualification. DNS mounts, forwarding, NAT, firewall
-  handling, and shaping remain unimplemented.
+  rule installation, and shaping remain unimplemented.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
   it, and reports its exit result.

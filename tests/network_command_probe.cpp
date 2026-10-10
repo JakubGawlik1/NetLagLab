@@ -42,6 +42,26 @@ int main(const int argc, char* argv[])
         }
         return 0;
     }
+    if (argc == 3 && std::string_view{argv[1]} == "stdout") {
+        std::size_t size{};
+        const std::string_view value{argv[2]};
+        const auto result{
+            std::from_chars(value.data(), value.data() + value.size(), size)};
+        if (result.ec != std::errc{}) {
+            return 53;
+        }
+        const std::string output(size, 'y');
+        std::size_t written{};
+        while (written < output.size()) {
+            const ssize_t count{
+                write(STDOUT_FILENO, output.data() + written, output.size() - written)};
+            if (count <= 0) {
+                return 54;
+            }
+            written += static_cast<std::size_t>(count);
+        }
+        return 0;
+    }
     if (argc == 3 && std::string_view{argv[1]} == "sleep") {
         int milliseconds{};
         const std::string_view value{argv[2]};

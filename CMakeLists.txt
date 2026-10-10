@@ -19,8 +19,10 @@ add_library(
         src/network_environment/linux_preflight.cpp
         src/network_environment/linux_production_platform.cpp
         src/network_environment/link_inventory.cpp
+        src/network_environment/linux_recovery_backend.cpp
         src/network_environment/network_environment.cpp
         src/network_environment/preflight.cpp
+        src/network_environment/recovery_journal.cpp
 )
 
 target_include_directories(netlaglab_network_environment PRIVATE src)
@@ -159,6 +161,7 @@ if(BUILD_TESTING)
         tests/network_link_inventory_test.cpp
         tests/network_preflight_test.cpp
         tests/network_production_adapter_test.cpp
+        tests/network_recovery_journal_test.cpp
     )
     target_include_directories(
         netlaglab_network_environment_tests

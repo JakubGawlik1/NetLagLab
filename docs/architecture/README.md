@@ -43,9 +43,9 @@ and accepted feature documents before its interface is designed.
 | [Supervisor-helper protocol](supervisor-helper-protocol.md) | Privilege boundary, authentication, framing, start block, commands, acknowledgements, and events | Lifecycle, typed Profile Change conversations, and production Controller dispatch implemented; real privileged shaping remains absent |
 | [Controller control plane](controller-control-plane.md) | Attached commands, value grammar, serialization, status, stop, detach, and terminal responses | Event/action module, bounded queue, reply ownership, confirmed profile, stopping state, and complete Session Outcome implemented |
 | [Network environment](network-environment.md) | Network namespace, veth pair, addresses, routing, DNS mount, and readiness | Transaction, helper integration, host-local topology, and explicit cleanup implemented with unprivileged tests; Session-path privileged qualification remains open |
-| [Host networking and firewall](host-networking-and-firewall.md) | Forwarding preflight, NAT, firewall adapters, consent, and host-policy boundaries | Manually verified only; production adapters and recovery are not implemented |
+| [Host networking and firewall](host-networking-and-firewall.md) | Forwarding preflight, NAT, firewall adapters, consent, and host-policy boundaries | Persistent UFW recovery and safe startup reconciliation implemented; rule creation, NAT, and DNS remain unimplemented |
 | [Traffic shaping](traffic-shaping.md) | Network Profile semantics, direction mapping, `tc/netem`, live deltas, and rollback | Typed validation implemented; runtime shaping is not implemented |
-| [Cleanup and recovery](cleanup-and-recovery.md) | Owned-resource cleanup, partial-failure rollback, descendant semantics, and interrupted persistent changes | Process/descriptor/socket cleanup, local Session network cleanup, host-lock ownership, and scripted rollback/residual ownership implemented; durable recovery remains target design |
+| [Cleanup and recovery](cleanup-and-recovery.md) | Owned-resource cleanup, partial-failure rollback, descendant semantics, and interrupted persistent changes | Process/descriptor/socket cleanup, local Session network cleanup, host-lock ownership, scripted rollback/residual ownership, and UFW journal recovery implemented |
 
 ## System boundary
 
@@ -89,14 +89,12 @@ namespace or provide production DNS, Internet routing, NAT, or shaping.
 
 ## Open decisions
 
-Three decisions are deliberately unresolved:
+Two decisions are deliberately unresolved:
 
 1. **DNS contents (Q64):** whether to use a read-only resolver snapshot or a
    host-side DNS proxy.
 2. **Host route selection (Q65):** whether forwarded Workload traffic follows
    current host routing dynamically or uses an uplink pinned at Session start.
-3. **Persistent recovery journal (Q47):** the final path, schema, transaction
-   protocol, and reconciliation behavior for persistent firewall changes.
 
 The profile-mutation path has an implemented typed conversation, Controller
 dispatch, bounded queue, and confirmed-profile update checkpoint. The real

@@ -19,12 +19,12 @@ cleanup work is gone. The standalone production path can now create and clean
 the proven namespace/veth roots together with their contained addresses, link
 state, loopback state, and namespace route. The active helper prepares this
 local topology before Workload launch and explicitly cleans it after the
-Workload is reaped. NAT, firewall, DNS-mount, qdisc, and durable recovery
-ownership remain unimplemented.
+Workload is reaped. Session-owned firewall rule creation, NAT, DNS-mount, and
+qdisc ownership remain unimplemented. The durable UFW recovery journal and
+startup reconciliation described below are implemented.
 
 The remaining production ownership and cleanup rules below are accepted target
-design. A durable recovery journal is accepted in principle for persistent
-firewall changes, but its exact design remains deliberately open.
+design unless a section marks them implemented.
 
 ## Ownership rule
 
@@ -217,30 +217,37 @@ owned.
 ## Persistent firewall recovery (Q47)
 
 A UFW CLI rule can outlive the helper process, so normal in-memory RAII cannot
-make it safely Session-scoped. The accepted direction is a durable,
-root-owned recovery journal used under the same global host lock as normal
-setup and cleanup.
+make it safely Session-scoped. The implementation stores
+`/var/lib/netlaglab/recovery.state` in a root-owned directory that is not
+group- or world-writable. The regular journal file is root-owned and mode
+`0600`; readers reject symlinks, unexpected ownership or mode, malformed
+content, and records larger than 4 KiB. Its versioned ASCII record has one
+fixed UFW route-rule shape and a random 128-bit transaction ID. That ID is
+also the UFW rule comment (`netlaglab-<id>`), so an otherwise identical
+administrator rule does not grant deletion authority.
 
-The intended safety properties are:
+Journal replacement uses an exclusive temporary file in the same directory,
+`fsync` on the file, atomic rename, and `fsync` on the containing directory.
+The typed phases are `intent`, `applied`, `removing`, and `removed`; updates
+must follow the allowed transition graph and keep the same transaction ID.
+Intent must be durable before a caller applies the persistent rule. The rule
+creation path is not yet implemented.
 
-- record intent before performing a persistent mutation;
-- record that the exact mutation was successfully applied;
-- remove only the exact recorded resource during normal cleanup;
-- record successful removal before discarding recovery evidence;
-- reconcile an interrupted prior Session before creating new host resources.
+Startup acquires the existing root host lock and reconciles the journal before
+preflight or creation of namespace/veth state. With no journal it continues.
+For a live record it inspects `ufw status numbered` and requires exactly one
+active route rule whose source, destination, action, interface, and
+transaction comment match the fixed record. It persists `removing` before
+deletion, deletes by the complete UFW rule including its comment, inspects
+again, then persists `removed` before unlinking the journal and syncing the
+directory. An absent matching rule is an idempotent cleanup success. Inactive
+UFW, missing or untrusted UFW, duplicate markers, a same-source mismatch,
+corrupt evidence, or any failed inspection refuses startup and preserves the
+journal for diagnosis.
 
-The following details are not decided and must not be invented during
-implementation:
-
-- final path (a location under `/var/lib/netlaglab/` was only an example);
-- file/schema format and versioning;
-- atomic write, flush, ownership, permission, and corruption behavior;
-- exact intent/applied/removing/removed state transitions;
-- reconciliation rules for host state that differs from the journal;
-- retention and user-facing diagnostics after failed recovery.
-
-Because this is persistent privileged state, its design requires a separate
-high-risk review and may merit an ADR once the trade-off is settled.
+Controlled tests exercise durable phase transitions, interrupted removal,
+retry, corruption, symlink refusal, live identity mismatch, duplicate UFW
+matches, and lock-before-preflight ordering. No test mutates the host firewall.
 
 ## Verification obligations
 

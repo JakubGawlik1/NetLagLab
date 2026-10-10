@@ -3,6 +3,7 @@
 #include "network_environment.hpp"
 #include "preflight.hpp"
 #include "production_adapter.hpp"
+#include "recovery_journal.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -20,6 +21,12 @@ struct ProductionTrace {
 [[nodiscard]] PreparationResult prepare_with_production_platform(
     std::unique_ptr<detail::PreflightPlatform> preflight,
     std::unique_ptr<detail::ProductionPlatform> production);
+
+[[nodiscard]] PreparationResult prepare_with_recovery(
+    std::unique_ptr<detail::PreflightPlatform> preflight,
+    std::unique_ptr<detail::ProductionPlatform> production,
+    std::unique_ptr<detail::RecoveryJournalStore> journal,
+    std::unique_ptr<detail::PersistentFirewallBackend> backend);
 
 [[nodiscard]] int borrow_prepared_namespace_descriptor(
     const PreparedNetworkEnvironment& environment) noexcept;

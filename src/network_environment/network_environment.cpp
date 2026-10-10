@@ -3,6 +3,7 @@
 #include "preflight.hpp"
 #include "production_adapter.hpp"
 #include "production_test_support.hpp"
+#include "recovery_journal.hpp"
 #include "transaction_test_support.hpp"
 
 #include <algorithm>
@@ -1380,12 +1381,24 @@ namespace {
 [[nodiscard]] PreparationResult prepare_production_network_environment(
     std::unique_ptr<detail::PreflightPlatform> platform,
     std::unique_ptr<detail::ProductionPlatform> production,
-    std::shared_ptr<testing::ProductionTrace> trace = {})
+    std::shared_ptr<testing::ProductionTrace> trace = {},
+    std::unique_ptr<detail::RecoveryJournalStore> recovery_journal = {},
+    std::unique_ptr<detail::PersistentFirewallBackend> recovery_backend = {})
 {
     detail::HostLockResult lock{platform->acquire_host_lock()};
     if (!lock.lock) {
         return PreparationFailure{
             {Stage::preflight, lock.cause},
+            {},
+            std::nullopt,
+        };
+    }
+    if (recovery_journal && recovery_backend
+        && detail::reconcile_persistent_firewall(
+               *recovery_journal, *recovery_backend)
+            != detail::RecoveryOutcome::complete) {
+        return PreparationFailure{
+            {Stage::preflight, Cause::identity_mismatch},
             {},
             std::nullopt,
         };
@@ -1407,7 +1420,11 @@ PreparationResult prepare_network_environment()
 {
     return prepare_production_network_environment(
         detail::make_linux_preflight_platform(),
-        detail::make_linux_production_platform());
+        detail::make_linux_production_platform(),
+        {},
+        std::make_unique<detail::RecoveryJournalStore>(
+            detail::RecoveryJournalStore::production()),
+        detail::make_linux_persistent_firewall_backend());
 }
 
 namespace testing {
@@ -1451,6 +1468,20 @@ PreparationResult prepare_with_production_platform(
 {
     return prepare_production_network_environment(
         std::move(preflight), std::move(production));
+}
+
+PreparationResult prepare_with_recovery(
+    std::unique_ptr<detail::PreflightPlatform> preflight,
+    std::unique_ptr<detail::ProductionPlatform> production,
+    std::unique_ptr<detail::RecoveryJournalStore> journal,
+    std::unique_ptr<detail::PersistentFirewallBackend> backend)
+{
+    return prepare_production_network_environment(
+        std::move(preflight),
+        std::move(production),
+        {},
+        std::move(journal),
+        std::move(backend));
 }
 
 int borrow_prepared_namespace_descriptor(

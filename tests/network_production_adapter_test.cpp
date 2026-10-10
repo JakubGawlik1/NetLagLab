@@ -4,11 +4,17 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
+#include <sys/types.h>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -29,16 +35,52 @@ using detail::QueryStatus;
 using detail::RouteDumpStatus;
 using detail::ToolQuery;
 
+struct RecoveryOrderTrace {
+    bool host_lock_held{};
+    bool preflight_called{};
+    bool inspected_under_lock{};
+    std::size_t removals{};
+};
+
 class FakeHostLock final : public HostLock {
+public:
+    explicit FakeHostLock(std::shared_ptr<RecoveryOrderTrace> trace = {})
+        : trace_{std::move(trace)}
+    {
+    }
+
+    ~FakeHostLock() override
+    {
+        if (trace_) {
+            trace_->host_lock_held = false;
+        }
+    }
+
+private:
+    std::shared_ptr<RecoveryOrderTrace> trace_;
 };
 
 class PassingPreflight final : public PreflightPlatform {
 public:
+    explicit PassingPreflight(std::shared_ptr<RecoveryOrderTrace> trace = {})
+        : trace_{std::move(trace)}
+    {
+    }
+
     [[nodiscard]] HostLockResult acquire_host_lock() override
     {
-        return {std::make_unique<FakeHostLock>()};
+        if (trace_) {
+            trace_->host_lock_held = true;
+        }
+        return {std::make_unique<FakeHostLock>(trace_)};
     }
-    [[nodiscard]] bool privileged() const override { return true; }
+    [[nodiscard]] bool privileged() const override
+    {
+        if (trace_) {
+            trace_->preflight_called = true;
+        }
+        return true;
+    }
     [[nodiscard]] ToolQuery query_tool(std::string_view) override
     {
         return {QueryStatus::present, {true, 0, 0755}};
@@ -57,6 +99,32 @@ public:
     {
         return RouteDumpStatus::complete;
     }
+
+private:
+    std::shared_ptr<RecoveryOrderTrace> trace_;
+};
+
+class RecoveryOrderBackend final : public detail::PersistentFirewallBackend {
+public:
+    explicit RecoveryOrderBackend(std::shared_ptr<RecoveryOrderTrace> trace)
+        : trace_{std::move(trace)}
+    {
+    }
+
+    [[nodiscard]] detail::LiveRuleState inspect(std::string_view) override
+    {
+        trace_->inspected_under_lock = trace_->host_lock_held;
+        return detail::LiveRuleState::mismatch;
+    }
+
+    [[nodiscard]] bool remove_exact(std::string_view) override
+    {
+        ++trace_->removals;
+        return true;
+    }
+
+private:
+    std::shared_ptr<RecoveryOrderTrace> trace_;
 };
 
 class FakeNamespaceHandle final : public NamespaceHandle {
@@ -1019,6 +1087,40 @@ INSTANTIATE_TEST_SUITE_P(
             CommandResultKind::exec_failure,
             Cause::unavailable_or_invalid_tool},
         CommandMappingCase{CommandResultKind::system_failure, Cause::system_failure}));
+
+TEST(NetworkProductionRecoveryTest, ReconcilesUnderHostLockBeforeNetworkPreflight)
+{
+    std::array<char, 40> directory_template{};
+    constexpr std::string_view pattern{"/tmp/nll-recovery-order-XXXXXX"};
+    std::copy(pattern.begin(), pattern.end(), directory_template.begin());
+    char* created{mkdtemp(directory_template.data())};
+    ASSERT_NE(created, nullptr);
+    const std::string directory{created};
+    const auto remove_directory = [&]() {
+        std::filesystem::remove_all(directory);
+    };
+    auto journal{std::make_unique<detail::RecoveryJournalStore>(
+        directory, static_cast<std::uint32_t>(getuid()))};
+    ASSERT_TRUE(journal->write(
+        {detail::RecoveryPhase::intent, "00112233445566778899aabbccddeeff"}));
+    auto trace{std::make_shared<RecoveryOrderTrace>()};
+
+    PreparationResult result{testing::prepare_with_recovery(
+        std::make_unique<PassingPreflight>(trace),
+        std::make_unique<FakeProductionPlatform>(),
+        std::move(journal),
+        std::make_unique<RecoveryOrderBackend>(trace))};
+
+    remove_directory();
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(
+        std::get<PreparationFailure>(result).primary.cause,
+        Cause::identity_mismatch);
+    EXPECT_TRUE(trace->inspected_under_lock);
+    EXPECT_FALSE(trace->preflight_called);
+    EXPECT_EQ(trace->removals, 0U);
+    EXPECT_FALSE(trace->host_lock_held);
+}
 
 } // namespace
 } // namespace netlaglab::network_environment
