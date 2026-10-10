@@ -158,8 +158,22 @@ public:
     std::string ufw_status_output{"Status: inactive\n"};
     std::string ufw_rules_output;
     std::string firewalld_state_output{"not running\n"};
+    std::optional<CommandResultKind> firewalld_state_kind;
+    std::string firewalld_failure_argument;
+    std::string ipv4_rules_output{
+        "0:\tfrom all lookup local\n"
+        "32766:\tfrom all lookup main\n"
+        "32767:\tfrom all lookup default\n"};
+    std::string ipv4_default_route_output{
+        "default via 192.0.2.1 dev eth0 proto static\n"};
+    std::string default_route_link_output{
+        "2: eth0: <BROADCAST,UP>\n    link/ether 02:00:00:00:00:01\n"};
+    std::string nft_ruleset_output;
     std::string firewalld_zone{"public"};
     bool firewalld_policy_exists{};
+    bool firewalld_ingress_configured{};
+    bool firewalld_egress_configured{};
+    bool firewalld_rule_configured{};
     std::string nft_table_name;
     std::deque<NamespaceQuery> namespaces;
     std::deque<LinkQuery> host_links;
@@ -220,6 +234,20 @@ public:
         }
         const std::string_view command{
             arguments.empty() ? std::string_view{} : std::string_view{arguments.front()}};
+        if (arguments.size() == 3U && arguments[0] == "-4"
+            && arguments[1] == "rule" && arguments[2] == "show") {
+            return {CommandResultKind::success, 0, {}, ipv4_rules_output};
+        }
+        if (arguments.size() == 4U && arguments[0] == "-4"
+            && arguments[1] == "route" && arguments[2] == "show"
+            && arguments[3] == "default") {
+            return {CommandResultKind::success, 0, {}, ipv4_default_route_output};
+        }
+        if (arguments.size() == 5U && arguments[0] == "-d"
+            && arguments[1] == "link" && arguments[2] == "show"
+            && arguments[3] == "dev") {
+            return {CommandResultKind::success, 0, {}, default_route_link_output};
+        }
         if (command == "status") {
             if (arguments.size() > 1U && arguments[1] == "numbered") {
                 return {CommandResultKind::success, 0, {}, ufw_rules_output};
@@ -228,8 +256,9 @@ public:
         }
         if (command == "--state") {
             const bool running{firewalld_state_output == "running\n"};
-            return {running ? CommandResultKind::success
-                            : CommandResultKind::nonzero_exit,
+            return {firewalld_state_kind.value_or(
+                        running ? CommandResultKind::success
+                                : CommandResultKind::nonzero_exit),
                     running ? 0 : 252, {}, firewalld_state_output};
         }
         if (command.starts_with("--get-zone-of-interface=")) {
@@ -237,24 +266,59 @@ public:
         }
         if (command.starts_with("--new-policy=")) {
             firewalld_policy_exists = true;
+            firewalld_ingress_configured = false;
+            firewalld_egress_configured = false;
+            firewalld_rule_configured = false;
             return {CommandResultKind::success, 0, {}, {}};
+        }
+        if (arguments.size() == 2U && arguments[0].starts_with("--policy=")) {
+            const std::string_view operation{arguments[1]};
+            if (operation.starts_with("--add-ingress-zone=")) {
+                if (operation == firewalld_failure_argument) {
+                    return {CommandResultKind::nonzero_exit, 1, "COMMAND_FAILED", {}};
+                }
+                firewalld_ingress_configured = true;
+                return {CommandResultKind::success, 0, {}, {}};
+            }
+            if (operation == "--add-egress-zone=ANY") {
+                if (operation == firewalld_failure_argument) {
+                    return {CommandResultKind::nonzero_exit, 1, "COMMAND_FAILED", {}};
+                }
+                firewalld_egress_configured = true;
+                return {CommandResultKind::success, 0, {}, {}};
+            }
+            if (operation.starts_with("--add-rich-rule=")) {
+                if (operation == firewalld_failure_argument) {
+                    return {CommandResultKind::nonzero_exit, 1, "COMMAND_FAILED", {}};
+                }
+                firewalld_rule_configured = true;
+                return {CommandResultKind::success, 0, {}, {}};
+            }
         }
         if (command.starts_with("--info-policy=")) {
             if (!firewalld_policy_exists) {
                 return {CommandResultKind::nonzero_exit, 2, "INVALID_POLICY", {}};
             }
             return {CommandResultKind::success, 0, {},
-                    "ingress-zones: " + firewalld_zone
-                        + "\negress-zones: ANY\nrich rules:\n"
-                          " rule family=\"ipv4\" source address=\"10.200.0.2/32\" accept\n"};
+                    "ingress-zones: "
+                        + (firewalld_ingress_configured ? firewalld_zone : "")
+                        + "\negress-zones: "
+                        + (firewalld_egress_configured ? "ANY" : "")
+                        + "\nrich rules:\n"
+                        + (firewalld_rule_configured
+                               ? " rule family=\"ipv4\" source address=\"10.200.0.2/32\" accept\n"
+                               : "")};
         }
         if (command.starts_with("--delete-policy=")) {
             firewalld_policy_exists = false;
+            firewalld_ingress_configured = false;
+            firewalld_egress_configured = false;
+            firewalld_rule_configured = false;
             return {CommandResultKind::success, 0, {}, {}};
         }
         if (command == "list" && arguments.size() == 2U
             && arguments[1] == "ruleset") {
-            return {CommandResultKind::success, 0, {}, {}};
+            return {CommandResultKind::success, 0, {}, nft_ruleset_output};
         }
         if (command == "list" && arguments.size() == 4U
             && arguments[1] == "table") {
@@ -307,6 +371,12 @@ public:
         return recovery_directory_descriptor_ == -1
             ? -1
             : dup(recovery_directory_descriptor_);
+    }
+
+    [[nodiscard]] bool remove_recovery_record()
+    {
+        return recovery_directory_descriptor_ != -1
+            && unlinkat(recovery_directory_descriptor_, "recovery.state", 0) == 0;
     }
 
     [[nodiscard]] NamespaceQuery query_namespace() override
@@ -475,9 +545,210 @@ TEST(NetworkProductionAdapterTest, ConfiguresTheCompleteFixedTopology)
     EXPECT_EQ(
         nat_rule->arguments,
         (std::vector<std::string>{
-            "add", "rule", "ip", nat_rule->arguments[3], "postrouting", "ip",
-            "saddr", "10.200.0.2/32", "counter", "masquerade", "comment",
+            "add", "rule", "ip", nat_rule->arguments[3], "postrouting",
+            "iifname", "\"nll-host\"", "ip", "saddr", "10.200.0.2/32",
+            "counter", "masquerade", "comment",
             "\"netlaglab:" + nat_rule->arguments[3].substr(10) + "\""}));
+}
+
+TEST(NetworkProductionAdapterTest, RefusesCustomIpv4PolicyRouting)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->ipv4_rules_output += "100: from all lookup 100\n";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(
+        std::get<PreparationFailure>(result).primary.cause,
+        Cause::unsupported_host_configuration);
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add"
+                && command.arguments[1] == "table";
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, RefusesVpnDefaultRouteInTheMainTable)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->ipv4_default_route_output = "default dev tun0 proto static\n";
+    production->default_route_link_output =
+        "7: tun0: <POINTOPOINT,UP>\n    link/none\n    tun type tun\n";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(
+        std::get<PreparationFailure>(result).primary.cause,
+        Cause::unsupported_host_configuration);
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add"
+                && command.arguments[1] == "table";
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, RefusesWhenNoIpv4DefaultRouteCanBeFollowed)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->ipv4_default_route_output.clear();
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(
+        std::get<PreparationFailure>(result).primary.cause,
+        Cause::unsupported_host_configuration);
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add"
+                && command.arguments[1] == "table";
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, RefusesDefaultRouteWithoutAnEgressDevice)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->ipv4_default_route_output =
+        "default via 192.0.2.1 proto static\n"
+        "default via 198.51.100.1 dev eth0 proto static\n";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(
+        std::get<PreparationFailure>(result).primary.cause,
+        Cause::unsupported_host_configuration);
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add"
+                && command.arguments[1] == "table";
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, SupportsPppDefaultRoute)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    auto* const fake{production.get()};
+    production->ipv4_default_route_output = "default dev ppp0 proto static\n";
+    production->default_route_link_output =
+        "9: ppp0: <POINTOPOINT,UP>\n    link/ppp\n";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    EXPECT_TRUE(std::any_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments == std::vector<std::string>{
+                "-d", "link", "show", "dev", "ppp0"};
+        }));
+    CleanupResult cleanup{std::move(
+        std::get<PreparedNetworkEnvironment>(result)).cleanup()};
+    EXPECT_TRUE(cleanup.failures.empty());
+    EXPECT_FALSE(cleanup.residual.has_value());
+    EXPECT_TRUE(fake->nft_table_name.empty());
+}
+
+TEST(NetworkProductionAdapterTest, DoesNotTreatFirewalldInspectionFailureAsInactive)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->firewalld_state_kind = CommandResultKind::system_failure;
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(
+        std::get<PreparationFailure>(result).primary.cause,
+        Cause::unsupported_host_configuration);
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add"
+                && command.arguments[1] == "table";
+        }));
 }
 
 TEST(NetworkProductionAdapterTest, RefusesFirewallMutationWithoutInteractiveConsent)
@@ -608,6 +879,109 @@ TEST(NetworkProductionAdapterTest, AddsAndRemovesScopedFirewalldPolicy)
         [](const RecordedCommand& command) {
             return !command.arguments.empty()
                 && command.arguments[0].starts_with("--delete-policy=netlaglab-");
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, RemovesPartialFirewalldPolicyAfterSetupFailure)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->firewalld_state_output = "running\n";
+    production->firewalld_failure_argument = "--add-egress-zone=ANY";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+    auto* const fake{production.get()};
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    const PreparationFailure& failure{std::get<PreparationFailure>(result)};
+    EXPECT_EQ(failure.primary.stage, Stage::internet_connectivity);
+    EXPECT_TRUE(failure.rollback_failures.empty());
+    EXPECT_FALSE(failure.residual.has_value());
+    EXPECT_FALSE(fake->firewalld_policy_exists);
+    EXPECT_TRUE(fake->nft_table_name.empty());
+    EXPECT_TRUE(std::any_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return !command.arguments.empty()
+                && command.arguments[0].starts_with("--delete-policy=netlaglab-");
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, RefusesTruncatedNftRulesetInspection)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->nft_ruleset_output = std::string(4096U, ' ');
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(
+        std::get<PreparationFailure>(result).primary.stage,
+        Stage::internet_connectivity);
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add"
+                && command.arguments[1] == "table";
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, RecreatesMissingJournalFromInMemoryOwnershipProof)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    auto* const fake{production.get()};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    ASSERT_TRUE(fake->remove_recovery_record());
+    CleanupResult cleanup{std::move(
+        std::get<PreparedNetworkEnvironment>(result)).cleanup()};
+    EXPECT_TRUE(cleanup.failures.empty());
+    EXPECT_FALSE(cleanup.residual.has_value());
+    EXPECT_TRUE(fake->nft_table_name.empty());
+    EXPECT_TRUE(std::any_of(
+        observed->recorded_tools.begin(),
+        observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "delete"
+                && command.arguments[1] == "table";
         }));
 }
 

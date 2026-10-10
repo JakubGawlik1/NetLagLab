@@ -797,6 +797,23 @@ public:
             return {false, Cause::unsupported_host_configuration, {}};
         }
 
+        const std::optional<bool> policy_routing{
+            inspect_ipv4_policy_routing(deadline)};
+        if (!policy_routing.has_value()) {
+            return {false, Cause::system_failure, {}};
+        }
+        if (!*policy_routing) {
+            return {false, Cause::unsupported_host_configuration, {}};
+        }
+        const std::optional<bool> vpn_route{
+            inspect_ipv4_default_route_interfaces(deadline)};
+        if (!vpn_route.has_value()) {
+            return {false, Cause::system_failure, {}};
+        }
+        if (!*vpn_route) {
+            return {false, Cause::unsupported_host_configuration, {}};
+        }
+
         const TrustedToolLookup nft{find_trusted_tool(*platform_, "nft")};
         if (!nft.query_succeeded || !nft.path.has_value()) {
             return {false, Cause::unavailable_or_invalid_tool, {}};
@@ -825,7 +842,8 @@ public:
         const std::vector<std::string> list_ruleset_arguments{"list", "ruleset"};
         const CommandResult nft_ruleset{production_->run_tool(
             *nft_path, list_ruleset_arguments, deadline)};
-        if (nft_ruleset.kind != CommandResultKind::success) {
+        if (nft_ruleset.kind != CommandResultKind::success
+            || nft_ruleset.standard_output.size() >= 4096U) {
             return {false, command_cause(nft_ruleset), {}};
         }
         if (!ufw_active && !firewalld_active
@@ -905,8 +923,9 @@ public:
             return {false, command_cause(chain_result), state_with_handle()};
         }
         const std::vector<std::string> rule_arguments{
-            "add", "rule", "ip", table, "postrouting", "ip", "saddr",
-            "10.200.0.2/32", "counter", "masquerade", "comment",
+            "add", "rule", "ip", table, "postrouting", "iifname",
+            "\"nll-host\"", "ip", "saddr", "10.200.0.2/32", "counter",
+            "masquerade", "comment",
             "\"netlaglab:" + *token + "\""};
         const CommandResult nat_result{
             production_->run_tool(*nft_path, rule_arguments, deadline)};
@@ -963,18 +982,17 @@ public:
         }
         const detail::RecoveryReadResult current{detail::read_recovery_record(
             handle->journal_directory_.get(), ::geteuid())};
-        if (current.status == detail::RecoveryReadStatus::empty) {
-            return {Cause::system_failure, {}};
-        }
-        if (current.status != detail::RecoveryReadStatus::valid
-            || !current.record.has_value()
-            || current.record->token != handle->recovery_record_.token
-            || current.record->backend != handle->recovery_record_.backend) {
+        detail::RecoveryRecord removing{handle->recovery_record_};
+        if (current.status == detail::RecoveryReadStatus::valid
+            && current.record.has_value()
+            && current.record->token == handle->recovery_record_.token
+            && current.record->backend == handle->recovery_record_.backend) {
+            removing = *current.record;
+        } else if (current.status != detail::RecoveryReadStatus::empty) {
             ConnectivityState state;
             state.emplace<IdentityUnconfirmed>();
             return {Cause::identity_mismatch, std::move(state)};
         }
-        detail::RecoveryRecord removing{*current.record};
         removing.phase = detail::RecoveryPhase::removing;
         if (!detail::write_recovery_record(
                 handle->journal_directory_.get(), ::geteuid(), removing)) {
@@ -982,6 +1000,7 @@ public:
             state.emplace<ConnectivityProof>(std::move(proof));
             return {Cause::system_failure, std::move(state)};
         }
+        handle->recovery_record_ = removing;
 
         if (!handle->firewall_path.empty()) {
             const OperationResult firewall_cleanup{remove_firewall(*handle, deadline)};
@@ -1172,6 +1191,165 @@ private:
         return std::nullopt;
     }
 
+    [[nodiscard]] std::optional<bool> inspect_ipv4_policy_routing(
+        const TimePoint deadline)
+    {
+        const std::vector<std::string> arguments{"-4", "rule", "show"};
+        const CommandResult result{
+            production_->run_tool(ip_path_, arguments, deadline)};
+        if (result.kind != CommandResultKind::success
+            || result.standard_output.size() >= 4096U) {
+            return std::nullopt;
+        }
+
+        constexpr std::array<std::string_view, 3> supported_rules{
+            "0: from all lookup local",
+            "32766: from all lookup main",
+            "32767: from all lookup default",
+        };
+        std::array<bool, supported_rules.size()> found{};
+        std::size_t line_start{};
+        while (line_start < result.standard_output.size()) {
+            const std::size_t line_end{
+                result.standard_output.find('\n', line_start)};
+            const std::size_t length{line_end == std::string::npos
+                    ? result.standard_output.size() - line_start
+                    : line_end - line_start};
+            std::string_view line{
+                result.standard_output.data() + line_start, length};
+            std::string normalized_line;
+            normalized_line.reserve(line.size());
+            bool previous_was_space{};
+            for (const unsigned char character : line) {
+                if (std::isspace(character)) {
+                    if (!normalized_line.empty() && !previous_was_space) {
+                        normalized_line.push_back(' ');
+                    }
+                    previous_was_space = true;
+                } else {
+                    normalized_line.push_back(static_cast<char>(character));
+                    previous_was_space = false;
+                }
+            }
+            bool matched{};
+            for (std::size_t index{}; index < supported_rules.size(); ++index) {
+                if (normalized_line == supported_rules[index] && !found[index]) {
+                    found[index] = true;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                return false;
+            }
+            if (line_end == std::string::npos) {
+                break;
+            }
+            line_start = line_end + 1U;
+        }
+        return std::all_of(found.begin(), found.end(), [](const bool value) {
+            return value;
+        });
+    }
+
+    [[nodiscard]] std::optional<bool> inspect_ipv4_default_route_interfaces(
+        const TimePoint deadline)
+    {
+        const std::vector<std::string> route_arguments{
+            "-4", "route", "show", "default"};
+        const CommandResult routes{
+            production_->run_tool(ip_path_, route_arguments, deadline)};
+        if (routes.kind != CommandResultKind::success
+            || routes.standard_output.size() >= 4096U) {
+            return std::nullopt;
+        }
+
+        std::vector<std::string> devices;
+        std::size_t line_start{};
+        while (line_start < routes.standard_output.size()) {
+            const std::size_t line_end{routes.standard_output.find('\n', line_start)};
+            std::string_view line{routes.standard_output.data() + line_start,
+                                  (line_end == std::string::npos
+                                       ? routes.standard_output.size()
+                                       : line_end)
+                                      - line_start};
+            while (!line.empty()
+                   && std::isspace(static_cast<unsigned char>(line.front()))) {
+                line.remove_prefix(1U);
+            }
+            if (!line.empty()) {
+                std::vector<std::string_view> fields;
+                while (!line.empty()) {
+                    const std::size_t separator{line.find_first_of(" \t\r")};
+                    fields.push_back(line.substr(0, separator));
+                    if (separator == std::string_view::npos) {
+                        break;
+                    }
+                    line.remove_prefix(separator);
+                    while (!line.empty()
+                           && std::isspace(static_cast<unsigned char>(line.front()))) {
+                        line.remove_prefix(1U);
+                    }
+                }
+                if (fields.empty() || fields.front() != "default") {
+                    return false;
+                }
+                bool found_device{};
+                for (std::size_t index{}; index + 1U < fields.size(); ++index) {
+                    if (fields[index] != "dev") {
+                        continue;
+                    }
+                    const std::string_view name{fields[index + 1U]};
+                    if (name.empty() || name.size() > 15U) {
+                        return false;
+                    }
+                    devices.emplace_back(name);
+                    found_device = true;
+                }
+                if (!found_device) {
+                    return false;
+                }
+            }
+            if (line_end == std::string::npos) {
+                break;
+            }
+            line_start = line_end + 1U;
+        }
+        if (devices.empty()) {
+            return false;
+        }
+
+        for (const std::string& device : devices) {
+            const std::vector<std::string> link_arguments{
+                "-d", "link", "show", "dev", device};
+            const CommandResult link{
+                production_->run_tool(ip_path_, link_arguments, deadline)};
+            if (link.kind != CommandResultKind::success
+                || link.standard_output.size() >= 4096U) {
+                return std::nullopt;
+            }
+            const std::string_view output{link.standard_output};
+            constexpr std::array<std::string_view, 16> unsupported_types{
+                "wireguard", "type tun", "type tap", "type ipip", "type gre",
+                "type gretap", "type sit", "type ip6tnl", "type ip6gre",
+                "type ip6gretap", "type vti", "type vti6", "type xfrm",
+                "type vxlan", "type geneve", "type bareudp",
+            };
+            const bool unsupported_type{std::any_of(
+                unsupported_types.begin(), unsupported_types.end(),
+                [output](const std::string_view type) {
+                    return output.find(type) != std::string_view::npos;
+                })};
+            const bool supported_egress_type{
+                output.find("link/ether") != std::string_view::npos
+                || output.find("link/ppp") != std::string_view::npos};
+            if (!supported_egress_type || unsupported_type) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] std::optional<bool> inspect_firewalld(
         const std::string_view path,
         const TimePoint deadline)
@@ -1182,7 +1360,8 @@ private:
             && trim_ascii(result.standard_output) == "running") {
             return true;
         }
-        if (trim_ascii(result.standard_output) == "not running") {
+        if (result.kind == CommandResultKind::nonzero_exit
+            && trim_ascii(result.standard_output) == "not running") {
             return false;
         }
         return std::nullopt;
@@ -1340,7 +1519,7 @@ private:
             return {false, command_cause(current)};
         }
         if (!firewalld_policy_matches(
-                current.standard_output, handle.firewall_zone)) {
+                current.standard_output, handle.firewall_zone, true)) {
             return {false, Cause::identity_mismatch};
         }
         const std::vector<std::string> delete_arguments{"--delete-policy=" + policy};
@@ -1366,7 +1545,8 @@ private:
 
     [[nodiscard]] static bool firewalld_policy_matches(
         const std::string_view output,
-        const std::string_view expected_ingress_zone)
+        const std::string_view expected_ingress_zone,
+        const bool allow_incomplete = false)
     {
         const auto field_value = [output](const std::string_view field)
             -> std::optional<std::string_view> {
@@ -1387,10 +1567,10 @@ private:
         const std::optional<std::string_view> ingress{
             field_value("ingress-zones")};
         const std::optional<std::string_view> egress{field_value("egress-zones")};
-        if (!ingress.has_value() || !egress.has_value() || ingress->empty()
-            || *egress != "ANY"
-            || (!expected_ingress_zone.empty()
-                && *ingress != expected_ingress_zone)) {
+        if (!ingress.has_value() || !egress.has_value()
+            || (!ingress->empty() && *ingress != expected_ingress_zone)
+            || (!egress->empty() && *egress != "ANY")
+            || (!allow_incomplete && (ingress->empty() || *egress != "ANY"))) {
             return false;
         }
         for (const unsigned char character : *ingress) {
@@ -1402,25 +1582,28 @@ private:
         if (rich_rules_at == std::string_view::npos) {
             return false;
         }
-        const std::string_view rules{output.substr(rich_rules_at)};
-        const std::size_t source_at{rules.find("source address=\"10.200.0.2/32\"")};
-        if (source_at == std::string_view::npos) {
-            return false;
-        }
-        const std::size_t rule_begin{rules.rfind("rule ", source_at)};
-        const std::size_t rule_end{rules.find('\n', source_at)};
-        if (rule_begin == std::string_view::npos) {
-            return false;
-        }
-        const std::string_view owned_rule{rules.substr(
-            rule_begin,
-            rule_end == std::string_view::npos
-                ? rules.size() - rule_begin
-                : rule_end - rule_begin)};
-        if (owned_rule.find("family=\"ipv4\"") == std::string_view::npos
-            || owned_rule.find(" accept") == std::string_view::npos
-            || rules.find("rule ", rule_begin + 5U) != std::string_view::npos) {
-            return false;
+        const std::string_view rules{output.substr(rich_rules_at + 11U)};
+        constexpr std::string_view expected_rule{
+            "rule family=\"ipv4\" source address=\"10.200.0.2/32\" accept"};
+        bool has_rule{};
+        std::size_t line_start{};
+        while (line_start < rules.size()) {
+            const std::size_t line_end{rules.find('\n', line_start)};
+            const std::string_view line{trim_ascii(rules.substr(
+                line_start,
+                line_end == std::string_view::npos
+                    ? rules.size() - line_start
+                    : line_end - line_start))};
+            if (!line.empty()) {
+                if (line != expected_rule || has_rule) {
+                    return false;
+                }
+                has_rule = true;
+            }
+            if (line_end == std::string_view::npos) {
+                break;
+            }
+            line_start = line_end + 1U;
         }
         constexpr std::array<std::string_view, 6> empty_fields{
             "services", "ports", "protocols", "source-ports", "forward-ports",
@@ -1432,7 +1615,7 @@ private:
                 return false;
             }
         }
-        return true;
+        return allow_incomplete || has_rule;
     }
 
     [[nodiscard]] static bool known_nft_table_absence(const CommandResult& result)
