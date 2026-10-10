@@ -126,6 +126,7 @@ LiveRuleState decode_ufw_route_status(
         }
     }
     bool active{};
+    std::size_t matching_marker_count{};
     std::size_t exact_count{};
     std::size_t same_source_count{};
     std::size_t offset{};
@@ -144,17 +145,24 @@ LiveRuleState decode_ufw_route_status(
         const std::size_t close_bracket{line.find(']')};
         if (line.starts_with('[') && close_bracket != std::string_view::npos) {
             line.remove_prefix(close_bracket + 1);
+            const std::string normalized{normalize_columns(line)};
+            const std::size_t comment_separator{normalized.find(" # ")};
+            const bool has_matching_marker{
+                comment_separator != std::string::npos
+                && std::string_view{normalized}.substr(comment_separator + 3)
+                    == "netlaglab-" + std::string{transaction_id}};
+            if (has_matching_marker) {
+                ++matching_marker_count;
+            }
             if (line.find("10.200.0.2") != std::string_view::npos) {
                 ++same_source_count;
-                const std::string normalized{normalize_columns(line)};
-                const std::string exact_suffix{
-                    " # netlaglab-" + std::string{transaction_id}};
                 const std::string normalized_rule{
-                    normalized.substr(0, normalized.find(" # "))};
-                if ((normalized_rule == "Anywhere ALLOW FWD 10.200.0.2 on nll-host"
-                     || normalized_rule
-                         == "Anywhere ALLOW FWD 10.200.0.2/32 on nll-host")
-                    && normalized.ends_with(exact_suffix)) {
+                    normalized.substr(0, comment_separator)};
+                if (has_matching_marker
+                    && (normalized_rule
+                            == "Anywhere ALLOW FWD 10.200.0.2 on nll-host"
+                        || normalized_rule
+                            == "Anywhere ALLOW FWD 10.200.0.2/32 on nll-host")) {
                     ++exact_count;
                 }
             }
@@ -167,8 +175,11 @@ LiveRuleState decode_ufw_route_status(
     if (!active) {
         return LiveRuleState::failure;
     }
-    if (exact_count > 1) {
+    if (matching_marker_count > 1) {
         return LiveRuleState::ambiguous;
+    }
+    if (matching_marker_count == 1 && exact_count != 1) {
+        return LiveRuleState::mismatch;
     }
     if (same_source_count > exact_count) {
         return LiveRuleState::mismatch;

@@ -221,6 +221,23 @@ TEST(NetworkRecoveryJournalTest, PreservesRemovingRecordWhenRuleStillExistsAfter
     EXPECT_EQ(journal.read().record.phase, RecoveryPhase::removing);
 }
 
+TEST(NetworkRecoveryJournalTest, ClearsRemovingRecordWhenRuleIsAlreadyAbsent)
+{
+    TemporaryDirectory directory;
+    const RecoveryJournalStore journal{make_store(directory)};
+    ASSERT_TRUE(journal.write(record(RecoveryPhase::intent)));
+    ASSERT_TRUE(journal.write(record(RecoveryPhase::applied)));
+    ASSERT_TRUE(journal.write(record(RecoveryPhase::removing)));
+    ScriptedFirewall backend;
+    backend.state = LiveRuleState::absent;
+
+    EXPECT_EQ(
+        reconcile_persistent_firewall(journal, backend),
+        RecoveryOutcome::complete);
+    EXPECT_EQ(backend.remove_count, 0U);
+    EXPECT_EQ(journal.read().kind, JournalReadKind::absent);
+}
+
 TEST(NetworkRecoveryJournalTest, CorruptOrOversizedJournalIsRejectedWithoutDeletion)
 {
     constexpr std::array<std::string_view, 2> corrupt_contents{
@@ -289,6 +306,13 @@ TEST(NetworkRecoveryJournalTest, UfwStatusRequiresOneExactForwardRule)
           "# netlaglab-00112233445566778899aabbccddeeff\n"};
     EXPECT_EQ(
         decode_ufw_route_status(duplicate, test_transaction_id),
+        LiveRuleState::ambiguous);
+
+    const std::string duplicate_marker{std::string{one_exact_rule}
+        + "[ 2] 192.0.2.1               ALLOW FWD   198.51.100.2 on eth0 "
+          "# netlaglab-00112233445566778899aabbccddeeff\n"};
+    EXPECT_EQ(
+        decode_ufw_route_status(duplicate_marker, test_transaction_id),
         LiveRuleState::ambiguous);
 
     constexpr std::string_view mismatched_rule{
