@@ -2,28 +2,17 @@
 
 ## Status
 
-The implemented helper lifecycle reaps the directly managed Workload, releases
-the root-owned host lock before its final result, and uses RAII for descriptors
-and Unix-socket paths. The Supervisor then reaps its launcher and removes the
-user control socket.
+The helper prepares the production Network Environment before Workload launch
+and retains its prepared owner through Workload reaping and cleanup. That owner
+tracks the proven namespace/veth roots, routes, DNS view, source-scoped NAT,
+and any approved firewall change. It retains the root-owned host lock until
+cleanup is complete. Identity-unconfirmed state never regains deletion
+authority, and owner destruction makes one bounded no-throw pass.
 
-The standalone Network Environment library now implements and tests the local
-transaction ownership contract through a scripted semantic adapter. Preparation
-rolls back only its proven prefix; explicit cleanup consumes a prepared or
-residual owner, continues across independent roots, aggregates failures, and
-returns only unresolved state. Identity-unconfirmed state never regains
-deletion authority, and owner destruction performs one bounded no-throw pass.
-Its production entry point acquires the root-owned host lock before preflight,
-and the runtime retains that lock in either a prepared or residual owner until
-cleanup work is gone. The standalone production path can now create and clean
-the proven namespace/veth roots together with their contained addresses, link
-state, loopback state, and namespace route. The active helper still creates
-none of these resources, and NAT, firewall, DNS-mount, qdisc, and durable
-recovery ownership remain unimplemented.
-
-The remaining production ownership and cleanup rules below are accepted target
-design. A durable recovery journal is accepted in principle for persistent
-firewall changes, but its exact design remains deliberately open.
+UFW's persistent rule is additionally recorded in a durable recovery journal.
+Reconciliation runs under the host lock before fixed-name preflight. The
+journal protects persistent firewall/NAT ownership across helper interruption;
+the in-memory owner continues to track namespace and veth cleanup.
 
 ## Ownership rule
 
@@ -38,7 +27,8 @@ The helper owns, when created for the Session:
 - Session addresses and routes;
 - qdiscs and the applied Network Profile state;
 - the Session mount namespace and DNS snapshot/mount;
-- the `netlaglab` nftables table and its contained NAT objects;
+- the uniquely named `netlaglab_<token>` nftables table and its contained NAT
+  objects;
 - an explicitly approved firewall exception;
 - the directly managed Workload process;
 - helper-side protocol descriptors and temporary privileged files.
@@ -62,7 +52,7 @@ remain. Complete rollback returns only the setup failure. Incomplete rollback
 also returns an opaque cleanup owner containing the remaining in-memory ledger;
 the helper retains it and can retry exact cleanup, but it does not describe the
 partial setup as an active Network Environment. This owner is not durable
-recovery evidence and does not resolve interrupted-helper recovery or Q47.
+recovery evidence for namespace or veth state.
 Both a prepared environment and a residual cleanup owner own their cleanup
 capability; neither borrows a production adapter whose lifetime must be managed
 separately by the helper.
@@ -71,9 +61,9 @@ The production preparation operation acquires the root-owned global host lock
 before preflight and transfers it with the adapter and clock into whichever
 owner survives. That owner retains the lock through explicit cleanup, residual
 retry, and any destructor safety pass. A clean preparation failure or complete
-cleanup releases it. The standalone module is not yet called by the helper;
-future integration replaces the helper's current manual lock acquisition rather
-than attempting to acquire the same lock twice.
+cleanup releases it. The helper enters the retained network namespace only in
+the forked Workload child and does not reacquire the host lock while this owner
+holds it.
 
 Explicit cleanup consumes the prepared environment or residual cleanup owner
 and performs exactly one dependency-aware pass. Complete cleanup returns no new
@@ -214,33 +204,20 @@ would require a different ownership model, likely including cgroups. That
 alternative was rejected for the MVP because descendants are explicitly not
 owned.
 
-## Persistent firewall recovery (Q47)
+## Persistent UFW recovery
 
-A UFW CLI rule can outlive the helper process, so normal in-memory RAII cannot
-make it safely Session-scoped. The accepted direction is a durable,
-root-owned recovery journal used under the same global host lock as normal
-setup and cleanup.
+The helper stores `/var/lib/netlaglab/recovery.state` in a root-owned `0700`
+directory. The bounded version-1 record stores the backend, `intent`, `applied`,
+or `removing` phase, and a random token. Replacement writes a mode-`0600`
+temporary file, synchronizes it, atomically renames it, and synchronizes the
+directory. Removing the record also synchronizes the directory.
 
-The intended safety properties are:
-
-- record intent before performing a persistent mutation;
-- record that the exact mutation was successfully applied;
-- remove only the exact recorded resource during normal cleanup;
-- record successful removal before discarding recovery evidence;
-- reconcile an interrupted prior Session before creating new host resources.
-
-The following details are not decided and must not be invented during
-implementation:
-
-- final path (a location under `/var/lib/netlaglab/` was only an example);
-- file/schema format and versioning;
-- atomic write, flush, ownership, permission, and corruption behavior;
-- exact intent/applied/removing/removed state transitions;
-- reconciliation rules for host state that differs from the journal;
-- retention and user-facing diagnostics after failed recovery.
-
-Because this is persistent privileged state, its design requires a separate
-high-risk review and may merit an ADR once the trade-off is settled.
+Intent is durable before a UFW mutation. Reconciliation reads the record under
+the host lock before new network resources are created and removes only state
+that matches the journal token and live identity checks. Corrupt or mismatched
+evidence fails closed. Controlled journal tests cover replacement, phases,
+corruption, and identity mismatch; real privileged host mutation remains
+outside the routine test suite.
 
 ## Verification obligations
 

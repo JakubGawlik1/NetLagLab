@@ -19,7 +19,9 @@ public:
         const WorkloadStandardDescriptors& standard_descriptors,
         const network_environment::WorkloadNamespaceEntry& namespace_entry) = 0;
     [[nodiscard]] virtual bool send(const HelperConversationEvent& event) = 0;
-    [[nodiscard]] virtual int supervise(WorkloadProcess workload) = 0;
+    [[nodiscard]] virtual int supervise(
+        WorkloadProcess workload,
+        network_environment::PreparedNetworkEnvironment& environment) = 0;
     [[nodiscard]] virtual bool stop_and_reap(WorkloadProcess& workload) = 0;
 };
 

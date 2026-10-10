@@ -2,12 +2,13 @@
 
 ## Status
 
-NetLagLab currently performs no routing, forwarding, NAT, or firewall
-mutation. [Experiment 01](../experiment_01.md) manually verified that a scoped
-NAT setup and a compatible forwarding rule can provide Internet access, and
-that UFW can allow ICMP while still blocking forwarded TCP and UDP. The policy
-and consent rules below are accepted target design; production adapters are not
-implemented.
+The production Network Environment creates source-scoped NAT and supports
+scoped UFW and firewalld forwarding changes. It refuses unknown, conflicting,
+or ambiguous firewall states before Workload activation. Firewall consent and
+ownership checks have unprivileged scripted coverage; end-to-end DNS, TCP, and
+UDP connectivity remains a separately qualified host-dependent behavior.
+[Experiment 01](../experiment_01.md) records the manual evidence that a
+successful ping does not prove forwarded TCP or UDP connectivity.
 
 ## Safety boundary
 
@@ -35,10 +36,9 @@ on the user's behalf.
 
 ## NAT ownership
 
-The helper owns a dedicated nftables table named `netlaglab`. NAT must be
-scoped to the Session address rather than an unrestricted host range. The
-final output-interface match depends on the unresolved host-route decision in
-[Network environment](network-environment.md#host-route-selection-open-decision-q65).
+The helper owns a dedicated nftables table named `netlaglab_<token>`. Its
+masquerade rule matches packets entering through `nll-host` with source
+`10.200.0.2/32`. Host routing remains unchanged and is followed dynamically.
 
 Creating a separate nftables table gives NetLagLab a removable ownership
 boundary for its NAT objects. It does not give that table authority over UFW,
@@ -66,18 +66,21 @@ diagnostic evidence instead of speculative changes.
 - UFW CLI rules are persistent rather than naturally Session-scoped runtime
   objects, so exact ownership, cleanup, and interrupted-run recovery are
   mandatory.
-- The rule must name the exact Session source, direction, and interfaces that
-  follow from the final route decision.
+- The rule names the Session source and ingress interface; it allows the
+  Session to follow the host's current egress route.
 - NetLagLab removes only the exact rule it recorded as its own.
+- A root-owned recovery journal records intent before mutation and is reconciled
+  under the host lock before another Session starts.
 
 ### firewalld
 
 - NetLagLab may use runtime-only changes when a compatible existing zone or
-  policy already exists.
+  policy already exists. Its policy is scoped to the Session source and the
+  detected ingress zone.
 - It does not create a permanent firewalld policy automatically.
 - A reload or daemon restart can discard runtime-only changes; the helper must
   treat lost or unknown required state as Session failure rather than continue
-  claiming isolation or connectivity.
+  claiming connectivity.
 
 ### No supported manager
 
@@ -92,10 +95,13 @@ chains.
 Consent is separate from `sudo` authentication.
 
 1. Before invoking `sudo`, the Supervisor explains why root privilege is
-   needed and warns that the helper may propose a scoped firewall exception.
+   needed and warns that the helper may request consent for a scoped firewall
+   exception.
 2. After authenticated privileged inspection, but before any firewall
-   mutation or Workload launch, NetLagLab displays the exact backend, rule
-   scope, persistence, and cleanup plan and asks `y/N`.
+   mutation or Workload launch, NetLagLab displays the backend, exact rule or
+   policy scope, persistence, and cleanup plan and asks `y/N`. UFW's persistent
+   rule is removed during cleanup or journal recovery; the firewalld policy is
+   runtime-only and removed during cleanup.
 
 The exact confirmation is read from `/dev/tty`, never fd 0. Workload standard
 input may already be a pipe, and consuming even one byte for a prompt would
@@ -111,21 +117,16 @@ automatic mutation is refused with an actionable error. The MVP does not add a
   persistent mutation.
 - If any network or firewall step fails before Workload launch, roll back every
   resource already created.
-- During runtime, loss or ambiguity of required firewall/NAT state is an
-  infrastructure failure.
+- While the Workload runs, the helper checks its exact owned NAT table and
+  required firewall rule or policy once per second. Missing or mismatched state
+  fails the Session, requests orderly Workload termination, and preserves the
+  Workload result separately from the connectivity failure.
 - Cleanup removes only exact Session-owned resources.
 - Failure to remove an owned resource causes Session result `125` and feeds
   the recovery path.
 
-The durable recovery mechanism for persistent UFW mutation is not fully
-designed. See [Cleanup and recovery](cleanup-and-recovery.md).
-
-## Open decisions
-
-- **Q65:** dynamic host route selection versus a pinned startup uplink. This
-  affects the final NAT and firewall rule shape.
-- **Q47:** recovery-journal path, schema, write/flush guarantees, state
-  transitions, and reconciliation policy.
+The journal's file format and durability rules are documented in
+[Cleanup and recovery](cleanup-and-recovery.md#persistent-ufw-recovery).
 
 ## Primary references
 

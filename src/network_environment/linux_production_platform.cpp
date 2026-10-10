@@ -358,9 +358,9 @@ public:
         }
         netlaglab::FileDescriptor terminal{descriptor};
         const std::string prompt{
-            "NetLagLab requests this temporary firewall exception:\n  "
+            "NetLagLab requests this firewall change:\n  "
             + std::string{rule}
-            + "\nIt will be removed during Session cleanup. Apply it? [y/N] "};
+            + "\nApprove this exact change? [y/N] "};
         std::size_t written{};
         while (written < prompt.size()) {
             const ssize_t count{write(

@@ -371,6 +371,25 @@ TEST(SessionLifecycleTest, ProfileStateFailureStopsAndPreservesLaterOutcomes)
             InfrastructureFailure::cleanup}));
 }
 
+TEST(SessionLifecycleTest, ConnectivityFailureStopsWorkloadAndKeepsBothOutcomes)
+{
+    ScriptedLifecycleAdapter adapter{
+        {{LifecycleEventKind::activated, 4321},
+         {LifecycleEventKind::connectivity_failed},
+         {LifecycleEventKind::workload_signaled, 15},
+         {LifecycleEventKind::cleanup_succeeded}}};
+
+    const SessionOutcome outcome{run_session_lifecycle(adapter)};
+
+    EXPECT_EQ(adapter.stop_requests, (std::vector{StopRequest::terminate}));
+    ASSERT_TRUE(outcome.workload.has_value());
+    EXPECT_EQ(outcome.workload->kind, WorkloadResultKind::signaled);
+    EXPECT_EQ(outcome.workload->value, 15);
+    EXPECT_EQ(
+        outcome.infrastructure_failures,
+        (std::vector{InfrastructureFailure::connectivity}));
+}
+
 TEST(SessionLifecycleTest, ProfileStateFailurePreservesExistingStopDeadline)
 {
     ScriptedLifecycleAdapter adapter{
@@ -399,6 +418,7 @@ TEST(SessionPresentationTest, ReportsEveryInfrastructureFailureAndWorkloadResult
         .workload = WorkloadResult{WorkloadResultKind::exited, 7},
         .infrastructure_failures = {
             InfrastructureFailure::conversation,
+            InfrastructureFailure::connectivity,
             InfrastructureFailure::profile_state,
             InfrastructureFailure::cleanup,
         },
@@ -409,6 +429,7 @@ TEST(SessionPresentationTest, ReportsEveryInfrastructureFailureAndWorkloadResult
 
     EXPECT_EQ(session_exit_status(outcome), 125);
     EXPECT_NE(error.str().find("helper conversation"), std::string::npos);
+    EXPECT_NE(error.str().find("Session connectivity"), std::string::npos);
     EXPECT_NE(error.str().find("unknown network profile state"), std::string::npos);
     EXPECT_NE(error.str().find("privileged cleanup"), std::string::npos);
     EXPECT_NE(error.str().find("Workload result was 7"), std::string::npos);

@@ -194,6 +194,8 @@ private:
                 return {LifecycleEventKind::workload_exited, value.result};
             } else if constexpr (std::is_same_v<Event, WorkloadSignaledEvent>) {
                 return {LifecycleEventKind::workload_signaled, value.signal};
+            } else if constexpr (std::is_same_v<Event, ConnectivityFailedEvent>) {
+                return {LifecycleEventKind::connectivity_failed};
             } else if constexpr (std::is_same_v<Event, CleanupSucceededEvent>) {
                 return {LifecycleEventKind::cleanup_succeeded};
             } else if constexpr (std::is_same_v<Event, CleanupFailedEvent>) {
@@ -476,6 +478,9 @@ private:
                 execute_control_actions(control_plane_->handle(
                     HelperProfileStateUnknownEvent{}));
                 continue;
+            } else if (std::holds_alternative<ConnectivityFailedEvent>(event)) {
+                execute_control_actions(
+                    control_plane_->handle(SessionStoppingEvent{}));
             } else if (std::holds_alternative<WorkloadExitedEvent>(event)
                        || std::holds_alternative<WorkloadSignaledEvent>(event)) {
                 execute_control_actions(
@@ -592,8 +597,8 @@ int run_session(char* const child_arguments[], std::ostream& error)
     }
 
     error << "NetLagLab: root privileges are required for the isolated Session helper. "
-             "A future network backend may separately request confirmation for an exact "
-             "firewall exception.\n";
+             "The helper may separately request confirmation for a scoped firewall "
+             "exception needed by Session connectivity.\n";
     const std::optional<pid_t> helper_launcher_pid{spawn_helper(*paths, error)};
     if (!helper_launcher_pid.has_value()) {
         return 125;

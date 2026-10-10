@@ -89,6 +89,7 @@ public:
     ~PreparedNetworkEnvironment() noexcept;
 
     [[nodiscard]] WorkloadNamespaceEntry workload_namespace() const noexcept;
+    [[nodiscard]] std::optional<Failure> validate_connectivity() const;
     [[nodiscard]] CleanupResult cleanup() &&;
 
 private:

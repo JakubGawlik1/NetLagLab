@@ -108,7 +108,7 @@ NetLagLab: connection to session lost; session result is unknown.
 | Status | Meaning |
 |---:|---|
 | 2 | The NetLagLab command has invalid syntax. |
-| 125 | Session infrastructure, communication, reaping, or cleanup failed. |
+| 125 | Session connectivity or other infrastructure, communication, reaping, or cleanup failed. |
 | 126 | The helper could not execute the program because of permission or executable-format failure. |
 | 127 | The helper could not find the program. |
 | `128 + signal` | The program was terminated by a signal. |

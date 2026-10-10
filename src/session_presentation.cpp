@@ -23,6 +23,8 @@ std::string_view infrastructure_failure_name(
         return "startup";
     case InfrastructureFailure::conversation:
         return "helper conversation";
+    case InfrastructureFailure::connectivity:
+        return "Session connectivity";
     case InfrastructureFailure::profile_state:
         return "unknown network profile state";
     case InfrastructureFailure::stop_request:

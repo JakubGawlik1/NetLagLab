@@ -20,6 +20,7 @@ enum class Operation {
     bring_namespace_link_up,
     add_default_route,
     configure_connectivity,
+    validate_connectivity,
     remove_connectivity,
     remove_veth,
     remove_namespace,

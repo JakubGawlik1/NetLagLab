@@ -220,6 +220,9 @@ public:
         TimePoint deadline) = 0;
     [[nodiscard]] virtual ConnectivityMutationResult configure_connectivity(
         TimePoint deadline) = 0;
+    [[nodiscard]] virtual OperationResult validate_connectivity(
+        const ConnectivityProof& proof,
+        TimePoint deadline) = 0;
     [[nodiscard]] virtual ConnectivityRemovalResult remove_connectivity(
         ConnectivityProof proof,
         TimePoint deadline) = 0;
@@ -418,6 +421,13 @@ public:
             state.emplace<IdentityUnconfirmed>();
         }
         return {step.outcome == Outcome::success, step.cause, std::move(state)};
+    }
+
+    [[nodiscard]] OperationResult validate_connectivity(
+        const ConnectivityProof&,
+        const TimePoint deadline) override
+    {
+        return operation(Operation::validate_connectivity, deadline);
     }
 
     [[nodiscard]] ConnectivityRemovalResult remove_connectivity(
@@ -866,17 +876,25 @@ public:
         const std::string table{"netlaglab_" + *token};
         const std::string ufw_rule{
             "route allow in on nll-host from 10.200.0.2 comment netlaglab-" + *token};
-        std::string consent_description{ufw_rule};
+        std::string consent_description;
         std::optional<std::string> firewalld_zone;
-        if (firewalld_active) {
+        if (ufw_active) {
+            consent_description =
+                "UFW persistent rule: " + ufw_rule
+                + "; persistence: saved across reboot until Session cleanup or recovery"
+                  "; cleanup: remove this exact token-matched rule, then clear its journal";
+        } else if (firewalld_active) {
             const std::string policy{"netlaglab-" + *token};
             firewalld_zone = firewalld_ingress_zone(*firewalld_path, deadline);
             if (!firewalld_zone.has_value()) {
                 return {false, Cause::unsupported_host_configuration, {}};
             }
             consent_description =
-                "firewalld policy " + policy + " from zone " + *firewalld_zone
-                + " for IPv4 source 10.200.0.2/32 to any routed destination";
+                "firewalld runtime-only policy " + policy + " from zone "
+                + *firewalld_zone
+                + " for IPv4 source 10.200.0.2/32 to any routed destination"
+                  "; persistence: runtime only, not saved to permanent configuration"
+                  "; cleanup: delete this exact policy during Session cleanup";
         }
         if ((ufw_active || firewalld_active)
             && !production_->request_firewall_consent(
@@ -970,6 +988,84 @@ public:
         return {true, Cause::system_failure, state_with_handle()};
     }
 
+    [[nodiscard]] OperationResult validate_connectivity(
+        const ConnectivityProof& proof,
+        const TimePoint deadline) override
+    {
+        auto* handle{dynamic_cast<ProductionConnectivityHandle*>(proof.handle_.get())};
+        if (handle == nullptr) {
+            return {false, Cause::identity_unavailable};
+        }
+
+        const auto nft_path{handle->nft_path.empty()
+                ? tool_path("nft")
+                : std::optional<std::string>{handle->nft_path}};
+        if (!nft_path.has_value()) {
+            return {false, Cause::unavailable_or_invalid_tool};
+        }
+        const std::vector<std::string> table_arguments{
+            "list", "table", "ip", handle->table_};
+        const CommandResult table{production_->run_tool(
+            *nft_path, table_arguments, deadline)};
+        if (table.kind != CommandResultKind::success) {
+            return known_nft_table_absence(table)
+                ? OperationResult{false, Cause::unsupported_host_configuration}
+                : OperationResult{false, command_cause(table)};
+        }
+        if (table.standard_output.size() >= 4096U
+            || !nft_connectivity_table_matches(
+                table.standard_output, handle->table_,
+                handle->recovery_record_.token, false)) {
+            return {false, Cause::identity_mismatch};
+        }
+
+        if (handle->recovery_record_.backend == detail::RecoveryBackend::ufw) {
+            const std::optional<bool> active{
+                inspect_ufw(handle->firewall_path, deadline)};
+            if (!active.has_value()) {
+                return {false, Cause::identity_unavailable};
+            }
+            if (!*active) {
+                return {false, Cause::unsupported_host_configuration};
+            }
+            const std::optional<bool> present{ufw_rule_present(
+                handle->firewall_path, handle->recovery_record_.token, deadline)};
+            if (!present.has_value()) {
+                return {false, Cause::identity_mismatch};
+            }
+            if (!*present) {
+                return {false, Cause::unsupported_host_configuration};
+            }
+        } else if (handle->recovery_record_.backend
+                   == detail::RecoveryBackend::firewalld) {
+            const std::optional<bool> active{
+                inspect_firewalld(handle->firewall_path, deadline)};
+            if (!active.has_value()) {
+                return {false, Cause::identity_unavailable};
+            }
+            if (!*active) {
+                return {false, Cause::unsupported_host_configuration};
+            }
+            const std::string policy{
+                "netlaglab-" + handle->recovery_record_.token};
+            const std::vector<std::string> info_arguments{
+                "--info-policy=" + policy};
+            const CommandResult current{production_->run_tool(
+                handle->firewall_path, info_arguments, deadline)};
+            if (current.kind != CommandResultKind::success) {
+                return current.standard_error.find("INVALID_POLICY")
+                        != std::string::npos
+                    ? OperationResult{false, Cause::unsupported_host_configuration}
+                    : OperationResult{false, command_cause(current)};
+            }
+            if (!firewalld_policy_matches(
+                    current.standard_output, handle->firewall_zone)) {
+                return {false, Cause::identity_mismatch};
+            }
+        }
+        return {true, Cause::system_failure};
+    }
+
     [[nodiscard]] ConnectivityRemovalResult remove_connectivity(
         ConnectivityProof proof,
         const TimePoint deadline) override
@@ -993,6 +1089,8 @@ public:
             state.emplace<IdentityUnconfirmed>();
             return {Cause::identity_mismatch, std::move(state)};
         }
+        const bool require_complete_nft_state{
+            removing.phase == detail::RecoveryPhase::applied};
         removing.phase = detail::RecoveryPhase::removing;
         if (!detail::write_recovery_record(
                 handle->journal_directory_.get(), ::geteuid(), removing)) {
@@ -1023,7 +1121,12 @@ public:
         const CommandResult table_query{production_->run_tool(
             *nft_path, list_table_arguments, deadline)};
         if (table_query.kind == CommandResultKind::success) {
-            if (table_query.standard_output.find(handle->table_) == std::string::npos) {
+            if (table_query.standard_output.size() >= 4096U
+                || !nft_connectivity_table_matches(
+                    table_query.standard_output,
+                    handle->table_,
+                    handle->recovery_record_.token,
+                    !require_complete_nft_state)) {
                 ConnectivityState state;
                 state.emplace<IdentityUnconfirmed>();
                 return {Cause::identity_mismatch, std::move(state)};
@@ -1626,6 +1729,86 @@ private:
                     != std::string::npos);
     }
 
+    [[nodiscard]] static bool nft_connectivity_table_matches(
+        const std::string_view output,
+        const std::string_view table,
+        const std::string_view token,
+        const bool allow_incomplete)
+    {
+        std::array<std::string_view, 6> lines{};
+        std::size_t count{};
+        std::size_t begin{};
+        while (begin < output.size()) {
+            const std::size_t end{output.find('\n', begin)};
+            const std::string_view line{trim_ascii(output.substr(
+                begin,
+                end == std::string_view::npos ? output.size() - begin
+                                              : end - begin))};
+            if (!line.empty()) {
+                if (count == lines.size()) {
+                    return false;
+                }
+                lines[count++] = line;
+            }
+            if (end == std::string_view::npos) {
+                break;
+            }
+            begin = end + 1U;
+        }
+        if (count < 2U || lines[0] != std::string{"table ip "}
+                + std::string{table} + " {") {
+            return false;
+        }
+        if (count == 2U) {
+            return allow_incomplete && lines[1] == "}";
+        }
+        if (count != 5U && count != lines.size()) {
+            return false;
+        }
+        if (lines[1] != "chain postrouting {"
+            || lines[2] != "type nat hook postrouting priority srcnat; policy accept;"
+            || lines[count - 2U] != "}" || lines[count - 1U] != "}") {
+            return false;
+        }
+        if (count == 5U) {
+            return allow_incomplete;
+        }
+
+        std::string_view rule{lines[3]};
+        constexpr std::string_view rule_prefix{
+            "iifname \"nll-host\" ip saddr 10.200.0.2 "};
+        if (!rule.starts_with(rule_prefix)) {
+            return false;
+        }
+        rule.remove_prefix(rule_prefix.size());
+        if (rule.starts_with("counter packets ")) {
+            rule.remove_prefix(std::string_view{"counter packets "}.size());
+            const auto remove_digits = [&rule]() {
+                const std::size_t digits{rule.find_first_not_of("0123456789")};
+                if (digits == 0U || digits == std::string_view::npos) {
+                    return false;
+                }
+                rule.remove_prefix(digits);
+                return true;
+            };
+            if (!remove_digits() || !rule.starts_with(" bytes ")) {
+                return false;
+            }
+            rule.remove_prefix(std::string_view{" bytes "}.size());
+            if (!remove_digits() || !rule.starts_with(" masquerade ")) {
+                return false;
+            }
+            rule.remove_prefix(std::string_view{" masquerade "}.size());
+            return rule == std::string{"comment \"netlaglab:"}
+                + std::string{token} + "\"";
+        }
+        if (rule.starts_with("counter ")) {
+            rule.remove_prefix(std::string_view{"counter "}.size());
+        }
+        return rule == std::string{"masquerade comment \"netlaglab:"}
+            + std::string{token} + "\"";
+    }
+
     [[nodiscard]] static std::string_view trim_ascii(const std::string_view value)
     {
         std::size_t begin{};
@@ -2223,6 +2406,24 @@ PreparedNetworkEnvironment::~PreparedNetworkEnvironment() noexcept
 WorkloadNamespaceEntry PreparedNetworkEnvironment::workload_namespace() const noexcept
 {
     return WorkloadNamespaceEntry{detail::OwnerAccess::namespace_handle(*this)};
+}
+
+std::optional<Failure> PreparedNetworkEnvironment::validate_connectivity() const
+{
+    if (!state_ || !state_->runtime) {
+        return Failure{Stage::internet_connectivity, Cause::identity_unavailable};
+    }
+    const auto* proof{std::get_if<ConnectivityProof>(&state_->connectivity_root)};
+    if (proof == nullptr) {
+        return Failure{Stage::internet_connectivity, Cause::identity_unavailable};
+    }
+    const TimePoint now{state_->runtime->clock->now()};
+    const OperationResult validation{state_->runtime->adapter->validate_connectivity(
+        *proof, now + operation_limit)};
+    if (validation.succeeded) {
+        return std::nullopt;
+    }
+    return Failure{Stage::internet_connectivity, validation.cause};
 }
 
 CleanupResult PreparedNetworkEnvironment::cleanup() &&

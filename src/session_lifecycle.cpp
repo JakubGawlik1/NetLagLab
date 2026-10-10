@@ -75,6 +75,20 @@ SessionOutcome run_session_lifecycle(LifecycleAdapter& adapter)
                     continue;
                 }
             } else if (state == State::active) {
+                if (event.kind == LifecycleEventKind::connectivity_failed) {
+                    outcome.infrastructure_failures.push_back(
+                        InfrastructureFailure::connectivity);
+                    if (stop_stage == StopStage::none) {
+                        if (!adapter.request_stop(StopRequest::terminate)) {
+                            outcome.infrastructure_failures.push_back(
+                                InfrastructureFailure::stop_request);
+                            break;
+                        }
+                        stop_stage = StopStage::terminate_grace;
+                    }
+                    continue;
+                }
+
                 if (event.kind == LifecycleEventKind::profile_state_unknown) {
                     outcome.infrastructure_failures.push_back(
                         InfrastructureFailure::profile_state);

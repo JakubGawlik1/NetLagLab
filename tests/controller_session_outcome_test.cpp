@@ -104,6 +104,7 @@ TEST(ControllerSessionOutcomeTest, RoundTripsSignalAndEveryFailureCode)
         .infrastructure_failures = {
             InfrastructureFailure::start,
             InfrastructureFailure::conversation,
+            InfrastructureFailure::connectivity,
             InfrastructureFailure::profile_state,
             InfrastructureFailure::stop_request,
             InfrastructureFailure::cleanup,
@@ -124,6 +125,7 @@ TEST(ControllerSessionOutcomeTest, RoundTripsSignalAndEveryFailureCode)
         "INFRASTRUCTURE FAILED\n"
         "FAILURE STARTUP\n"
         "FAILURE HELPER_CONVERSATION\n"
+        "FAILURE SESSION_CONNECTIVITY\n"
         "FAILURE PROFILE_STATE\n"
         "FAILURE STOP_REQUEST\n"
         "FAILURE PRIVILEGED_CLEANUP\n"

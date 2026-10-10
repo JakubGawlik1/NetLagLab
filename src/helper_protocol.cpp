@@ -369,14 +369,14 @@ RuntimeCommandFeedResult HelperRuntimeConversation::receive_bytes(
         buffer_.erase(0, newline + 1);
         const std::optional<HelperRuntimeCommand> command{
             parse_helper_runtime_command(line)};
-        if (command.has_value() && profile_state_unknown_
+        if (command.has_value() && (profile_state_unknown_ || connectivity_failed_)
             && std::holds_alternative<ProfileChange>(*command)) {
             continue;
         }
         if (!command.has_value() || workload_finished_
             || (std::holds_alternative<ProfileChange>(*command)
                 && (pending_profile_change_.has_value() || stopping_
-                    || profile_state_unknown_))) {
+                    || profile_state_unknown_ || connectivity_failed_))) {
             valid_ = false;
             buffer_.clear();
             return {false, std::move(commands),
@@ -415,6 +415,13 @@ void HelperRuntimeConversation::workload_finished() noexcept
     workload_finished_ = true;
     pending_profile_change_.reset();
     buffer_.clear();
+}
+
+void HelperRuntimeConversation::connectivity_failed() noexcept
+{
+    stopping_ = true;
+    connectivity_failed_ = true;
+    pending_profile_change_.reset();
 }
 
 std::optional<std::string> complete_profile_change(
@@ -491,6 +498,8 @@ std::string helper_conversation_event_message(const HelperConversationEvent& eve
                     ? "PROFILE_OK\n" : "PROFILE_FAILED APPLY_FAILED\n";
             } else if constexpr (std::is_same_v<Event, ProfileStateUnknownEvent>) {
                 return "ERROR PROFILE_STATE_UNKNOWN\n";
+            } else if constexpr (std::is_same_v<Event, ConnectivityFailedEvent>) {
+                return "CONNECTIVITY_FAILED\n";
             } else {
                 return {};
             }
@@ -569,6 +578,10 @@ std::vector<HelperConversationEvent> SupervisorHelperConversation::receive_bytes
             pending_profile_change_.reset();
             state_ = State::profile_state_unknown;
             event = ProfileStateUnknownEvent{};
+        } else if (state_ == State::active && line == "CONNECTIVITY_FAILED") {
+            pending_profile_change_.reset();
+            state_ = State::connectivity_failed;
+            event = ConnectivityFailedEvent{};
         } else if (line.starts_with(helper_error_prefix)) {
             pending_profile_change_.reset();
             state_ = State::failed;
@@ -586,7 +599,8 @@ std::vector<HelperConversationEvent> SupervisorHelperConversation::receive_bytes
                 state_ = State::waiting_for_cleanup;
             }
         } else if (state_ == State::active
-                   || state_ == State::profile_state_unknown) {
+                   || state_ == State::profile_state_unknown
+                   || state_ == State::connectivity_failed) {
             if (const auto result{
                     parse_value_after(line, "WORKLOAD_EXITED ", 0, 255)}) {
                 event = WorkloadExitedEvent{*result};

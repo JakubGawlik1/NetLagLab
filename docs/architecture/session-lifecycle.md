@@ -71,8 +71,9 @@ The semantic order is:
 3. The helper authenticates the Supervisor and accepts the bounded execution
    context; the Network Environment transaction then acquires the global host
    lock and performs semantic preflight checks and collision detection.
-4. If a firewall mutation is necessary, the helper reports the exact plan and
-   the user confirms it through `/dev/tty` before mutation.
+4. If a firewall mutation is necessary, the helper reports the backend, exact
+   scope, persistence, and cleanup plan. The user confirms through `/dev/tty`
+   before mutation.
 5. The helper creates the network and mount environment and applies the
    unrestricted initial Network Profile.
 6. The helper launches the Workload with the invoking user's identity and
@@ -97,6 +98,13 @@ it send `ACTIVE <pid>`. `START_FAILED 126|127` remains a pre-activation result.
 ### Runtime
 
 - The helper is mandatory. Helper loss is an infrastructure failure.
+- While the Workload runs, the helper checks the Session's exact nftables table
+  and required UFW rule or firewalld policy once per second. Missing or
+  mismatched state sends `CONNECTIVITY_FAILED` to the Supervisor and prevents
+  further profile changes.
+- The Supervisor records Session connectivity failure and starts the normal
+  TERM-to-KILL stop path. Workload reaping and privileged cleanup still follow,
+  so the Session Outcome retains the Workload result independently.
 - Supervisor loss makes the helper stop and reap the directly managed
   Workload, clean its owned resources, and exit. It must not remain as an
   orphaned root process.
@@ -152,6 +160,8 @@ to the blocking lifecycle.
   the failure neither sends a duplicate initial request nor restarts its
   deadline. In both cases the lifecycle continues through Workload reaping and
   privileged cleanup.
+- A connectivity failure is recorded separately as infrastructure failure
+  `connectivity`; the Controller receives it as `FAILURE SESSION_CONNECTIVITY`.
 
 ### Result precedence
 

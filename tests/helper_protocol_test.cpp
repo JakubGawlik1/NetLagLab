@@ -413,6 +413,35 @@ TEST(HelperProtocolTest, UnknownProfileStatePreservesLifecycleEventFraming)
     EXPECT_NE(std::get_if<CleanupFailedEvent>(&events[2]), nullptr);
 }
 
+TEST(HelperProtocolTest, ConnectivityFailurePreservesWorkloadAndCleanupEvents)
+{
+    EXPECT_EQ(
+        helper_conversation_event_message(ConnectivityFailedEvent{}),
+        "CONNECTIVITY_FAILED\n");
+    SupervisorHelperConversation supervisor;
+    ASSERT_EQ(supervisor.receive_bytes("READY\nACTIVE 123\n").size(), 2U);
+
+    const auto failure{supervisor.receive_bytes("CONNECTIVITY_FAILED\n")};
+
+    ASSERT_EQ(failure.size(), 1U);
+    EXPECT_NE(std::get_if<ConnectivityFailedEvent>(&failure.front()), nullptr);
+    EXPECT_FALSE(supervisor.begin_profile_change(
+        ProfileChange{SetDelay{TrafficDirection::outbound, 10ms}}).has_value());
+    const auto completed{supervisor.receive_bytes(
+        "WORKLOAD_SIGNALED 15\nCLEANUP_OK\n")};
+    ASSERT_EQ(completed.size(), 2U);
+    EXPECT_NE(std::get_if<WorkloadSignaledEvent>(&completed[0]), nullptr);
+    EXPECT_NE(std::get_if<CleanupSucceededEvent>(&completed[1]), nullptr);
+
+    HelperRuntimeConversation helper;
+    helper.connectivity_failed();
+    const RuntimeCommandFeedResult commands{helper.receive_bytes(
+        "PROFILE_SET_DELAY OUTBOUND 10\nSTOP TERM\n")};
+    ASSERT_TRUE(commands.valid);
+    ASSERT_EQ(commands.commands.size(), 1U);
+    EXPECT_NE(std::get_if<StopTerminateCommand>(&commands.commands.front()), nullptr);
+}
+
 TEST(HelperProtocolTest, TerminalWorkloadEventCancelsPendingProfileState)
 {
     const ProfileChange change{SetPacketLoss{TrafficDirection::inbound, 2.5}};

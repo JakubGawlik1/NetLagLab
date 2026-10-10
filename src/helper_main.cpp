@@ -391,10 +391,13 @@ public:
 [[nodiscard]] int supervise_workload(
     const int supervisor_descriptor,
     netlaglab::WorkloadProcess workload,
+    netlaglab::network_environment::PreparedNetworkEnvironment& environment,
     std::ostream& error)
 {
     netlaglab::HelperRuntimeConversation conversation;
     RestoreOnlyProfileChangeAdapter profile_change_adapter;
+    auto next_connectivity_check{std::chrono::steady_clock::now() + 1s};
+    bool connectivity_checks_enabled{true};
     while (true) {
         const netlaglab::WorkloadPollResult workload_result{workload.poll()};
         if (workload_result.state == netlaglab::WorkloadPollState::error) {
@@ -409,6 +412,27 @@ public:
                 return 125;
             }
             return 0;
+        }
+
+        if (connectivity_checks_enabled
+            && std::chrono::steady_clock::now() >= next_connectivity_check) {
+            const std::optional<netlaglab::network_environment::Failure> failure{
+                environment.validate_connectivity()};
+            if (failure.has_value()) {
+                error << "NetLagLab helper: required Session firewall or NAT state "
+                         "was lost or could not be verified\n";
+                conversation.connectivity_failed();
+                if (!netlaglab::send_socket_text(
+                        supervisor_descriptor,
+                        netlaglab::helper_conversation_event_message(
+                            netlaglab::ConnectivityFailedEvent{}))) {
+                    (void)stop_after_supervisor_loss(workload);
+                    return 125;
+                }
+                connectivity_checks_enabled = false;
+            } else {
+                next_connectivity_check = std::chrono::steady_clock::now() + 1s;
+            }
         }
 
         struct pollfd descriptor {supervisor_descriptor, POLLIN, 0};
@@ -539,9 +563,13 @@ public:
             netlaglab::helper_conversation_event_message(event));
     }
 
-    [[nodiscard]] int supervise(netlaglab::WorkloadProcess workload) override
+    [[nodiscard]] int supervise(
+        netlaglab::WorkloadProcess workload,
+        netlaglab::network_environment::PreparedNetworkEnvironment& environment)
+        override
     {
-        return supervise_workload(supervisor_descriptor_, std::move(workload), error_);
+        return supervise_workload(
+            supervisor_descriptor_, std::move(workload), environment, error_);
     }
 
     [[nodiscard]] bool stop_and_reap(

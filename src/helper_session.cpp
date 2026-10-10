@@ -151,7 +151,7 @@ int run_helper_session(
         (void)operations.stop_and_reap(*launch.process);
         launch.process.reset();
     } else {
-        supervision_status = operations.supervise(std::move(*launch.process));
+        supervision_status = operations.supervise(std::move(*launch.process), *prepared);
     }
 
     const bool cleanup_succeeded{cleanup_prepared(*prepared, error)};

@@ -81,6 +81,10 @@ struct ProfileStateUnknownEvent {
     bool operator==(const ProfileStateUnknownEvent&) const = default;
 };
 
+struct ConnectivityFailedEvent {
+    bool operator==(const ConnectivityFailedEvent&) const = default;
+};
+
 using HelperConversationEvent = std::variant<
     ReadyEvent,
     ActivatedEvent,
@@ -91,7 +95,8 @@ using HelperConversationEvent = std::variant<
     CleanupFailedEvent,
     ConversationLostEvent,
     ProfileChangeResultEvent,
-    ProfileStateUnknownEvent>;
+    ProfileStateUnknownEvent,
+    ConnectivityFailedEvent>;
 
 enum class StartBlockState {
     incomplete,
@@ -139,6 +144,7 @@ public:
 class HelperRuntimeConversation {
 public:
     [[nodiscard]] RuntimeCommandFeedResult receive_bytes(std::string_view bytes);
+    void connectivity_failed() noexcept;
     [[nodiscard]] std::optional<std::string> complete_profile_change(
         ProfileChangeCompletion completion);
     void workload_finished() noexcept;
@@ -150,6 +156,7 @@ private:
     bool workload_finished_{};
     bool stopping_{};
     bool profile_state_unknown_{};
+    bool connectivity_failed_{};
 };
 
 [[nodiscard]] std::optional<std::string> complete_profile_change(
@@ -171,6 +178,7 @@ private:
         waiting_for_activation,
         active,
         profile_state_unknown,
+        connectivity_failed,
         waiting_for_cleanup,
         finished,
         failed,

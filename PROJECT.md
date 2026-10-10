@@ -95,8 +95,11 @@ cross-platform support are not current goals.
   nftables table, and supports scoped UFW or firewalld policy changes after
   controlling-terminal consent. A root-owned durable journal records mutation
   phases and is reconciled under the host lock before fixed-name preflight.
-  Scripted, filesystem, helper, and Workload tests cover the unprivileged
-  contracts; end-to-end DNS/TCP/UDP behavior remains unqualified.
+  While the Workload runs, the helper rechecks its exact NAT and required
+  firewall state once per second and fails the Session if ownership or presence
+  cannot be confirmed. Scripted, filesystem, helper, and Workload tests cover
+  the unprivileged contracts; end-to-end DNS/TCP/UDP behavior remains
+  unqualified.
 - Typed outbound and inbound profiles exist, but no network shaping is applied.
 
 ## Candidate capabilities

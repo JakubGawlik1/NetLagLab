@@ -173,6 +173,7 @@ frames, size limits, and legal ordering for their respective phases.
 | Helper -> Supervisor | `PROFILE_OK` | The requested Profile Change was applied. |
 | Helper -> Supervisor | `PROFILE_FAILED APPLY_FAILED` | Apply failed and the preceding confirmed profile was restored. |
 | Helper -> Supervisor | `ERROR PROFILE_STATE_UNKNOWN` | Profile state is unknown; only lifecycle completion remains legal. |
+| Helper -> Supervisor | `CONNECTIVITY_FAILED` | Owned NAT/firewall state was lost or could not be verified; the Supervisor stops the Workload and records a connectivity failure. |
 | Supervisor -> Helper | START block | One-time Workload execution context. |
 | Supervisor -> Helper | `STOP TERM` | Signal the directly managed Workload with SIGTERM. |
 | Supervisor -> Helper | `STOP KILL` | Signal the directly managed Workload with SIGKILL. |
@@ -191,8 +192,8 @@ and launcher reaping. Tests supply a scripted adapter at the same seam.
 `SessionOutcome` preserves two independent facts:
 
 - optional Workload result: start failure, normal exit, or signal;
-- zero or more infrastructure failures: start, conversation, profile state, stop request,
-  cleanup, launcher reaping/finalization, or impossible event.
+- zero or more infrastructure failures: start, conversation, Session connectivity,
+  profile state, stop request, cleanup, launcher reaping/finalization, or impossible event.
 
 An infrastructure failure maps the CLI result to `125` without discarding an
 already known Workload result. Otherwise a start failure returns `126`/`127`,

@@ -94,6 +94,12 @@ public:
         } else if (std::holds_alternative<WorkloadExitedEvent>(event)) {
             actions.push_back("workload exited");
             EXPECT_TRUE(trace_->host_lock_alive);
+        } else if (std::holds_alternative<ConnectivityFailedEvent>(event)) {
+            actions.push_back("connectivity failed");
+            EXPECT_TRUE(trace_->host_lock_alive);
+        } else if (std::holds_alternative<WorkloadSignaledEvent>(event)) {
+            actions.push_back("workload signaled");
+            EXPECT_TRUE(trace_->host_lock_alive);
         } else if (std::holds_alternative<CleanupSucceededEvent>(event)) {
             actions.push_back("cleanup succeeded");
             EXPECT_FALSE(trace_->host_lock_alive);
@@ -104,9 +110,31 @@ public:
         return true;
     }
 
-    int supervise(WorkloadProcess workload) override
+    int supervise(
+        WorkloadProcess workload,
+        PreparedNetworkEnvironment& environment) override
     {
         actions.push_back("supervise");
+        if (validate_connectivity_during_supervision) {
+            const std::optional<Failure> failure{environment.validate_connectivity()};
+            EXPECT_TRUE(failure.has_value());
+            if (!failure.has_value()) {
+                return 0;
+            }
+            EXPECT_EQ(failure->stage, Stage::internet_connectivity);
+            (void)send(ConnectivityFailedEvent{});
+            if (!workload.send_signal(SIGTERM)) {
+                return 125;
+            }
+            const std::optional<WorkloadStatus> status{workload.wait()};
+            EXPECT_TRUE(status.has_value());
+            if (!status.has_value()) {
+                return 125;
+            }
+            EXPECT_FALSE(status->exited);
+            (void)send(WorkloadSignaledEvent{status->value});
+            return 125;
+        }
         if (simulate_supervisor_loss) {
             actions.push_back("supervisor lost");
             (void)stop_and_reap(workload);
@@ -144,6 +172,7 @@ public:
     std::optional<int> launch_failure;
     bool active_delivery_succeeds{true};
     bool simulate_supervisor_loss{};
+    bool validate_connectivity_during_supervision{};
     bool lock_was_held_after_reap{};
     std::vector<Operation> operations_at_start_failure;
     std::vector<int> workload_exit_codes;
@@ -176,6 +205,38 @@ TEST(HelperSessionTest, PreparesLaunchesReapsAndCleansInOrder)
     EXPECT_FALSE(trace->host_lock_alive);
     EXPECT_EQ(trace->operations[10], Operation::remove_veth);
     EXPECT_EQ(trace->operations[11], Operation::remove_namespace);
+}
+
+TEST(HelperSessionTest, RuntimeConnectivityLossStopsWorkloadBeforeCleanup)
+{
+    auto trace{std::make_shared<SharedTrace>()};
+    std::vector<ScriptStep> script{successful_preparation()};
+    script.insert(script.begin() + 10, {Operation::configure_connectivity});
+    script.insert(
+        script.begin() + 11,
+        {Operation::validate_connectivity,
+         Outcome::fail_unchanged,
+         Cause::unsupported_host_configuration});
+    ScriptedHelperSession operations{std::move(script), trace};
+    operations.validate_connectivity_during_supervision = true;
+    const WorkloadContext context{
+        "/bin", {"/bin/sleep", "30"}, {"PATH=/bin"}};
+    std::ostringstream error;
+
+    const int result{run_helper_session(
+        operations, context, current_identity(), {}, error)};
+
+    EXPECT_EQ(result, 125);
+    ASSERT_EQ(operations.actions.size(), 7U);
+    EXPECT_EQ(operations.actions[0], "prepare");
+    EXPECT_EQ(operations.actions[1], "launch");
+    EXPECT_TRUE(operations.actions[2].starts_with("active "));
+    EXPECT_EQ(operations.actions[3], "supervise");
+    EXPECT_EQ(operations.actions[4], "connectivity failed");
+    EXPECT_EQ(operations.actions[5], "workload signaled");
+    EXPECT_EQ(operations.actions[6], "cleanup succeeded");
+    EXPECT_EQ(trace->operations.back(), Operation::remove_namespace);
+    EXPECT_FALSE(trace->host_lock_alive);
 }
 
 TEST(HelperSessionTest, PreparationFailureRetriesResidualWithoutLaunching)

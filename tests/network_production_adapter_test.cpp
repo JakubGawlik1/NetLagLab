@@ -175,6 +175,7 @@ public:
     bool firewalld_egress_configured{};
     bool firewalld_rule_configured{};
     std::string nft_table_name;
+    std::string nft_rule_token;
     std::deque<NamespaceQuery> namespaces;
     std::deque<LinkQuery> host_links;
     std::deque<LinkQuery> namespace_links;
@@ -323,8 +324,17 @@ public:
         if (command == "list" && arguments.size() == 4U
             && arguments[1] == "table") {
             if (arguments[3] == nft_table_name) {
+                const std::string table_header{"table ip " + arguments[3] + " {\n"};
+                if (nft_rule_token.empty()) {
+                    return {CommandResultKind::success, 0, {}, table_header + "}\n"};
+                }
                 return {CommandResultKind::success, 0, {},
-                        "table ip " + arguments[3] + " {}\n"};
+                        table_header
+                            + " chain postrouting {\n"
+                              "  type nat hook postrouting priority srcnat; policy accept;\n"
+                            + "  iifname \"nll-host\" ip saddr 10.200.0.2 counter packets 0 bytes 0"
+                              " masquerade comment \"netlaglab:" + nft_rule_token + "\"\n"
+                              " }\n}\n"};
             }
             return {CommandResultKind::nonzero_exit, 1, "No such file", {}};
         }
@@ -332,9 +342,15 @@ public:
             && arguments[1] == "table") {
             nft_table_name = arguments[3];
         }
+        if (command == "add" && arguments.size() == 14U
+            && arguments[1] == "rule" && arguments[13].starts_with("\"netlaglab:")) {
+            const std::string_view marker{arguments[13]};
+            nft_rule_token = std::string{marker.substr(11U, marker.size() - 12U)};
+        }
         if (command == "delete" && arguments.size() == 4U
             && arguments[1] == "table") {
             nft_table_name.clear();
+            nft_rule_token.clear();
         }
         if (arguments.size() > 1U && arguments[0] == "route"
             && arguments[1] == "allow") {
@@ -775,6 +791,9 @@ TEST(NetworkProductionAdapterTest, RefusesFirewallMutationWithoutInteractiveCons
     EXPECT_EQ(failure.primary.stage, Stage::internet_connectivity);
     EXPECT_TRUE(failure.rollback_failures.empty());
     ASSERT_EQ(observed->consent_requests.size(), 1U);
+    EXPECT_NE(observed->consent_requests.front().find("UFW"), std::string::npos);
+    EXPECT_NE(observed->consent_requests.front().find("persistent"), std::string::npos);
+    EXPECT_NE(observed->consent_requests.front().find("cleanup"), std::string::npos);
     EXPECT_NE(observed->consent_requests.front().find("nll-host"), std::string::npos);
     EXPECT_NE(observed->consent_requests.front().find("10.200.0.2"), std::string::npos);
     EXPECT_TRUE(std::none_of(
@@ -812,6 +831,9 @@ TEST(NetworkProductionAdapterTest, AddsAndRemovesOnlyTheConsentedUfwRule)
     EXPECT_TRUE(cleanup.failures.empty());
     EXPECT_FALSE(cleanup.residual.has_value());
     ASSERT_EQ(observed->consent_requests.size(), 1U);
+    EXPECT_NE(observed->consent_requests.front().find("UFW"), std::string::npos);
+    EXPECT_NE(observed->consent_requests.front().find("persistent"), std::string::npos);
+    EXPECT_NE(observed->consent_requests.front().find("cleanup"), std::string::npos);
     EXPECT_NE(observed->consent_requests.front().find("nll-host"), std::string::npos);
     const auto allow{std::find_if(
         observed->recorded_tools.begin(),
@@ -840,6 +862,122 @@ TEST(NetworkProductionAdapterTest, AddsAndRemovesOnlyTheConsentedUfwRule)
               remove->arguments.back());
 }
 
+TEST(NetworkProductionAdapterTest, DetectsMissingSessionNftStateWhileWorkloadIsActive)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    auto* const fake{production.get()};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    auto& environment{std::get<PreparedNetworkEnvironment>(result)};
+    EXPECT_FALSE(environment.validate_connectivity().has_value());
+    fake->nft_table_name.clear();
+    const std::optional<Failure> failure{environment.validate_connectivity()};
+    ASSERT_TRUE(failure.has_value());
+    EXPECT_EQ(failure->stage, Stage::internet_connectivity);
+    EXPECT_EQ(failure->cause, Cause::unsupported_host_configuration);
+    CleanupResult cleanup{std::move(environment).cleanup()};
+    EXPECT_FALSE(cleanup.residual.has_value());
+}
+
+TEST(NetworkProductionAdapterTest, DetectsMissingUfwRuleWhileWorkloadIsActive)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    auto* const fake{production.get()};
+    production->ufw_status_output = "Status: active\n";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    auto& environment{std::get<PreparedNetworkEnvironment>(result)};
+    ASSERT_FALSE(environment.validate_connectivity().has_value());
+    fake->ufw_rules_output.clear();
+    const std::optional<Failure> failure{environment.validate_connectivity()};
+    ASSERT_TRUE(failure.has_value());
+    EXPECT_EQ(failure->cause, Cause::unsupported_host_configuration);
+    CleanupResult cleanup{std::move(environment).cleanup()};
+    EXPECT_FALSE(cleanup.residual.has_value());
+}
+
+TEST(NetworkProductionAdapterTest, DetectsMissingFirewalldPolicyWhileWorkloadIsActive)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    auto* const fake{production.get()};
+    production->firewalld_state_output = "running\n";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    auto& environment{std::get<PreparedNetworkEnvironment>(result)};
+    ASSERT_FALSE(environment.validate_connectivity().has_value());
+    fake->firewalld_policy_exists = false;
+    const std::optional<Failure> failure{environment.validate_connectivity()};
+    ASSERT_TRUE(failure.has_value());
+    EXPECT_EQ(failure->cause, Cause::unsupported_host_configuration);
+    CleanupResult cleanup{std::move(environment).cleanup()};
+    EXPECT_FALSE(cleanup.residual.has_value());
+}
+
+TEST(NetworkProductionAdapterTest, PreservesNftTableWithUnrecognizedLiveRule)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    auto* const fake{production.get()};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    auto& environment{std::get<PreparedNetworkEnvironment>(result)};
+    fake->nft_rule_token = "different-owner";
+    const std::optional<Failure> failure{environment.validate_connectivity()};
+    ASSERT_TRUE(failure.has_value());
+    EXPECT_EQ(failure->cause, Cause::identity_mismatch);
+    CleanupResult cleanup{std::move(environment).cleanup()};
+    EXPECT_FALSE(cleanup.failures.empty());
+    EXPECT_TRUE(cleanup.residual.has_value());
+    EXPECT_FALSE(fake->nft_table_name.empty());
+}
+
 TEST(NetworkProductionAdapterTest, AddsAndRemovesScopedFirewalldPolicy)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
@@ -864,6 +1002,10 @@ TEST(NetworkProductionAdapterTest, AddsAndRemovesScopedFirewalldPolicy)
     EXPECT_TRUE(cleanup.failures.empty());
     EXPECT_FALSE(cleanup.residual.has_value());
     ASSERT_EQ(observed->consent_requests.size(), 1U);
+    EXPECT_NE(
+        observed->consent_requests.front().find("firewalld runtime-only"),
+        std::string::npos);
+    EXPECT_NE(observed->consent_requests.front().find("cleanup"), std::string::npos);
     EXPECT_NE(observed->consent_requests.front().find("public"), std::string::npos);
     EXPECT_NE(observed->consent_requests.front().find("10.200.0.2/32"), std::string::npos);
     EXPECT_TRUE(std::any_of(
@@ -997,6 +1139,7 @@ TEST(NetworkProductionAdapterTest, ReconcilesJournalBeforeRejectingFixedNameColl
         "0123456789abcdef0123456789abcdef",
     };
     production->nft_table_name = "netlaglab_" + record.token;
+    production->nft_rule_token = record.token;
     ASSERT_TRUE(detail::write_recovery_record(
         journal_directory, ::geteuid(), record));
 
