@@ -7,8 +7,10 @@ an integrated Controller-to-helper Profile Change path. The helper applies live
 directional delay, jitter, and packet loss with `tc/netem` on the Session's
 proven veth endpoints. Status reflects only helper-confirmed changes. Bandwidth
 is not applied and cannot be acknowledged as applied. Deterministic tests cover
-the operation, qdisc decoding, reconciliation, and rollback contract; privileged
-Session qualification has not been run for this implementation.
+the operation, qdisc decoding, reconciliation, and rollback contract. An opt-in
+integrated Session qualification now measures the production
+Controller-to-helper path against a controlled UDP peer, but it has not yet
+been run; real packet behavior remains unqualified.
 
 ## Network Profile meaning
 
@@ -145,7 +147,9 @@ The manual experiment showed fixed delay, variable delay with jitter, and
 packet loss on the two veth endpoints. It also demonstrated that round-trip
 ping can conceal direction. It did not prove production rollback, live profile
 updates, bandwidth limiting, Controller behavior, helper protocol behavior, or
-cleanup. Automated tests do not qualify privileged packet behavior.
+cleanup. Deterministic and integrated qualification tests provide separate
+evidence; only a completed opt-in Session qualification can establish live
+production packet behavior on its recorded host.
 
 ## Open implementation design
 

@@ -208,6 +208,47 @@ if(BUILD_TESTING)
     gtest_discover_tests(netlaglab_network_environment_tests)
 
     if(NETLAGLAB_BUILD_PRIVILEGED_TESTS)
+        execute_process(
+            COMMAND git rev-parse HEAD
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            OUTPUT_VARIABLE NETLAGLAB_TESTED_REVISION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT NETLAGLAB_TESTED_REVISION)
+            set(NETLAGLAB_TESTED_REVISION "unknown")
+        endif()
+        find_program(
+            NETLAGLAB_TEST_TC_PATH
+            NAMES tc
+            PATHS /usr/sbin /usr/bin /sbin /bin
+            NO_DEFAULT_PATH
+        )
+        if(NOT NETLAGLAB_TEST_TC_PATH)
+            set(NETLAGLAB_TEST_TC_PATH "unavailable")
+            set(NETLAGLAB_TEST_TC_VERSION "unavailable")
+        else()
+            execute_process(
+                COMMAND "${NETLAGLAB_TEST_TC_PATH}" -V
+                OUTPUT_VARIABLE NETLAGLAB_TEST_TC_VERSION
+                ERROR_VARIABLE NETLAGLAB_TEST_TC_VERSION_ERROR
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_STRIP_TRAILING_WHITESPACE
+            )
+            if(NOT NETLAGLAB_TEST_TC_VERSION)
+                set(NETLAGLAB_TEST_TC_VERSION
+                    "${NETLAGLAB_TEST_TC_VERSION_ERROR}")
+            endif()
+        endif()
+        execute_process(
+            COMMAND git status --porcelain --untracked-files=no
+            WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+            OUTPUT_VARIABLE NETLAGLAB_WORKTREE_STATUS
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        if(NETLAGLAB_WORKTREE_STATUS)
+            string(APPEND NETLAGLAB_TESTED_REVISION "-dirty")
+        endif()
+
         target_compile_definitions(
             netlaglab_network_environment
             PRIVATE NETLAGLAB_BUILD_PRIVILEGED_TESTS=1
@@ -269,6 +310,9 @@ if(BUILD_TESTING)
             PRIVATE
                 NETLAGLAB_EXECUTABLE_PATH="$<TARGET_FILE:netlaglab>"
                 NETLAGLAB_SESSION_PROBE_PATH="$<TARGET_FILE:netlaglab_session_qualification>"
+                NETLAGLAB_TESTED_REVISION="${NETLAGLAB_TESTED_REVISION}"
+                NETLAGLAB_TEST_TC_PATH="${NETLAGLAB_TEST_TC_PATH}"
+                NETLAGLAB_TEST_TC_VERSION="${NETLAGLAB_TEST_TC_VERSION}"
         )
         add_dependencies(
             netlaglab_session_qualification

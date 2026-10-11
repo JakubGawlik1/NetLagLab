@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <csignal>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -27,11 +29,14 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <time.h>
 #include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <utility>
@@ -64,6 +69,35 @@ constexpr std::string_view probe_stderr{"NLL_SESSION_PROBE_STDERR\n"};
 constexpr std::string_view udp_result_prefix{"NLL_SESSION_PROBE_UDP:"};
 constexpr std::string_view connectivity_result_prefix{
     "NLL_SESSION_PROBE_CONNECTIVITY:"};
+constexpr std::string_view shaping_sample_prefix{"NLL_SESSION_SHAPING_SAMPLE:"};
+
+struct ShapingDatagram {
+    std::uint64_t sequence{};
+    std::int64_t workload_sent_ns{};
+    std::int64_t peer_received_ns{};
+};
+
+[[nodiscard]] std::int64_t monotonic_nanoseconds()
+{
+    timespec now{};
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == -1) {
+        return 0;
+    }
+    return static_cast<std::int64_t>(now.tv_sec) * 1'000'000'000LL + now.tv_nsec;
+}
+
+[[nodiscard]] std::int64_t percentile(
+    std::vector<std::int64_t> values,
+    const std::size_t numerator,
+    const std::size_t denominator)
+{
+    if (values.empty()) {
+        return -1;
+    }
+    std::sort(values.begin(), values.end());
+    const std::size_t index{(values.size() - 1U) * numerator / denominator};
+    return values[index];
+}
 
 [[nodiscard]] int report_probe_failure(
     const int status,
@@ -302,6 +336,107 @@ extern "C" void handle_termination(int)
     return succeeded;
 }
 
+[[nodiscard]] bool run_shaping_measurement(
+    const std::uint16_t port,
+    const std::string_view token,
+    const std::size_t packet_count)
+{
+    const int descriptor{socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+    if (descriptor == -1) {
+        return false;
+    }
+    sockaddr_in host{};
+    host.sin_family = AF_INET;
+    host.sin_port = htons(port);
+    if (inet_pton(AF_INET, "10.200.0.1", &host.sin_addr) != 1) {
+        (void)close(descriptor);
+        return false;
+    }
+
+    std::vector<std::int64_t> outbound_us;
+    std::vector<std::int64_t> inbound_us;
+    std::vector<bool> received(packet_count);
+    for (std::size_t index{}; index < packet_count; ++index) {
+        ShapingDatagram request{
+            .sequence = static_cast<std::uint64_t>(index + 1U),
+            .workload_sent_ns = monotonic_nanoseconds(),
+            .peer_received_ns = 0};
+        const ssize_t sent{sendto(
+            descriptor,
+            &request,
+            sizeof(request),
+            0,
+            reinterpret_cast<const sockaddr*>(&host),
+            sizeof(host))};
+        if (sent != static_cast<ssize_t>(sizeof(request))) {
+            (void)close(descriptor);
+            return false;
+        }
+        (void)poll(nullptr, 0, 2);
+    }
+
+    const auto deadline{std::chrono::steady_clock::now() + 8s};
+    std::size_t received_count{};
+    while (received_count < packet_count
+           && std::chrono::steady_clock::now() < deadline) {
+        pollfd watched{descriptor, POLLIN, 0};
+        int ready{};
+        do {
+            ready = poll(&watched, 1, 50);
+        } while (ready == -1 && errno == EINTR);
+        if (ready <= 0 || (watched.revents & POLLIN) == 0) {
+            continue;
+        }
+        ShapingDatagram response{};
+        sockaddr_in source{};
+        socklen_t source_size{sizeof(source)};
+        const ssize_t size{recvfrom(
+            descriptor,
+            &response,
+            sizeof(response),
+            0,
+            reinterpret_cast<sockaddr*>(&source),
+            &source_size)};
+        if (size != static_cast<ssize_t>(sizeof(response))
+            || response.sequence == 0 || response.sequence > packet_count
+            || response.peer_received_ns == 0
+            || source.sin_family != AF_INET || source_size != sizeof(source)
+            || source.sin_addr.s_addr != host.sin_addr.s_addr
+            || source.sin_port != host.sin_port) {
+            continue;
+        }
+        const std::size_t index{static_cast<std::size_t>(response.sequence - 1U)};
+        if (received[index]) {
+            continue;
+        }
+        received[index] = true;
+        ++received_count;
+        const std::int64_t workload_received_ns{monotonic_nanoseconds()};
+        outbound_us.push_back(
+            (response.peer_received_ns - response.workload_sent_ns) / 1'000);
+        inbound_us.push_back(
+            (workload_received_ns - response.peer_received_ns) / 1'000);
+    }
+    (void)close(descriptor);
+
+    const std::int64_t outbound_p10{percentile(outbound_us, 1U, 10U)};
+    const std::int64_t outbound_p50{percentile(outbound_us, 1U, 2U)};
+    const std::int64_t outbound_p90{percentile(outbound_us, 9U, 10U)};
+    const std::int64_t inbound_p10{percentile(inbound_us, 1U, 10U)};
+    const std::int64_t inbound_p50{percentile(inbound_us, 1U, 2U)};
+    const std::int64_t inbound_p90{percentile(inbound_us, 9U, 10U)};
+    std::cout << shaping_sample_prefix << token << ":sent=" << packet_count
+              << ",received=" << received_count
+              << ",outbound_p10_us=" << outbound_p10
+              << ",outbound_p50_us=" << outbound_p50
+              << ",outbound_p90_us=" << outbound_p90
+              << ",inbound_p10_us=" << inbound_p10
+              << ",inbound_p50_us=" << inbound_p50
+              << ",inbound_p90_us=" << inbound_p90 << '\n';
+    std::cout.flush();
+    return true;
+}
+
 [[nodiscard]] std::optional<sockaddr_in> first_ipv4_resolver()
 {
     std::ifstream resolver{ "/etc/resolv.conf" };
@@ -463,7 +598,8 @@ extern "C" void handle_termination(int)
     const std::string_view mode{argv[2]};
     const std::string_view port_text{argv[3]};
     const std::string_view token{argv[4]};
-    if (mode != "natural" && mode != "hold" && mode != "connectivity") {
+    if (mode != "natural" && mode != "hold" && mode != "connectivity"
+        && mode != "shaping") {
         return report_probe_failure(81, "unexpected probe mode");
     }
     std::uint64_t port_value{};
@@ -504,7 +640,7 @@ extern "C" void handle_termination(int)
     if (!udp_succeeded) {
         std::cerr << "Session qualification probe failed: bounded host UDP exchange failed\n";
     }
-    if (mode == "hold") {
+    if (mode == "hold" || mode == "shaping") {
         struct sigaction action {};
         action.sa_handler = handle_termination;
         sigemptyset(&action.sa_mask);
@@ -532,6 +668,28 @@ extern "C" void handle_termination(int)
     std::cout.flush();
     std::cerr.flush();
     if (mode == "natural") {
+        return 37;
+    }
+    if (mode == "shaping") {
+        std::string command;
+        while (std::getline(std::cin, command)) {
+            if (command == "exit") {
+                return 37;
+            }
+            std::istringstream input{command};
+            std::string operation;
+            std::string count_text;
+            std::string extra;
+            std::uint64_t count{};
+            if (!(input >> operation >> count_text) || (input >> extra)
+                || operation != "sample" || !parse_unsigned(count_text, count)
+                || count < 20U || count > 500U
+                || !run_shaping_measurement(
+                    static_cast<std::uint16_t>(port_value), token,
+                    static_cast<std::size_t>(count))) {
+                return report_probe_failure(90, "invalid shaping sample request");
+            }
+        }
         return 37;
     }
     while (termination_requested == 0) {
@@ -709,6 +867,62 @@ public:
     }
 
     [[nodiscard]] pid_t pid() const noexcept { return pid_; }
+
+    [[nodiscard]] bool write_input(const std::string_view input)
+    {
+        std::size_t written{};
+        while (written < input.size()) {
+            const ssize_t amount{write(
+                input_.get(), input.data() + written, input.size() - written)};
+            if (amount > 0) {
+                written += static_cast<std::size_t>(amount);
+            } else if (amount == -1 && errno == EINTR) {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool wait_for_output(
+        const std::string_view marker,
+        std::string& stdout_text,
+        std::string& stderr_text,
+        const std::chrono::milliseconds timeout = 10000ms,
+        const std::size_t search_after = 0)
+    {
+        const auto deadline{std::chrono::steady_clock::now() + timeout};
+        while (std::chrono::steady_clock::now() < deadline) {
+            const std::size_t found{stdout_text.find(marker, search_after)};
+            if (found != std::string::npos
+                && stdout_text.find('\n', found) != std::string::npos) {
+                return true;
+            }
+            pollfd descriptors[2]{{output_.get(), POLLIN, 0},
+                                  {error_.get(), POLLIN, 0}};
+            const auto remaining{std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now())};
+            int ready{};
+            do {
+                ready = poll(descriptors, 2,
+                             static_cast<int>(std::max<std::int64_t>(
+                                 0, remaining.count())));
+            } while (ready == -1 && errno == EINTR);
+            if (ready <= 0) {
+                break;
+            }
+            if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0
+                && !read_available(output_.get(), stdout_text)) {
+                return false;
+            }
+            if ((descriptors[1].revents & (POLLIN | POLLHUP)) != 0
+                && !read_available(error_.get(), stderr_text)) {
+                return false;
+            }
+        }
+        return false;
+    }
 
     [[nodiscard]] bool wait_for_ready(
         const int udp_descriptor,
@@ -994,6 +1208,7 @@ public:
     }
     ~UdpPeer()
     {
+        stop_shaping_service();
         if (descriptor_ != -1) {
             (void)close(descriptor_);
         }
@@ -1002,10 +1217,82 @@ public:
     [[nodiscard]] int descriptor() const noexcept { return descriptor_; }
     [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
 
+    [[nodiscard]] bool start_shaping_service()
+    {
+        if (!valid_ || service_.joinable()) {
+            return false;
+        }
+        service_stopping_.store(false);
+        service_ = std::thread{[this] {
+            while (!service_stopping_.load()) {
+                pollfd watched{descriptor_, POLLIN, 0};
+                int ready{};
+                do {
+                    ready = poll(&watched, 1, 50);
+                } while (ready == -1 && errno == EINTR);
+                if (ready <= 0 || (watched.revents & POLLIN) == 0) {
+                    continue;
+                }
+                ShapingDatagram packet{};
+                sockaddr_in workload{};
+                socklen_t workload_size{sizeof(workload)};
+                const ssize_t size{recvfrom(
+                    descriptor_,
+                    &packet,
+                    sizeof(packet),
+                    0,
+                    reinterpret_cast<sockaddr*>(&workload),
+                    &workload_size)};
+                if (size != static_cast<ssize_t>(sizeof(packet))
+                    || workload.sin_family != AF_INET
+                    || workload_size != sizeof(workload)
+                    || packet.sequence == 0 || packet.workload_sent_ns <= 0) {
+                    continue;
+                }
+                packet.peer_received_ns = monotonic_nanoseconds();
+                in_addr expected_workload{};
+                if (inet_pton(AF_INET, "10.200.0.2", &expected_workload) != 1
+                    || workload.sin_addr.s_addr != expected_workload.s_addr) {
+                    continue;
+                }
+                received_count_.fetch_add(1);
+                (void)sendto(
+                    descriptor_,
+                    &packet,
+                    sizeof(packet),
+                    0,
+                    reinterpret_cast<const sockaddr*>(&workload),
+                    workload_size);
+            }
+        }};
+        return true;
+    }
+
+    void stop_shaping_service() noexcept
+    {
+        service_stopping_.store(true);
+        if (service_.joinable()) {
+            service_.join();
+        }
+    }
+
+    [[nodiscard]] std::uint64_t shaping_packets_received() const noexcept
+    {
+        return received_count_.load();
+    }
+
+    void reset_shaping_packets_received() noexcept
+    {
+        received_count_.store(0);
+    }
+
 private:
     int descriptor_{-1};
     std::uint16_t port_{};
     bool valid_{};
+    std::atomic<bool> service_stopping_{};
+    std::atomic<std::uint64_t> received_count_{};
+    std::thread service_;
 };
 
 [[nodiscard]] bool namespace_roots_absent(std::uint64_t session_inode)
@@ -1123,6 +1410,15 @@ private:
     return static_cast<std::uint64_t>(status.st_ino);
 }
 
+[[nodiscard]] bool request_shaping_sample(
+    ChildProcess& session,
+    UdpPeer& peer,
+    std::string_view token,
+    std::size_t packet_count,
+    std::string& output,
+    std::string& error,
+    std::string_view& sample_line);
+
 class Scenario {
 public:
     Scenario() : token_{"qualification-" + std::to_string(getpid())}
@@ -1165,6 +1461,29 @@ public:
     }
     [[nodiscard]] std::uint16_t port() const noexcept { return peer_.port(); }
     [[nodiscard]] int udp_descriptor() const noexcept { return peer_.descriptor(); }
+    [[nodiscard]] bool start_shaping_service()
+    {
+        return peer_.start_shaping_service();
+    }
+    [[nodiscard]] std::uint64_t shaping_packets_received() const noexcept
+    {
+        return peer_.shaping_packets_received();
+    }
+    void reset_shaping_packets_received() noexcept
+    {
+        peer_.reset_shaping_packets_received();
+    }
+    [[nodiscard]] bool request_shaping_sample(
+        ChildProcess& session,
+        const std::string_view token,
+        const std::size_t packet_count,
+        std::string& output,
+        std::string& error,
+        std::string_view& sample_line)
+    {
+        return ::request_shaping_sample(
+            session, peer_, token, packet_count, output, error, sample_line);
+    }
 
     [[nodiscard]] std::vector<std::string> run_arguments(
         const std::string_view mode) const
@@ -1210,6 +1529,24 @@ public:
             host_peer_received_datagram,
             udp_exchange_succeeded,
             timeout);
+    }
+
+    [[nodiscard]] bool launch_shaping_session(
+        ChildProcess& process,
+        std::string& stdout_text,
+        std::string& stderr_text,
+        std::uint64_t& session_inode,
+        bool& host_peer_received_datagram,
+        bool& udp_exchange_succeeded) const
+    {
+        if (!process.start(
+                run_arguments("shaping"), work_directory(),
+                std::string{stdin_value} + "\n", true)) {
+            return false;
+        }
+        return process.wait_for_ready(
+            udp_descriptor(), token_, stdout_text, stderr_text, session_inode,
+            host_peer_received_datagram, udp_exchange_succeeded);
     }
 
 private:
@@ -1274,6 +1611,126 @@ private:
     return controller.wait_for_exit(stdout_text, stderr_text, 15000ms);
 }
 
+class ActiveSessionCleanup {
+public:
+    ActiveSessionCleanup(
+        ChildProcess& session,
+        const Scenario& scenario,
+        std::uint64_t& namespace_inode)
+        : session_{session}, scenario_{scenario}, namespace_inode_{namespace_inode}
+    {
+    }
+
+    ~ActiveSessionCleanup()
+    {
+        if (session_.pid() > 0) {
+            std::string output;
+            std::string error;
+            const std::optional<int> controller_status{run_controller_stop(
+                scenario_.work_directory(), output, error)};
+            if (!controller_status.has_value() || *controller_status != 0) {
+                if (!session_.kill_and_reap(SIGKILL)) {
+                    ADD_FAILURE() << "failed to stop the active qualification Session: "
+                                  << error;
+                }
+            } else if (!session_.wait_for_exit(output, error, 15000ms)) {
+                ADD_FAILURE() << "Session did not exit after scoped Controller stop: "
+                              << error;
+                (void)session_.kill_and_reap(SIGKILL);
+            }
+        }
+        if (!wait_for_cleanup(namespace_inode_)) {
+            ADD_FAILURE() << "qualification cleanup left an owned network resource or "
+                             "the host lock behind";
+        }
+    }
+
+    ActiveSessionCleanup(const ActiveSessionCleanup&) = delete;
+    ActiveSessionCleanup& operator=(const ActiveSessionCleanup&) = delete;
+
+private:
+    ChildProcess& session_;
+    const Scenario& scenario_;
+    std::uint64_t& namespace_inode_;
+};
+
+[[nodiscard]] std::optional<int> run_controller_script(
+    const std::filesystem::path& working_directory,
+    const std::string_view script,
+    std::string& stdout_text,
+    std::string& stderr_text)
+{
+    ChildProcess controller;
+    if (!controller.start(
+            {NETLAGLAB_EXECUTABLE_PATH, "attach"}, working_directory, script)) {
+        return std::nullopt;
+    }
+    return controller.wait_for_exit(stdout_text, stderr_text, 15000ms);
+}
+
+[[nodiscard]] std::optional<std::int64_t> shaping_metric(
+    const std::string_view line,
+    const std::string_view name)
+{
+    const std::size_t begin{line.find(name)};
+    if (begin == std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::size_t value_begin{begin + name.size()};
+    const std::size_t end{line.find_first_of(",\n", value_begin)};
+    const std::string_view value{line.substr(
+        value_begin,
+        end == std::string_view::npos ? line.size() - value_begin
+                                      : end - value_begin)};
+    std::int64_t parsed{};
+    const auto result{std::from_chars(
+        value.data(), value.data() + value.size(), parsed)};
+    if (value.empty() || result.ec != std::errc{}
+        || result.ptr != value.data() + value.size()) {
+        return std::nullopt;
+    }
+    return parsed;
+}
+
+[[nodiscard]] std::string_view shaping_sample_line(
+    const std::string& output,
+    const std::string_view token,
+    const std::size_t after = 0)
+{
+    const std::string marker{
+        std::string{shaping_sample_prefix} + std::string{token} + ':'};
+    const std::size_t begin{output.find(marker, after)};
+    if (begin == std::string::npos) {
+        return {};
+    }
+    const std::size_t end{output.find('\n', begin)};
+    return end == std::string::npos
+        ? std::string_view{}
+        : std::string_view{output}.substr(begin, end - begin);
+}
+
+[[nodiscard]] bool request_shaping_sample(
+    ChildProcess& session,
+    UdpPeer& peer,
+    const std::string_view token,
+    const std::size_t packet_count,
+    std::string& output,
+    std::string& error,
+    std::string_view& sample_line)
+{
+    const std::size_t previous_size{output.size()};
+    peer.reset_shaping_packets_received();
+    const std::string command{"sample " + std::to_string(packet_count) + '\n'};
+    if (!session.write_input(command)
+        || !session.wait_for_output(
+            std::string{shaping_sample_prefix} + std::string{token} + ':',
+            output, error, 10000ms, previous_size)) {
+        return false;
+    }
+    sample_line = shaping_sample_line(output, token, previous_size);
+    return !sample_line.empty();
+}
+
 TEST(SessionNetworkQualification, NaturalExitPreservesContextUdpAndCleanup)
 {
     if (!has_authorization()) {
@@ -1290,6 +1747,7 @@ TEST(SessionNetworkQualification, NaturalExitPreservesContextUdpAndCleanup)
     std::string output;
     std::string error;
     std::uint64_t session_inode{};
+    ActiveSessionCleanup cleanup{session, scenario, session_inode};
     bool host_peer_received_datagram{};
     bool udp_exchange_succeeded{};
     ASSERT_TRUE(scenario.launch_and_wait_for_probe(
@@ -1333,6 +1791,7 @@ TEST(SessionConnectivityQualification, ReportsDnsTcpAndUdpSeparately)
     std::string output;
     std::string error;
     std::uint64_t session_inode{};
+    ActiveSessionCleanup cleanup{session, scenario, session_inode};
     bool host_peer_received_datagram{};
     bool local_udp_succeeded{};
     ASSERT_TRUE(scenario.launch_and_wait_for_probe(
@@ -1365,6 +1824,272 @@ TEST(SessionConnectivityQualification, ReportsDnsTcpAndUdpSeparately)
     EXPECT_NE(results.find("udp=passed"), std::string_view::npos) << results;
 }
 
+TEST(SessionShapingQualification, MeasuresLiveDirectionalChangesAndCleanup)
+{
+    if (!has_authorization()) {
+        GTEST_SKIP() << "set NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 only for an explicitly "
+                        "authorized local networking qualification";
+    }
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "run this CTest directly as root; the qualification harness "
+                        "does not invoke sudo";
+    }
+    struct utsname host {};
+    ASSERT_EQ(uname(&host), 0) << "could not record host kernel conditions";
+    std::cout << "QUALIFICATION revision=" << NETLAGLAB_TESTED_REVISION
+              << " kernel=" << host.release << " system=" << host.sysname
+              << " machine=" << host.machine
+              << " euid=" << geteuid()
+              << " tc_path=" << NETLAGLAB_TEST_TC_PATH
+              << " tc_version=\"" << NETLAGLAB_TEST_TC_VERSION << '\"'
+              << " path=Workload 10.200.0.2 -> host peer 10.200.0.1 UDP echo\n";
+    Scenario scenario;
+    ASSERT_TRUE(scenario.valid());
+    ChildProcess session;
+    std::uint64_t session_inode{};
+    ActiveSessionCleanup cleanup{session, scenario, session_inode};
+    std::string output;
+    std::string error;
+    bool host_peer_received_datagram{};
+    bool udp_exchange_succeeded{};
+    ASSERT_TRUE(scenario.launch_shaping_session(
+        session, output, error, session_inode, host_peer_received_datagram,
+        udp_exchange_succeeded))
+        << "Workload did not establish the controlled peer baseline\n"
+        << error << output;
+    if (!udp_exchange_succeeded || !host_peer_received_datagram) {
+        GTEST_SKIP() << "unrestricted local UDP baseline unavailable; shaping "
+                        "measurements are unqualified on this host";
+    }
+    ASSERT_TRUE(scenario.start_shaping_service());
+
+    const auto controller_script = [&](const std::string_view command) {
+        std::string controller_output;
+        std::string controller_error;
+        const std::string script{std::string{command} + "\nstatus\n"};
+        const std::optional<int> status{run_controller_script(
+            scenario.work_directory(), script, controller_output,
+            controller_error)};
+        std::cout << "QUALIFICATION command=" << command << " exit="
+                  << (status.has_value() ? *status : -1) << '\n';
+        std::cout << controller_output;
+        EXPECT_EQ(status, std::optional<int>{0}) << controller_error;
+        return std::pair{std::move(controller_output),
+                         std::move(controller_error)};
+    };
+    const auto measure = [&](const std::size_t packet_count) {
+        std::string_view line;
+        scenario.reset_shaping_packets_received();
+        const bool ready{scenario.request_shaping_sample(
+            session, scenario.token(), packet_count, output, error, line)};
+        EXPECT_TRUE(ready) << error << output;
+        std::cout << "QUALIFICATION sample " << line
+                  << " peer_received=" << scenario.shaping_packets_received()
+                  << '/' << packet_count << '\n';
+        return std::pair{std::string{line}, scenario.shaping_packets_received()};
+    };
+
+    auto [baseline, baseline_peer_received]{measure(40U)};
+    const auto baseline_sent{shaping_metric(baseline, "sent=")};
+    const auto baseline_received{shaping_metric(baseline, "received=")};
+    ASSERT_TRUE(baseline_sent.has_value() && baseline_received.has_value())
+        << baseline;
+    std::cout << "QUALIFICATION baseline packets=" << baseline_peer_received
+              << '/' << *baseline_sent << " responses=" << *baseline_received
+              << '\n';
+    if (baseline_peer_received < 38U || *baseline_received < 38) {
+        GTEST_SKIP() << "controlled local UDP baseline was lossy or unavailable; "
+                        "shaping results remain unqualified";
+    }
+    const auto baseline_outbound{shaping_metric(baseline, "outbound_p50_us=")};
+    const auto baseline_inbound{shaping_metric(baseline, "inbound_p50_us=")};
+    ASSERT_TRUE(baseline_outbound.has_value() && baseline_inbound.has_value());
+    EXPECT_LT(*baseline_outbound, 100'000);
+    EXPECT_LT(*baseline_inbound, 100'000);
+
+    auto [outbound_set, outbound_error]{controller_script(
+        "set outbound delay 150ms")};
+    EXPECT_NE(outbound_set.find("Profile change applied."), std::string::npos)
+        << outbound_set << outbound_error;
+    EXPECT_NE(outbound_set.find("outbound:\n  delay: 150 ms"), std::string::npos)
+        << outbound_set;
+    EXPECT_NE(outbound_set.find("inbound:\n  delay: 0 ms"), std::string::npos)
+        << outbound_set;
+    auto [outbound_delay, outbound_peer_received]{measure(40U)};
+    const auto outbound_delay_us{shaping_metric(outbound_delay, "outbound_p50_us=")};
+    const auto outbound_return_us{shaping_metric(outbound_delay, "inbound_p50_us=")};
+    ASSERT_TRUE(outbound_delay_us.has_value() && outbound_return_us.has_value())
+        << outbound_delay;
+    EXPECT_GT(*outbound_delay_us, 100'000);
+    EXPECT_LT(*outbound_delay_us, 300'000);
+    EXPECT_LT(*outbound_return_us, 100'000);
+    EXPECT_GE(outbound_peer_received, 38U);
+
+    auto [both_set, both_error]{controller_script("set inbound delay 250ms")};
+    EXPECT_NE(both_set.find("Profile change applied."), std::string::npos)
+        << both_set << both_error;
+    EXPECT_NE(both_set.find("outbound:\n  delay: 150 ms"), std::string::npos)
+        << both_set;
+    EXPECT_NE(both_set.find("inbound:\n  delay: 250 ms"), std::string::npos)
+        << both_set;
+    auto [both_directions, both_peer_received]{measure(40U)};
+    const auto outbound_after_inbound{
+        shaping_metric(both_directions, "outbound_p50_us=")};
+    const auto inbound_delay_us{
+        shaping_metric(both_directions, "inbound_p50_us=")};
+    ASSERT_TRUE(outbound_after_inbound.has_value() && inbound_delay_us.has_value())
+        << both_directions;
+    EXPECT_GT(*outbound_after_inbound, 100'000);
+    EXPECT_GT(*inbound_delay_us, 180'000);
+    EXPECT_GE(both_peer_received, 38U);
+
+    auto [jitter_set, jitter_error]{controller_script("set outbound jitter 60ms")};
+    EXPECT_NE(jitter_set.find("Profile change applied."), std::string::npos)
+        << jitter_set << jitter_error;
+    EXPECT_NE(jitter_set.find("outbound:\n  delay: 150 ms\n  jitter: 60 ms"),
+              std::string::npos)
+        << jitter_set;
+    EXPECT_NE(jitter_set.find("inbound:\n  delay: 250 ms"), std::string::npos)
+        << jitter_set;
+    auto [with_jitter, jitter_peer_received]{measure(80U)};
+    const auto jitter_p10{shaping_metric(with_jitter, "outbound_p10_us=")};
+    const auto jitter_p90{shaping_metric(with_jitter, "outbound_p90_us=")};
+    ASSERT_TRUE(jitter_p10.has_value() && jitter_p90.has_value()) << with_jitter;
+    EXPECT_GT(*jitter_p90 - *jitter_p10, 20'000);
+    EXPECT_GE(jitter_peer_received, 70U);
+
+    auto [bandwidth_result, bandwidth_error]{controller_script(
+        "set outbound bandwidth 1000")};
+    EXPECT_NE(bandwidth_error.find("could not be applied"), std::string::npos)
+        << bandwidth_result << bandwidth_error;
+    EXPECT_NE(bandwidth_result.find("outbound:\n  delay: 150 ms\n  jitter: 60 ms"),
+              std::string::npos)
+        << bandwidth_result;
+    EXPECT_NE(bandwidth_result.find("bandwidth: unlimited"), std::string::npos)
+        << bandwidth_result;
+
+    auto [outbound_loss_set, outbound_loss_error]{controller_script(
+        "set outbound loss 35%")};
+    EXPECT_NE(outbound_loss_set.find("outbound:\n  delay: 150 ms\n  jitter: 60 ms\n"
+                                     "  packet loss: 35%"), std::string::npos)
+        << outbound_loss_set << outbound_loss_error;
+    auto [with_outbound_loss, outbound_loss_peer_received]{measure(200U)};
+    const auto outbound_loss_received{
+        shaping_metric(with_outbound_loss, "received=")};
+    ASSERT_TRUE(outbound_loss_received.has_value()) << with_outbound_loss;
+    EXPECT_GE(outbound_loss_peer_received, 100U);
+    EXPECT_LE(outbound_loss_peer_received, 165U);
+    EXPECT_GT(*outbound_loss_received, 80);
+    EXPECT_LT(*outbound_loss_received, 180);
+
+    auto [inbound_loss_set, inbound_loss_error]{controller_script(
+        "set inbound loss 35%")};
+    EXPECT_NE(inbound_loss_set.find("inbound:\n  delay: 250 ms\n  jitter: 0 ms\n"
+                                    "  packet loss: 35%"), std::string::npos)
+        << inbound_loss_set << inbound_loss_error;
+    auto [with_inbound_loss, inbound_loss_peer_received]{measure(200U)};
+    const auto inbound_loss_received{
+        shaping_metric(with_inbound_loss, "received=")};
+    ASSERT_TRUE(inbound_loss_received.has_value()) << with_inbound_loss;
+    ASSERT_GT(inbound_loss_peer_received, 0U) << with_inbound_loss;
+    EXPECT_GE(inbound_loss_peer_received, 100U);
+    EXPECT_LE(inbound_loss_peer_received, 165U);
+    EXPECT_GT(*inbound_loss_received, 45);
+    EXPECT_LT(*inbound_loss_received, 150);
+    EXPECT_GT(*inbound_loss_received * 100
+                  / static_cast<std::int64_t>(inbound_loss_peer_received),
+              40);
+    EXPECT_LT(*inbound_loss_received * 100
+                  / static_cast<std::int64_t>(inbound_loss_peer_received),
+              85);
+
+    auto [reset_outbound_loss, reset_outbound_error]{controller_script(
+        "reset outbound loss")};
+    EXPECT_NE(reset_outbound_loss.find("outbound:\n  delay: 150 ms\n  jitter: 60 ms\n"
+                                       "  packet loss: 0%"), std::string::npos)
+        << reset_outbound_loss << reset_outbound_error;
+    auto [preserved_after_outbound_reset, outbound_reset_peer_received]{measure(80U)};
+    const auto inbound_loss_after_outbound_reset{
+        shaping_metric(preserved_after_outbound_reset, "received=")};
+    ASSERT_TRUE(inbound_loss_after_outbound_reset.has_value());
+    EXPECT_GE(outbound_reset_peer_received, 75U);
+    EXPECT_LT(*inbound_loss_after_outbound_reset, 75);
+
+    auto [reset_inbound_loss, reset_inbound_error]{controller_script(
+        "reset inbound loss")};
+    EXPECT_NE(reset_inbound_loss.find("inbound:\n  delay: 250 ms\n  jitter: 0 ms\n"
+                                      "  packet loss: 0%"), std::string::npos)
+        << reset_inbound_loss << reset_inbound_error;
+    auto [preserved_after_inbound_reset, inbound_reset_peer_received]{measure(80U)};
+    const auto received_after_reset{
+        shaping_metric(preserved_after_inbound_reset, "received=")};
+    ASSERT_TRUE(received_after_reset.has_value());
+    EXPECT_GE(inbound_reset_peer_received, 75U);
+    EXPECT_GE(*received_after_reset, 75);
+
+    auto [reset_outbound_delay, reset_outbound_delay_error]{controller_script(
+        "reset outbound delay")};
+    EXPECT_NE(reset_outbound_delay.find("outbound:\n  delay: 0 ms\n  jitter: 60 ms"),
+              std::string::npos)
+        << reset_outbound_delay << reset_outbound_delay_error;
+    EXPECT_NE(reset_outbound_delay.find("inbound:\n  delay: 250 ms"), std::string::npos)
+        << reset_outbound_delay;
+    auto [jitter_without_base_delay, zero_delay_peer_received]{measure(40U)};
+    const auto zero_delay_outbound{
+        shaping_metric(jitter_without_base_delay, "outbound_p50_us=")};
+    ASSERT_TRUE(zero_delay_outbound.has_value());
+    EXPECT_LT(*zero_delay_outbound, 60'000);
+    EXPECT_GE(zero_delay_peer_received, 38U);
+
+    auto [reset_outbound_jitter, reset_outbound_jitter_error]{controller_script(
+        "reset outbound jitter")};
+    EXPECT_NE(reset_outbound_jitter.find("outbound:\n  delay: 0 ms\n  jitter: 0 ms"),
+              std::string::npos)
+        << reset_outbound_jitter << reset_outbound_jitter_error;
+    EXPECT_NE(reset_outbound_jitter.find("inbound:\n  delay: 250 ms"),
+              std::string::npos)
+        << reset_outbound_jitter;
+    auto [preserved_inbound_delay, preserved_delay_peer_received]{measure(40U)};
+    const auto outbound_after_jitter_reset{
+        shaping_metric(preserved_inbound_delay, "outbound_p50_us=")};
+    const auto inbound_after_jitter_reset{
+        shaping_metric(preserved_inbound_delay, "inbound_p50_us=")};
+    ASSERT_TRUE(outbound_after_jitter_reset.has_value()
+                && inbound_after_jitter_reset.has_value());
+    EXPECT_LT(*outbound_after_jitter_reset, 100'000);
+    EXPECT_GT(*inbound_after_jitter_reset, 180'000);
+    EXPECT_GE(preserved_delay_peer_received, 38U);
+
+    auto [reset_inbound_delay, reset_inbound_delay_error]{controller_script(
+        "reset inbound delay")};
+    EXPECT_NE(reset_inbound_delay.find("inbound:\n  delay: 0 ms"), std::string::npos)
+        << reset_inbound_delay << reset_inbound_delay_error;
+    auto [unrestricted, unrestricted_peer_received]{measure(40U)};
+    const auto unrestricted_outbound{
+        shaping_metric(unrestricted, "outbound_p50_us=")};
+    const auto unrestricted_inbound{
+        shaping_metric(unrestricted, "inbound_p50_us=")};
+    ASSERT_TRUE(unrestricted_outbound.has_value() && unrestricted_inbound.has_value());
+    EXPECT_LT(*unrestricted_outbound, 100'000);
+    EXPECT_LT(*unrestricted_inbound, 100'000);
+    EXPECT_GE(unrestricted_peer_received, 38U);
+    std::cout << "QUALIFICATION unrestricted packets=" << unrestricted_peer_received
+              << '/' << shaping_metric(unrestricted, "sent=").value_or(-1)
+              << " outbound_p50_us=" << *unrestricted_outbound
+              << " inbound_p50_us=" << *unrestricted_inbound << '\n';
+
+    const auto [shaped_at_exit, shaped_exit_error]{controller_script(
+        "set inbound loss 25%")};
+    EXPECT_NE(shaped_at_exit.find("inbound:\n  delay: 0 ms\n  jitter: 0 ms\n"
+                                  "  packet loss: 25%"), std::string::npos)
+        << shaped_at_exit << shaped_exit_error;
+    EXPECT_TRUE(session.write_input("exit\n"));
+    const std::optional<int> exit_status{session.wait_for_exit(output, error, 15000ms)};
+    ASSERT_EQ(exit_status, std::optional<int>{37}) << error << output;
+    EXPECT_TRUE(wait_for_cleanup(session_inode))
+        << "namespace/veth roots or host lock remained after shaped Workload exit";
+}
+
 TEST(SessionNetworkQualification, ControllerStopReapsWorkloadBeforeCleanup)
 {
     if (!has_authorization()) {
@@ -1381,6 +2106,7 @@ TEST(SessionNetworkQualification, ControllerStopReapsWorkloadBeforeCleanup)
     std::string session_output;
     std::string session_error;
     std::uint64_t session_inode{};
+    ActiveSessionCleanup cleanup{session, scenario, session_inode};
     bool host_peer_received_datagram{};
     bool udp_exchange_succeeded{};
     ASSERT_TRUE(scenario.launch_and_wait_for_probe(
@@ -1395,6 +2121,18 @@ TEST(SessionNetworkQualification, ControllerStopReapsWorkloadBeforeCleanup)
         << session_error << session_output;
     EXPECT_TRUE(!udp_exchange_succeeded || host_peer_received_datagram)
         << "Workload received a UDP echo that the host peer did not observe";
+
+    std::string profile_output;
+    std::string profile_error;
+    const std::optional<int> profile_status{run_controller_script(
+        scenario.work_directory(), "set outbound loss 25%\nstatus\n",
+        profile_output, profile_error)};
+    ASSERT_EQ(profile_status, std::optional<int>{0}) << profile_error;
+    ASSERT_NE(profile_output.find("Profile change applied."), std::string::npos)
+        << profile_output;
+    ASSERT_NE(profile_output.find("outbound:\n  delay: 0 ms\n  jitter: 0 ms\n"
+                                  "  packet loss: 25%"), std::string::npos)
+        << profile_output;
 
     std::string controller_output;
     std::string controller_error;
@@ -1433,6 +2171,7 @@ TEST(SessionNetworkQualification, SupervisorLossStopsWorkloadAndCleansTopology)
     std::string output;
     std::string error;
     std::uint64_t session_inode{};
+    ActiveSessionCleanup cleanup{session, scenario, session_inode};
     bool host_peer_received_datagram{};
     bool udp_exchange_succeeded{};
     ASSERT_TRUE(scenario.launch_and_wait_for_probe(
@@ -1447,6 +2186,17 @@ TEST(SessionNetworkQualification, SupervisorLossStopsWorkloadAndCleansTopology)
         << error << output;
     EXPECT_TRUE(!udp_exchange_succeeded || host_peer_received_datagram)
         << "Workload received a UDP echo that the host peer did not observe";
+
+    std::string profile_output;
+    std::string profile_error;
+    const std::optional<int> profile_status{run_controller_script(
+        scenario.work_directory(), "set inbound delay 120ms\nstatus\n",
+        profile_output, profile_error)};
+    ASSERT_EQ(profile_status, std::optional<int>{0}) << profile_error;
+    ASSERT_NE(profile_output.find("Profile change applied."), std::string::npos)
+        << profile_output;
+    ASSERT_NE(profile_output.find("inbound:\n  delay: 120 ms"), std::string::npos)
+        << profile_output;
 
     ASSERT_TRUE(session.kill_and_reap(SIGKILL));
     EXPECT_TRUE(wait_for_signal_marker(scenario.signal_marker()))
@@ -1468,11 +2218,12 @@ TEST(SessionNetworkQualification, FailedExecPreservesLookupStatusAndCleansTopolo
     Scenario scenario;
     ASSERT_TRUE(scenario.valid());
     ChildProcess session;
+    std::uint64_t session_inode{};
+    ActiveSessionCleanup cleanup{session, scenario, session_inode};
     ASSERT_TRUE(session.start(
         scenario.failed_exec_arguments(), scenario.work_directory()));
     std::string output;
     std::string error;
-    std::uint64_t session_inode{};
     const std::optional<int> status{
         session.wait_for_exit(output, error, 30000ms, &session_inode)};
     ASSERT_TRUE(status.has_value()) << "failed-exec Session did not finish\n" << error;

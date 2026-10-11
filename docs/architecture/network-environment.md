@@ -438,6 +438,31 @@ operation is not evidence that Session namespace integration passed. The test
 uses only numeric local addresses and does not configure forwarding, NAT,
 firewall policy, DNS, or shaping.
 
+The same opt-in target includes `SessionShapingQualification.*`. It first
+establishes a direct UDP echo baseline between the Workload and a controlled
+host peer over the Session veth. If that baseline is unavailable or already
+lossy, shaping measurements are skipped as unqualified. During the active
+Workload, separate `attach` connections apply live changes and read back the
+confirmed profile. Timed request and reply observations measure outbound and
+inbound one-way delay separately; repeated packets estimate jitter and loss.
+The test also checks setting composition, selective resets, zero-base-delay
+jitter, unsupported bandwidth, restoration to unrestricted transport, and
+cleanup with a shaping qdisc still active. Its output records the compiled
+revision/dirty marker, kernel, `tc` path, command sequence, and packet samples.
+It does not inject privileged runtime failures; rollback evidence remains the
+separate deterministic test result.
+This case is opt-in and has not been run as part of this change. To run only
+the shaping qualification (after authorizing its temporary namespace, veth,
+qdiscs, helper lock, and Session processes), use:
+
+```bash
+NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 GTEST_FILTER='SessionShapingQualification.*' \
+  ctest --test-dir build -R '^netlaglab_session_qualification$' --verbose \
+  --output-on-failure
+```
+
+No forwarding, NAT, DNS, firewall policy, or public Internet access is needed.
+
 ## Experimentally verified behavior
 
 The manual experiment established that:

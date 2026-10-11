@@ -23,6 +23,7 @@
 #include <sched.h>
 #include <span>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -603,12 +604,13 @@ enum ChildReadyStatus : int {
 TEST(NetworkEnvironmentPrivilegedSmokeTest, ExchangesUdpAndCleansOwnedRoots)
 {
     const char* authorization{std::getenv("NETLAGLAB_ALLOW_PRIVILEGED_TESTS")};
-    ASSERT_NE(authorization, nullptr)
-        << "set NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 for this explicit privileged run";
-    ASSERT_STREQ(authorization, "1")
-        << "set NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 for this explicit privileged run";
-    ASSERT_EQ(geteuid(), 0U)
-        << "run this privileged CTest directly as root; it does not invoke sudo";
+    if (authorization == nullptr || std::string_view{authorization} != "1") {
+        GTEST_SKIP() << "set NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 only for an explicitly "
+                        "authorized local networking qualification";
+    }
+    if (geteuid() != 0) {
+        GTEST_SKIP() << "run this CTest directly as root; it does not invoke sudo";
+    }
 
     PreparationResult result{prepare_network_environment()};
     auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};

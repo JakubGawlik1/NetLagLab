@@ -101,8 +101,10 @@ cross-platform support are not current goals.
   contracts; end-to-end DNS/TCP/UDP behavior remains unqualified.
 - Live outbound and inbound delay, jitter, and packet loss are applied with
   `tc/netem` to proven Session links. Deterministic tests cover qdisc decoding,
-  confirmation, composition, and rollback; privileged Session packet
-  qualification is still outstanding. Bandwidth is not implemented.
+  confirmation, composition, and rollback. An opt-in integrated qualification
+  measures direction, updates, resets, and cleanup against a controlled local
+  UDP peer; it has not yet run, so production packet behavior remains
+  unqualified. Bandwidth is not implemented.
 
 ## Candidate capabilities
 

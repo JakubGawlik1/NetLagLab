@@ -118,6 +118,11 @@ struct SupervisorResponseState {
         return std::nullopt;
     }
 
+    if (line == "PROFILE_CHANGED") {
+        output << "Profile change applied.\n";
+        return std::nullopt;
+    }
+
     if (line == "HELP_BEGIN") {
         response_block = ResponseBlock::help;
         return std::nullopt;

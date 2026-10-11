@@ -64,6 +64,9 @@ profile. The helper confirms and reconciles the complete qdisc state after each 
 failed change cannot be reconciled or rolled back, the Session terminates with an infrastructure
 failure.
 
+After the helper confirms a change, `attach` prints `Profile change applied.`. The following
+`status` output shows the helper-confirmed profile, including after reconnecting to the Session.
+
 Controller lines are limited to 1024 raw bytes before trimming. At most 32 parsed commands may
 wait behind the operation in flight. Ordinary syntax errors return a fixed `ERROR` response and
 do not consume queue capacity. An oversized command or queue overflow reports a fixed error and

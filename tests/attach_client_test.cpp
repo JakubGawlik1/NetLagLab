@@ -68,6 +68,20 @@ TEST(AttachClientTest, ReportsCleanExitAndSignalWithSuccessfulObservationStatus)
     EXPECT_TRUE(signaled.error.empty());
 }
 
+TEST(AttachClientTest, AcknowledgesConfirmedProfileChangeAndContinuesSession)
+{
+    const AttachRunResult result{run_controller_with_response(
+        "PROFILE_CHANGED\n"
+        "SESSION_OUTCOME_BEGIN\n"
+        "WORKLOAD EXIT 0\n"
+        "INFRASTRUCTURE OK\n"
+        "SESSION_OUTCOME_END\n")};
+    EXPECT_EQ(result.status, 0);
+    EXPECT_EQ(result.output,
+              "Profile change applied.\nSession ended; Workload exit code: 0.\n");
+    EXPECT_TRUE(result.error.empty());
+}
+
 TEST(AttachClientTest, ReportsInfrastructureFailureWithKnownOrUnknownWorkload)
 {
     const AttachRunResult known{run_controller_with_response(
