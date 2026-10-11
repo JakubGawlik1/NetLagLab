@@ -1852,9 +1852,26 @@ TEST(SessionShapingQualification, MeasuresLiveDirectionalChangesAndCleanup)
     std::string error;
     bool host_peer_received_datagram{};
     bool udp_exchange_succeeded{};
-    ASSERT_TRUE(scenario.launch_shaping_session(
+    const bool session_ready{scenario.launch_shaping_session(
         session, output, error, session_inode, host_peer_received_datagram,
-        udp_exchange_succeeded))
+        udp_exchange_succeeded)};
+    constexpr std::string_view unsupported_resolver{
+        "DNS preflight failed: resolver must list one to three reachable IPv4 "
+        "nameservers"};
+    if (!session_ready
+        && error.find(unsupported_resolver) != std::string::npos) {
+        const std::optional<int> startup_status{
+            session.wait_for_exit(output, error, 15000ms, &session_inode)};
+        ASSERT_TRUE(startup_status.has_value())
+            << "Session did not exit after rejecting the host resolver\n"
+            << error << output;
+        EXPECT_NE(*startup_status, 0)
+            << "Session unexpectedly succeeded after rejecting the host resolver";
+        GTEST_SKIP() << "host resolver configuration is unsupported by the Session "
+                        "preflight; live shaping remains unqualified on this host\n"
+                     << error;
+    }
+    ASSERT_TRUE(session_ready)
         << "Workload did not establish the controlled peer baseline\n"
         << error << output;
     if (!udp_exchange_succeeded || !host_peer_received_datagram) {
