@@ -154,7 +154,7 @@ public:
     std::vector<int> workload_exit_codes;
 };
 
-TEST(HelperSessionTest, ProfileChangeAdapterAppliesAndResetsDirectionalDelay)
+TEST(HelperSessionTest, ProfileChangeAdapterComposesAndResetsDirectionalImpairments)
 {
     const auto trace{std::make_shared<SharedTrace>()};
     auto preparation{prepare_scripted_network_environment(
@@ -163,7 +163,10 @@ TEST(HelperSessionTest, ProfileChangeAdapterAppliesAndResetsDirectionalDelay)
          {Operation::assign_host_address}, {Operation::bring_host_link_up},
          {Operation::bring_loopback_up}, {Operation::assign_namespace_address},
          {Operation::bring_namespace_link_up}, {Operation::add_default_route},
-         {Operation::set_delay}, {Operation::set_delay}, {Operation::set_delay}},
+         {Operation::set_settings}, {Operation::set_settings},
+         {Operation::set_settings}, {Operation::set_settings},
+         {Operation::set_settings}, {Operation::set_settings},
+         {Operation::set_settings}, {Operation::set_settings}},
         trace)};
     auto* environment{std::get_if<PreparedNetworkEnvironment>(&preparation)};
     ASSERT_NE(environment, nullptr);
@@ -171,11 +174,29 @@ TEST(HelperSessionTest, ProfileChangeAdapterAppliesAndResetsDirectionalDelay)
 
     EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::outbound, 100ms}),
               ProfileChangeCompletion::applied);
-    EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::inbound, 250ms}),
+    EXPECT_EQ(adapter.apply(SetJitter{TrafficDirection::outbound, 25ms}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(SetPacketLoss{TrafficDirection::outbound, 1.5}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(SetJitter{TrafficDirection::inbound, 30ms}),
               ProfileChangeCompletion::applied);
     EXPECT_EQ(adapter.apply(ResetSetting{TrafficDirection::outbound,
                                          NetworkSetting::delay}),
               ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(ResetSetting{TrafficDirection::outbound,
+                                         NetworkSetting::jitter}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(ResetSetting{TrafficDirection::outbound,
+                                         NetworkSetting::packet_loss}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(ResetSetting{TrafficDirection::inbound,
+                                         NetworkSetting::jitter}),
+              ProfileChangeCompletion::applied);
+    EXPECT_EQ(adapter.apply(SetBandwidth{TrafficDirection::outbound, 1000U}),
+              ProfileChangeCompletion::restored_after_failure);
+    EXPECT_EQ(adapter.apply(ResetSetting{TrafficDirection::outbound,
+                                         NetworkSetting::bandwidth}),
+              ProfileChangeCompletion::restored_after_failure);
     EXPECT_EQ(trace->operations,
               (std::vector<Operation>{
                   Operation::preflight, Operation::create_namespace,
@@ -183,7 +204,28 @@ TEST(HelperSessionTest, ProfileChangeAdapterAppliesAndResetsDirectionalDelay)
                   Operation::assign_host_address, Operation::bring_host_link_up,
                   Operation::bring_loopback_up, Operation::assign_namespace_address,
                   Operation::bring_namespace_link_up, Operation::add_default_route,
-                  Operation::set_delay, Operation::set_delay, Operation::set_delay}));
+                  Operation::set_settings, Operation::set_settings,
+                  Operation::set_settings, Operation::set_settings,
+                  Operation::set_settings, Operation::set_settings,
+                  Operation::set_settings, Operation::set_settings}));
+    EXPECT_EQ(trace->shaping_requests,
+        (std::vector<ShapingRequest>{
+            {ShapingDirection::outbound,
+                DirectionSettings{.delay = 100ms}},
+            {ShapingDirection::outbound,
+                DirectionSettings{.delay = 100ms, .jitter = 25ms}},
+            {ShapingDirection::outbound,
+                DirectionSettings{.delay = 100ms, .jitter = 25ms,
+                    .packet_loss_percent = 1.5}},
+            {ShapingDirection::inbound,
+                DirectionSettings{.jitter = 30ms}},
+            {ShapingDirection::outbound,
+                DirectionSettings{.jitter = 25ms, .packet_loss_percent = 1.5}},
+            {ShapingDirection::outbound,
+                DirectionSettings{.packet_loss_percent = 1.5}},
+            {ShapingDirection::outbound, DirectionSettings{}},
+            {ShapingDirection::inbound, DirectionSettings{}},
+        }));
 }
 
 TEST(HelperSessionTest, ProfileChangeAdapterPreservesConfirmedStateOnFailure)
@@ -195,25 +237,22 @@ TEST(HelperSessionTest, ProfileChangeAdapterPreservesConfirmedStateOnFailure)
          {Operation::assign_host_address}, {Operation::bring_host_link_up},
          {Operation::bring_loopback_up}, {Operation::assign_namespace_address},
          {Operation::bring_namespace_link_up}, {Operation::add_default_route},
-         {Operation::set_delay, Outcome::success},
-         {Operation::set_delay, Outcome::fail_unchanged},
-         {Operation::set_delay, Outcome::fail_new_state}},
+         {Operation::set_settings, Outcome::success},
+         {Operation::set_settings, Outcome::fail_unchanged},
+         {Operation::set_settings, Outcome::fail_new_state}},
         trace)};
     auto* environment{std::get_if<PreparedNetworkEnvironment>(&preparation)};
     ASSERT_NE(environment, nullptr);
     NetworkEnvironmentProfileChangeAdapter adapter{*environment};
 
     EXPECT_EQ(adapter.apply(SetJitter{TrafficDirection::outbound, 5ms}),
-              ProfileChangeCompletion::restored_after_failure);
-    EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::inbound, 30ms}),
               ProfileChangeCompletion::applied);
-    EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::inbound, 60ms}),
+    EXPECT_EQ(adapter.apply(SetDelay{TrafficDirection::inbound, 30ms}),
               ProfileChangeCompletion::restored_after_failure);
-    EXPECT_EQ(adapter.apply(ResetSetting{TrafficDirection::inbound,
-                                         NetworkSetting::delay}),
+    EXPECT_EQ(adapter.apply(SetPacketLoss{TrafficDirection::inbound, 2.5}),
               ProfileChangeCompletion::state_unknown);
     EXPECT_EQ(std::count(trace->operations.begin(), trace->operations.end(),
-                         Operation::set_delay), 3);
+                         Operation::set_settings), 3);
 }
 
 WorkloadContext true_context()

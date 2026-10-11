@@ -63,6 +63,16 @@ both ends. See the RTM_GETLINK ownership proof experiment in
 topology and packet smoke; this observation alone does not qualify full adapter
 behavior or Session integration.
 
+Live shaping continues to use fixed iproute2 `tc` operations behind the typed
+adapter. The adapter uses a bounded, read-only `RTM_GETQDISC` dump to verify the
+root qdisc before mutation and to reconcile the complete requested or previous
+configuration after mutation. This narrow decoder is necessary because the
+`tc qdisc show` presentation omits jitter when base delay is zero. The decoder
+is inventory only: it does not construct or mutate netlink messages. No
+libnl/libmnl dependency is introduced. Automated tests cover parsing and
+transaction outcomes, but privileged packet behavior remains separately
+unqualified.
+
 The adapter satisfies an internal port of fixed, named semantic operations
 rather than a generic command variant or configurable network builder. This
 makes the unavoidable transaction steps explicit and gives namespace creation,

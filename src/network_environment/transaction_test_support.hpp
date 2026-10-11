@@ -20,7 +20,7 @@ enum class Operation {
     bring_namespace_link_up,
     add_default_route,
     configure_connectivity,
-    set_delay,
+    set_settings,
     remove_connectivity,
     remove_veth,
     remove_namespace,
@@ -46,9 +46,17 @@ struct ScriptStep {
     std::chrono::steady_clock::duration elapsed{};
 };
 
+struct ShapingRequest {
+    ShapingDirection direction;
+    DirectionSettings settings;
+
+    bool operator==(const ShapingRequest&) const = default;
+};
+
 struct SharedTrace {
     std::vector<Operation> operations;
     std::vector<std::chrono::steady_clock::time_point> deadlines;
+    std::vector<ShapingRequest> shaping_requests;
     bool host_lock_alive{};
 };
 

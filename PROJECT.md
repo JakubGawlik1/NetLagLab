@@ -72,8 +72,9 @@ cross-platform support are not current goals.
   reply ownership, public running/stopping state, and the last helper-confirmed
   Network Profile. Its typed `set`/`reset` Profile Changes are dispatched
   through independently validating Supervisor/helper conversations. The helper
-  applies live directional delay to proven Session links with bounded rollback;
-  jitter, packet loss, and bandwidth remain unsupported. Status remains limited
+  applies live directional delay, jitter, and packet loss to proven Session
+  links with qdisc confirmation and bounded rollback; bandwidth remains
+  unsupported. Status remains limited
   to helper-confirmed state. An attached Controller
   receives the complete typed Session Outcome after Supervisor cleanup and
   reports the Workload result independently from infrastructure failures.
@@ -98,10 +99,10 @@ cross-platform support are not current goals.
   phases and is reconciled under the host lock before fixed-name preflight.
   Scripted, filesystem, helper, and Workload tests cover the unprivileged
   contracts; end-to-end DNS/TCP/UDP behavior remains unqualified.
-- Live outbound and inbound fixed delay is applied with `tc/netem` to proven
-  Session links. Deterministic tests cover confirmation and rollback; privileged
-  Session packet qualification is still outstanding. Jitter, packet loss, and
-  bandwidth are not implemented.
+- Live outbound and inbound delay, jitter, and packet loss are applied with
+  `tc/netem` to proven Session links. Deterministic tests cover qdisc decoding,
+  confirmation, composition, and rollback; privileged Session packet
+  qualification is still outstanding. Bandwidth is not implemented.
 
 ## Candidate capabilities
 

@@ -10,9 +10,11 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <fcntl.h>
 #include <linux/magic.h>
 #include <linux/netlink.h>
+#include <linux/pkt_sched.h>
 #include <linux/rtnetlink.h>
 #include <memory>
 #include <net/if.h>
@@ -187,6 +189,133 @@ private:
     return {InventoryStatus::timeout, std::nullopt};
 }
 
+[[nodiscard]] QdiscQuery query_current_namespace_qdisc(
+    const std::string_view requested_name,
+    const std::chrono::steady_clock::time_point deadline)
+{
+    if (std::chrono::steady_clock::now() >= deadline) {
+        return {InventoryStatus::timeout, std::nullopt};
+    }
+    const std::string name{requested_name};
+    errno = 0;
+    const unsigned int index{if_nametoindex(name.c_str())};
+    if (index == 0U) {
+        return {
+            errno == 0 || errno == ENODEV || errno == ENXIO
+                ? InventoryStatus::absent
+                : InventoryStatus::failure,
+            std::nullopt,
+        };
+    }
+
+    const int raw_socket{socket(
+        AF_NETLINK,
+        SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+        NETLINK_ROUTE)};
+    if (raw_socket == -1) return {InventoryStatus::failure, std::nullopt};
+    netlaglab::FileDescriptor socket_descriptor{raw_socket};
+    sockaddr_nl local{};
+    local.nl_family = AF_NETLINK;
+    if (bind(socket_descriptor.get(),
+            reinterpret_cast<const sockaddr*>(&local), sizeof(local)) == -1) {
+        return {InventoryStatus::failure, std::nullopt};
+    }
+    socklen_t local_length{sizeof(local)};
+    if (getsockname(socket_descriptor.get(),
+            reinterpret_cast<sockaddr*>(&local), &local_length) == -1
+        || local_length != sizeof(local) || local.nl_family != AF_NETLINK) {
+        return {InventoryStatus::failure, std::nullopt};
+    }
+
+    constexpr std::uint32_t sequence{1U};
+    struct Request {
+        nlmsghdr header;
+        tcmsg information;
+    } request{};
+    request.header.nlmsg_len = NLMSG_LENGTH(sizeof(tcmsg));
+    request.header.nlmsg_type = RTM_GETQDISC;
+    request.header.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+    request.header.nlmsg_seq = sequence;
+    request.header.nlmsg_pid = local.nl_pid;
+    request.information.tcm_family = AF_UNSPEC;
+    request.information.tcm_ifindex = static_cast<int>(index);
+
+    sockaddr_nl kernel{};
+    kernel.nl_family = AF_NETLINK;
+    const ssize_t sent{sendto(socket_descriptor.get(), &request,
+        request.header.nlmsg_len, 0,
+        reinterpret_cast<const sockaddr*>(&kernel), sizeof(kernel))};
+    if (sent != static_cast<ssize_t>(request.header.nlmsg_len)) {
+        return {InventoryStatus::failure, std::nullopt};
+    }
+
+    QdiscMessageDecoder decoder{sequence, local.nl_pid, index};
+    std::optional<RootQdisc> root;
+    std::array<std::byte, 65536> buffer{};
+    while (std::chrono::steady_clock::now() < deadline) {
+        pollfd descriptor{socket_descriptor.get(), POLLIN, 0};
+        int poll_result{};
+        do {
+            poll_result = poll(&descriptor, 1, poll_timeout(deadline));
+        } while (poll_result == -1 && errno == EINTR);
+        if (poll_result == 0) return {InventoryStatus::timeout, std::nullopt};
+        if (poll_result == -1
+            || (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0
+            || (descriptor.revents & POLLIN) == 0) {
+            return {InventoryStatus::failure, std::nullopt};
+        }
+
+        sockaddr_nl sender{};
+        iovec vector{buffer.data(), buffer.size()};
+        msghdr message{};
+        message.msg_name = &sender;
+        message.msg_namelen = sizeof(sender);
+        message.msg_iov = &vector;
+        message.msg_iovlen = 1U;
+        ssize_t received{};
+        do {
+            received = recvmsg(socket_descriptor.get(), &message, 0);
+        } while (received == -1 && errno == EINTR);
+        if (received == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        if (received <= 0 || (message.msg_flags & MSG_TRUNC) != 0
+            || message.msg_namelen != sizeof(sender)
+            || sender.nl_family != AF_NETLINK || sender.nl_pid != 0U) {
+            return {InventoryStatus::malformed, std::nullopt};
+        }
+
+        const std::size_t datagram_size{static_cast<std::size_t>(received)};
+        std::size_t offset{};
+        while (offset < datagram_size) {
+            nlmsghdr header{};
+            if (datagram_size - offset < sizeof(header)) {
+                return {InventoryStatus::malformed, std::nullopt};
+            }
+            std::memcpy(&header, buffer.data() + offset, sizeof(header));
+            if (header.nlmsg_len < sizeof(header)
+                || NLMSG_ALIGN(header.nlmsg_len) > datagram_size - offset) {
+                return {InventoryStatus::malformed, std::nullopt};
+            }
+            const std::size_t aligned{NLMSG_ALIGN(header.nlmsg_len)};
+            const QdiscMessage decoded{decoder.consume(
+                std::span{buffer}.subspan(offset, aligned))};
+            if (decoded.status != InventoryStatus::present) {
+                return {decoded.status, std::nullopt};
+            }
+            if (decoded.kind == QdiscMessageKind::root) {
+                if (root || !decoded.root) {
+                    return {InventoryStatus::malformed, std::nullopt};
+                }
+                root = decoded.root;
+            } else if (decoded.kind == QdiscMessageKind::dump_complete) {
+                return root ? QdiscQuery{InventoryStatus::present, root}
+                            : QdiscQuery{InventoryStatus::absent, std::nullopt};
+            }
+            offset += aligned;
+        }
+    }
+    return {InventoryStatus::timeout, std::nullopt};
+}
+
 struct LinkQueryWire {
     std::int32_t status;
     std::uint32_t index;
@@ -194,6 +323,17 @@ struct LinkQueryWire {
     std::int32_t peer_namespace_id;
     std::uint8_t has_identity;
     std::uint8_t has_peer_namespace_id;
+};
+
+struct QdiscQueryWire {
+    std::int32_t status;
+    std::int32_t kind;
+    std::uint32_t handle;
+    std::uint64_t delay_nanoseconds;
+    std::uint64_t jitter_nanoseconds;
+    std::uint32_t loss_probability;
+    std::uint8_t has_root;
+    std::uint8_t has_unsupported_options;
 };
 
 [[nodiscard]] bool write_complete(
@@ -270,6 +410,34 @@ struct LinkQueryWire {
                 : std::nullopt,
         },
     };
+}
+
+[[nodiscard]] QdiscQuery decode_qdisc_wire(const QdiscQueryWire& wire)
+{
+    if (wire.status < static_cast<std::int32_t>(InventoryStatus::absent)
+        || wire.status > static_cast<std::int32_t>(InventoryStatus::malformed)
+        || wire.has_root > 1U || wire.has_unsupported_options > 1U) {
+        return {InventoryStatus::malformed, std::nullopt};
+    }
+    const auto status{static_cast<InventoryStatus>(wire.status)};
+    if (wire.has_root == 0U) {
+        return status == InventoryStatus::present
+            ? QdiscQuery{InventoryStatus::malformed, std::nullopt}
+            : QdiscQuery{status, std::nullopt};
+    }
+    if (status != InventoryStatus::present
+        || wire.kind < static_cast<std::int32_t>(RootQdiscKind::noqueue)
+        || wire.kind > static_cast<std::int32_t>(RootQdiscKind::other)) {
+        return {InventoryStatus::malformed, std::nullopt};
+    }
+    return {status, RootQdisc{
+        wire.handle,
+        static_cast<RootQdiscKind>(wire.kind),
+        wire.delay_nanoseconds,
+        wire.jitter_nanoseconds,
+        wire.loss_probability,
+        wire.has_unsupported_options != 0U,
+    }};
 }
 
 class LinuxProductionPlatform final : public ProductionPlatform {
@@ -535,6 +703,82 @@ public:
             return {InventoryStatus::failure, std::nullopt};
         }
         return decode_wire(wire);
+    }
+
+    [[nodiscard]] QdiscQuery query_host_qdisc(
+        const std::string_view name,
+        const std::chrono::steady_clock::time_point deadline) override
+    {
+        return query_current_namespace_qdisc(name, deadline);
+    }
+
+    [[nodiscard]] QdiscQuery query_namespace_qdisc(
+        const NamespaceHandle& namespace_handle,
+        const std::string_view name,
+        const std::chrono::steady_clock::time_point deadline) override
+    {
+        const LinuxNamespaceHandle* handle{linux_handle(namespace_handle)};
+        if (handle == nullptr
+            || std::chrono::steady_clock::now() >= deadline) {
+            return {
+                handle == nullptr ? InventoryStatus::failure
+                                  : InventoryStatus::timeout,
+                std::nullopt,
+            };
+        }
+        int pipe_descriptors[2]{};
+        if (pipe2(pipe_descriptors, O_CLOEXEC) == -1) {
+            return {InventoryStatus::failure, std::nullopt};
+        }
+        netlaglab::FileDescriptor reader{pipe_descriptors[0]};
+        netlaglab::FileDescriptor writer{pipe_descriptors[1]};
+        const pid_t child{fork()};
+        if (child == -1) return {InventoryStatus::failure, std::nullopt};
+        if (child == 0) {
+            reader.reset();
+            if (setns(handle->descriptor(), CLONE_NEWNET) == -1) _exit(125);
+            const QdiscQuery query{query_current_namespace_qdisc(name, deadline)};
+            QdiscQueryWire wire{
+                static_cast<std::int32_t>(query.status),
+                static_cast<std::int32_t>(query.root
+                        ? query.root->kind
+                        : RootQdiscKind::other),
+                query.root ? query.root->handle : 0U,
+                query.root ? query.root->delay_nanoseconds : 0U,
+                query.root ? query.root->jitter_nanoseconds : 0U,
+                query.root ? query.root->loss_probability : 0U,
+                static_cast<std::uint8_t>(query.root.has_value()),
+                static_cast<std::uint8_t>(query.root
+                        && query.root->has_unsupported_options),
+            };
+            const bool written{write_complete(writer.get(), &wire, sizeof(wire))};
+            _exit(written ? 0 : 125);
+        }
+
+        writer.reset();
+        pollfd descriptor{reader.get(), POLLIN, 0};
+        int poll_result{};
+        do {
+            poll_result = poll(&descriptor, 1, poll_timeout(deadline));
+        } while (poll_result == -1 && errno == EINTR);
+        if (poll_result <= 0 || (descriptor.revents & POLLIN) == 0) {
+            (void)kill(child, SIGKILL);
+            int status{};
+            (void)reap(child, status);
+            return {
+                poll_result == 0 ? InventoryStatus::timeout
+                                 : InventoryStatus::failure,
+                std::nullopt,
+            };
+        }
+        QdiscQueryWire wire{};
+        const bool read{read_complete(reader.get(), &wire, sizeof(wire))};
+        int status{};
+        if (!reap(child, status) || !read || !WIFEXITED(status)
+            || WEXITSTATUS(status) != 0) {
+            return {InventoryStatus::failure, std::nullopt};
+        }
+        return decode_qdisc_wire(wire);
     }
 };
 

@@ -3,6 +3,7 @@
 #include "command_runner.hpp"
 #include "link_inventory.hpp"
 #include "network_environment.hpp"
+#include "qdisc_inventory.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -71,6 +72,13 @@ public:
         std::string_view name,
         std::chrono::steady_clock::time_point deadline) = 0;
     [[nodiscard]] virtual LinkQuery query_namespace_link(
+        const NamespaceHandle& handle,
+        std::string_view name,
+        std::chrono::steady_clock::time_point deadline) = 0;
+    [[nodiscard]] virtual QdiscQuery query_host_qdisc(
+        std::string_view name,
+        std::chrono::steady_clock::time_point deadline) = 0;
+    [[nodiscard]] virtual QdiscQuery query_namespace_qdisc(
         const NamespaceHandle& handle,
         std::string_view name,
         std::chrono::steady_clock::time_point deadline) = 0;

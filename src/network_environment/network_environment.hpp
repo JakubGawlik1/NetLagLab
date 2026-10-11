@@ -1,5 +1,7 @@
 #pragma once
 
+#include <netlaglab/network_profile.hpp>
+
 #include <memory>
 #include <cstdint>
 #include <optional>
@@ -49,7 +51,7 @@ class NamespaceHandle;
 class CleanupResult;
 
 enum class ShapingDirection { outbound, inbound };
-enum class DelayChangeResult { applied, restored_after_failure, state_unknown };
+enum class ShapingChangeResult { applied, restored_after_failure, state_unknown };
 
 class WorkloadNamespaceEntry {
 public:
@@ -93,9 +95,9 @@ public:
     ~PreparedNetworkEnvironment() noexcept;
 
     [[nodiscard]] WorkloadNamespaceEntry workload_namespace() const noexcept;
-    [[nodiscard]] DelayChangeResult set_delay(
+    [[nodiscard]] ShapingChangeResult set_direction_settings(
         ShapingDirection direction,
-        std::optional<std::uint64_t> delay_milliseconds);
+        const DirectionSettings& settings);
     [[nodiscard]] CleanupResult cleanup() &&;
 
 private:

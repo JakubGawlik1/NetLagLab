@@ -115,10 +115,16 @@ struct RecordedLinkQuery {
     const NamespaceHandle* namespace_handle;
 };
 
+struct RecordedQdiscQuery {
+    std::string name;
+    const NamespaceHandle* namespace_handle;
+};
+
 struct FakeProductionTrace {
     std::vector<RecordedCommand> recorded_commands;
     std::vector<RecordedCommand> recorded_tools;
     std::vector<RecordedLinkQuery> recorded_link_queries;
+    std::vector<RecordedQdiscQuery> recorded_qdisc_queries;
     std::vector<std::string> consent_requests;
     std::shared_ptr<std::vector<std::string>> events{
         std::make_shared<std::vector<std::string>>()};
@@ -179,6 +185,7 @@ public:
     std::deque<NamespaceQuery> namespaces;
     std::deque<LinkQuery> host_links;
     std::deque<LinkQuery> namespace_links;
+    std::deque<detail::QdiscQuery> qdiscs;
     std::shared_ptr<FakeProductionTrace> trace{
         std::make_shared<FakeProductionTrace>()};
 
@@ -440,6 +447,29 @@ public:
         return result;
     }
 
+    [[nodiscard]] detail::QdiscQuery query_host_qdisc(
+        const std::string_view name,
+        std::chrono::steady_clock::time_point) override
+    {
+        trace->recorded_qdisc_queries.push_back({std::string{name}, nullptr});
+        if (qdiscs.empty()) return {InventoryStatus::failure, std::nullopt};
+        detail::QdiscQuery result{std::move(qdiscs.front())};
+        qdiscs.pop_front();
+        return result;
+    }
+
+    [[nodiscard]] detail::QdiscQuery query_namespace_qdisc(
+        const NamespaceHandle& handle,
+        const std::string_view name,
+        std::chrono::steady_clock::time_point) override
+    {
+        trace->recorded_qdisc_queries.push_back({std::string{name}, &handle});
+        if (qdiscs.empty()) return {InventoryStatus::failure, std::nullopt};
+        detail::QdiscQuery result{std::move(qdiscs.front())};
+        qdiscs.pop_front();
+        return result;
+    }
+
 private:
     std::string recovery_directory_path_;
     int recovery_directory_descriptor_{-1};
@@ -459,6 +489,28 @@ LinkQuery present_link(
 LinkQuery absent_link()
 {
     return {InventoryStatus::absent, std::nullopt};
+}
+
+detail::QdiscQuery noqueue_qdisc()
+{
+    return {InventoryStatus::present,
+        detail::RootQdisc{0U, detail::RootQdiscKind::noqueue}};
+}
+
+detail::QdiscQuery netem_qdisc(
+    const std::uint64_t delay_nanoseconds,
+    const std::uint64_t jitter_nanoseconds,
+    const std::uint32_t loss_probability)
+{
+    return {InventoryStatus::present,
+        detail::RootQdisc{
+            0x4e4c0000U,
+            detail::RootQdiscKind::netem,
+            delay_nanoseconds,
+            jitter_nanoseconds,
+            loss_probability,
+            false,
+        }};
 }
 
 void queue_namespace_creation(FakeProductionPlatform& platform)
@@ -575,14 +627,14 @@ TEST(NetworkProductionAdapterTest, AppliesOutboundDelayThroughTheOwnedNamespace)
     for (int index{}; index < 11; ++index) {
         production->commands.push_back({CommandResultKind::success, 0, {}});
     }
-    const std::string noqueue{"qdisc noqueue 0: root refcnt 2\n"};
-    production->tc_commands = {
-        {CommandResultKind::success, 0, {}, noqueue},
-        {CommandResultKind::success, 0, {}},
-    };
+    production->tc_commands = {{CommandResultKind::success, 0, {}}};
+    production->qdiscs = {
+        noqueue_qdisc(), netem_qdisc(100'000'000U, 0U, 0U)};
     queue_namespace_creation(*production);
     queue_namespace_cleanup(*production);
     queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
     queue_placed_pair(*production);
     queue_placed_pair(*production);
     queue_absent_placed_pair(*production);
@@ -593,8 +645,9 @@ TEST(NetworkProductionAdapterTest, AppliesOutboundDelayThroughTheOwnedNamespace)
     auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
     ASSERT_NE(environment, nullptr);
 
-    EXPECT_EQ(environment->set_delay(ShapingDirection::outbound, 100U),
-              DelayChangeResult::applied);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{.delay = std::chrono::milliseconds{100}}),
+        ShapingChangeResult::applied);
     const auto shaping_command{std::find_if(
         observed->recorded_commands.begin(), observed->recorded_commands.end(),
         [](const RecordedCommand& command) {
@@ -609,18 +662,16 @@ TEST(NetworkProductionAdapterTest, AppliesOutboundDelayThroughTheOwnedNamespace)
                   "root", "handle", "4e4c:", "netem", "delay", "100ms"}));
 }
 
-TEST(NetworkProductionAdapterTest, AppliesInboundDelayThroughHostTc)
+TEST(NetworkProductionAdapterTest, AppliesZeroDelayJitterAndPacketLossTogether)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
     const auto observed{production->trace};
     for (int index{}; index < 11; ++index) {
         production->commands.push_back({CommandResultKind::success, 0, {}});
     }
-    const std::string noqueue{"qdisc noqueue 0: root refcnt 2\n"};
-    production->tc_commands = {
-        {CommandResultKind::success, 0, {}, noqueue},
-        {CommandResultKind::success, 0, {}},
-    };
+    production->tc_commands = {{CommandResultKind::success, 0, {}}};
+    production->qdiscs.push_back(noqueue_qdisc());
+    production->qdiscs.push_back(netem_qdisc(0U, 10'000'000U, 64'424'509U));
     queue_namespace_creation(*production);
     queue_namespace_cleanup(*production);
     queue_host_pair(*production);
@@ -633,8 +684,249 @@ TEST(NetworkProductionAdapterTest, AppliesInboundDelayThroughHostTc)
         std::make_unique<PassingPreflight>(), std::move(production))};
     auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
     ASSERT_NE(environment, nullptr);
-    EXPECT_EQ(environment->set_delay(ShapingDirection::inbound, 50U),
-              DelayChangeResult::applied);
+
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{
+                      .delay = std::chrono::milliseconds{0},
+                      .jitter = std::chrono::milliseconds{10},
+                      .packet_loss_percent = 1.5,
+                  }),
+        ShapingChangeResult::applied);
+
+    const auto shaping_command{std::find_if(
+        observed->recorded_commands.begin(), observed->recorded_commands.end(),
+        [](const RecordedCommand& command) {
+            return command.executable == "/usr/sbin/tc";
+        })};
+    ASSERT_NE(shaping_command, observed->recorded_commands.end());
+    EXPECT_EQ(shaping_command->arguments,
+        (std::vector<std::string>{"qdisc", "add", "dev", "nll-app",
+            "root", "handle", "4e4c:", "netem", "delay", "0ms",
+            "10ms", "loss", "1.5%"}));
+    ASSERT_EQ(observed->recorded_qdisc_queries.size(), 2U);
+    EXPECT_EQ(observed->recorded_qdisc_queries[0].name, "nll-app");
+    EXPECT_EQ(observed->recorded_qdisc_queries[1].name, "nll-app");
+    EXPECT_NE(observed->recorded_qdisc_queries[0].namespace_handle, nullptr);
+    EXPECT_EQ(observed->recorded_qdisc_queries[0].namespace_handle,
+        observed->recorded_qdisc_queries[1].namespace_handle);
+}
+
+TEST(NetworkProductionAdapterTest, PreservesCombinedSettingsThroughSelectiveResets)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    production->tc_commands = {
+        {CommandResultKind::success, 0, {}},
+        {CommandResultKind::success, 0, {}},
+        {CommandResultKind::success, 0, {}},
+        {CommandResultKind::success, 0, {}},
+    };
+    production->qdiscs = {
+        noqueue_qdisc(),
+        netem_qdisc(100'000'000U, 10'000'000U, 64'424'509U),
+        netem_qdisc(100'000'000U, 10'000'000U, 64'424'509U),
+        netem_qdisc(0U, 10'000'000U, 64'424'509U),
+        netem_qdisc(0U, 10'000'000U, 64'424'509U),
+        netem_qdisc(0U, 0U, 64'424'509U),
+        netem_qdisc(0U, 0U, 64'424'509U),
+        noqueue_qdisc(),
+    };
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+    queue_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{
+                      .delay = std::chrono::milliseconds{100},
+                      .jitter = std::chrono::milliseconds{10},
+                      .packet_loss_percent = 1.5,
+                  }),
+        ShapingChangeResult::applied);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{
+                      .jitter = std::chrono::milliseconds{10},
+                      .packet_loss_percent = 1.5,
+                  }),
+        ShapingChangeResult::applied);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{.packet_loss_percent = 1.5}),
+        ShapingChangeResult::applied);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{}),
+        ShapingChangeResult::applied);
+
+    std::vector<std::vector<std::string>> tc_arguments;
+    for (const RecordedCommand& command : observed->recorded_commands) {
+        if (command.executable == "/usr/sbin/tc") {
+            tc_arguments.push_back(command.arguments);
+        }
+    }
+    EXPECT_EQ(tc_arguments,
+        (std::vector<std::vector<std::string>>{
+            {"qdisc", "add", "dev", "nll-app", "root", "handle", "4e4c:",
+                "netem", "delay", "100ms", "10ms", "loss", "1.5%"},
+            {"qdisc", "change", "dev", "nll-app", "root", "handle", "4e4c:",
+                "netem", "delay", "0ms", "10ms", "loss", "1.5%"},
+            {"qdisc", "change", "dev", "nll-app", "root", "handle", "4e4c:",
+                "netem", "loss", "1.5%"},
+            {"qdisc", "del", "dev", "nll-app", "root", "handle", "4e4c:"},
+        }));
+}
+
+TEST(NetworkProductionAdapterTest, RestoresTheWholePreviousCombinedConfiguration)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    production->tc_commands = {
+        {CommandResultKind::success, 0, {}},
+        {CommandResultKind::nonzero_exit, 1, {}},
+        {CommandResultKind::success, 0, {}},
+    };
+    production->qdiscs = {
+        noqueue_qdisc(),
+        netem_qdisc(100'000'000U, 10'000'000U, 64'424'509U),
+        netem_qdisc(100'000'000U, 10'000'000U, 64'424'509U),
+        netem_qdisc(100'000'000U, 10'000'000U, 107'374'182U),
+        netem_qdisc(100'000'000U, 10'000'000U, 64'424'509U),
+    };
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+    queue_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{
+                      .delay = std::chrono::milliseconds{100},
+                      .jitter = std::chrono::milliseconds{10},
+                      .packet_loss_percent = 1.5,
+                  }),
+        ShapingChangeResult::applied);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{
+                      .delay = std::chrono::milliseconds{100},
+                      .jitter = std::chrono::milliseconds{10},
+                      .packet_loss_percent = 2.0,
+                  }),
+        ShapingChangeResult::restored_after_failure);
+
+    std::vector<std::vector<std::string>> tc_arguments;
+    for (const RecordedCommand& command : observed->recorded_commands) {
+        if (command.executable == "/usr/sbin/tc") {
+            tc_arguments.push_back(command.arguments);
+        }
+    }
+    ASSERT_EQ(tc_arguments.size(), 3U);
+    EXPECT_EQ(tc_arguments[0],
+        (std::vector<std::string>{"qdisc", "add", "dev", "nll-app",
+            "root", "handle", "4e4c:", "netem", "delay", "100ms",
+            "10ms", "loss", "1.5%"}));
+    EXPECT_EQ(tc_arguments[1],
+        (std::vector<std::string>{"qdisc", "change", "dev", "nll-app",
+            "root", "handle", "4e4c:", "netem", "delay", "100ms",
+            "10ms", "loss", "2%"}));
+    EXPECT_EQ(tc_arguments[2],
+        (std::vector<std::string>{"qdisc", "change", "dev", "nll-app",
+            "root", "handle", "4e4c:", "netem", "delay", "100ms",
+            "10ms", "loss", "1.5%"}));
+}
+
+TEST(NetworkProductionAdapterTest, RejectsPositiveLossBelowKernelResolution)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    production->tc_commands = {{CommandResultKind::success, 0, {}}};
+    production->qdiscs = {
+        noqueue_qdisc(),
+        netem_qdisc(100'000'000U, 0U, 0U),
+    };
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+    queue_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{.delay = std::chrono::milliseconds{100}}),
+        ShapingChangeResult::applied);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{
+                      .delay = std::chrono::milliseconds{100},
+                      .packet_loss_percent = 1.0e-20,
+                  }),
+        ShapingChangeResult::restored_after_failure);
+
+    ASSERT_EQ(observed->recorded_qdisc_queries.size(), 2U);
+    EXPECT_EQ(std::count_if(observed->recorded_commands.begin(),
+                  observed->recorded_commands.end(), [](const RecordedCommand& command) {
+                      return command.executable == "/usr/sbin/tc";
+                  }),
+        1);
+}
+
+TEST(NetworkProductionAdapterTest, AppliesInboundDelayThroughHostTc)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    production->tc_commands = {{CommandResultKind::success, 0, {}}};
+    production->qdiscs = {
+        noqueue_qdisc(), netem_qdisc(50'000'000U, 0U, 0U)};
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+    queue_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::inbound,
+                  DirectionSettings{.delay = std::chrono::milliseconds{50}}),
+        ShapingChangeResult::applied);
 
     const auto inbound_command{std::find_if(
         observed->recorded_tools.begin(), observed->recorded_tools.end(),
@@ -648,42 +940,36 @@ TEST(NetworkProductionAdapterTest, AppliesInboundDelayThroughHostTc)
     EXPECT_EQ(inbound_command->arguments.back(), "50ms");
 }
 
-TEST(NetworkProductionAdapterTest, DoesNotMatchDelayFromAnotherQdiscLine)
+TEST(NetworkProductionAdapterTest, DoesNotMutateAnUnconfirmedRootQdisc)
 {
-    const std::string noqueue{"qdisc noqueue 0: root refcnt 2\n"};
-    const std::array<std::string, 2> unsupported_states{
-        "qdisc netem 4e4c: root refcnt 2 limit 1000 delay 110.0ms\n"
-            "qdisc netem 1: parent 4e4c:1 limit 1000 delay 10.0ms\n",
-        "qdisc netem 4e4c: root refcnt 2 limit 1000 delay 10.0ms 2.0ms loss 1%\n",
-    };
-    for (const std::string& unsupported_state : unsupported_states) {
-        auto production{std::make_unique<FakeProductionPlatform>()};
-        for (int index{}; index < 11; ++index) {
-            production->commands.push_back({CommandResultKind::success, 0, {}});
-        }
-        production->tc_commands = {
-            {CommandResultKind::success, 0, {}, noqueue},
-            {CommandResultKind::nonzero_exit, 1, {}},
-            {CommandResultKind::success, 0, {}, unsupported_state},
-            {CommandResultKind::success, 0, {}},
-            {CommandResultKind::success, 0, {}, noqueue},
-        };
-        queue_namespace_creation(*production);
-        queue_namespace_cleanup(*production);
-        queue_host_pair(*production);
-        queue_placed_pair(*production);
-        queue_placed_pair(*production);
-        queue_absent_placed_pair(*production);
-        queue_placed_pair(*production);
-
-        PreparationResult result{testing::prepare_with_production_platform(
-            std::make_unique<PassingPreflight>(), std::move(production))};
-        auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
-        ASSERT_NE(environment, nullptr);
-
-        EXPECT_EQ(environment->set_delay(ShapingDirection::outbound, 10U),
-                  DelayChangeResult::restored_after_failure);
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
     }
+    production->qdiscs.push_back({InventoryStatus::present,
+        detail::RootQdisc{
+            0x4e4c0000U,
+            detail::RootQdiscKind::netem,
+            110'000'000U,
+            0U,
+            0U,
+            true,
+        }});
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+    queue_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+    auto* environment{std::get_if<PreparedNetworkEnvironment>(&result)};
+    ASSERT_NE(environment, nullptr);
+    EXPECT_EQ(environment->set_direction_settings(ShapingDirection::outbound,
+                  DirectionSettings{.delay = std::chrono::milliseconds{10}}),
+        ShapingChangeResult::state_unknown);
 }
 
 TEST(NetworkProductionAdapterTest, RefusesCustomIpv4PolicyRouting)

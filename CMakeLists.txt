@@ -21,10 +21,11 @@ add_library(
         src/network_environment/link_inventory.cpp
         src/network_environment/network_environment.cpp
         src/network_environment/preflight.cpp
+        src/network_environment/qdisc_inventory.cpp
         src/network_environment/recovery_journal.cpp
 )
 
-target_include_directories(netlaglab_network_environment PRIVATE src)
+target_include_directories(netlaglab_network_environment PUBLIC include PRIVATE src)
 target_compile_features(netlaglab_network_environment PUBLIC cxx_std_20)
 set_target_properties(
     netlaglab_network_environment
@@ -162,13 +163,14 @@ if(BUILD_TESTING)
         tests/network_command_runner_test.cpp
         tests/network_environment_transaction_test.cpp
         tests/network_link_inventory_test.cpp
+        tests/network_qdisc_inventory_test.cpp
         tests/network_preflight_test.cpp
         tests/recovery_journal_test.cpp
         tests/network_production_adapter_test.cpp
     )
     target_include_directories(
         netlaglab_network_environment_tests
-        PRIVATE src
+        PRIVATE src include
     )
     target_link_libraries(
         netlaglab_network_environment_tests

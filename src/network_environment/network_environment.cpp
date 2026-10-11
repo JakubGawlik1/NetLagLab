@@ -9,10 +9,14 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cerrno>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,6 +36,79 @@ using testing::ScriptStep;
 
 constexpr auto transaction_limit{std::chrono::seconds{30}};
 constexpr auto operation_limit{std::chrono::seconds{5}};
+constexpr std::uint32_t owned_netem_handle{0x4e4c0000U};
+constexpr std::uint64_t nanoseconds_per_millisecond{1'000'000U};
+
+[[nodiscard]] bool unrestricted(const DirectionSettings& settings)
+{
+    return settings.delay == std::chrono::milliseconds{0}
+        && settings.jitter == std::chrono::milliseconds{0}
+        && settings.packet_loss_percent == 0.0
+        && !settings.bandwidth_kbps;
+}
+
+[[nodiscard]] std::optional<std::uint64_t> nanoseconds(
+    const std::chrono::milliseconds value)
+{
+    if (value.count() < 0) return std::nullopt;
+    const auto milliseconds{static_cast<std::uint64_t>(value.count())};
+    if (milliseconds
+        > std::numeric_limits<std::uint64_t>::max() / nanoseconds_per_millisecond) {
+        return std::nullopt;
+    }
+    return milliseconds * nanoseconds_per_millisecond;
+}
+
+[[nodiscard]] std::optional<std::uint32_t> loss_probability(
+    const double percentage)
+{
+    if (!std::isfinite(percentage) || percentage < 0.0 || percentage > 100.0) {
+        return std::nullopt;
+    }
+    constexpr double probability_max{
+        static_cast<double>(std::numeric_limits<std::uint32_t>::max())};
+    const double scaled{std::rint(percentage / 100.0 * probability_max)};
+    if (scaled < 0.0 || scaled > probability_max) return std::nullopt;
+    return static_cast<std::uint32_t>(scaled);
+}
+
+[[nodiscard]] bool qdisc_matches(
+    const detail::RootQdisc& qdisc,
+    const DirectionSettings& settings)
+{
+    if (unrestricted(settings)) {
+        return qdisc.kind == detail::RootQdiscKind::noqueue
+            && qdisc.handle == 0U;
+    }
+    const auto delay{nanoseconds(settings.delay)};
+    const auto jitter{nanoseconds(settings.jitter)};
+    const auto loss{loss_probability(settings.packet_loss_percent)};
+    return delay && jitter && loss && !settings.bandwidth_kbps
+        && !qdisc.has_unsupported_options
+        && qdisc.kind == detail::RootQdiscKind::netem
+        && qdisc.handle == owned_netem_handle
+        && qdisc.delay_nanoseconds == *delay
+        && qdisc.jitter_nanoseconds == *jitter
+        && qdisc.loss_probability == *loss;
+}
+
+[[nodiscard]] bool is_owned_root_qdisc(const detail::RootQdisc& qdisc)
+{
+    return (qdisc.kind == detail::RootQdiscKind::noqueue && qdisc.handle == 0U)
+        || (qdisc.kind == detail::RootQdiscKind::netem
+            && qdisc.handle == owned_netem_handle);
+}
+
+[[nodiscard]] std::optional<std::string> format_loss_percentage(
+    const double percentage)
+{
+    std::array<char, 64> buffer{};
+    const auto result{std::to_chars(buffer.data(), buffer.data() + buffer.size(),
+        percentage, std::chars_format::general,
+        std::numeric_limits<double>::max_digits10)};
+    if (result.ec != std::errc{}) return std::nullopt;
+    return std::string{buffer.data(), result.ptr};
+}
 
 struct IdentityUnconfirmed {
 };
@@ -218,12 +295,12 @@ public:
         const NamespaceProof& namespace_proof,
         const PlacedVethProof& veth_proof,
         TimePoint deadline) = 0;
-    [[nodiscard]] virtual DelayChangeResult set_delay(
+    [[nodiscard]] virtual ShapingChangeResult set_settings(
         const NamespaceProof& namespace_proof,
         const PlacedVethProof& veth_proof,
         ShapingDirection direction,
-        std::optional<std::uint64_t> current,
-        std::optional<std::uint64_t> requested,
+        const DirectionSettings& current,
+        const DirectionSettings& requested,
         TimePoint deadline) = 0;
     [[nodiscard]] virtual ConnectivityMutationResult configure_connectivity(
         TimePoint deadline) = 0;
@@ -402,21 +479,22 @@ public:
         return operation(Operation::add_default_route, deadline);
     }
 
-    [[nodiscard]] DelayChangeResult set_delay(
+    [[nodiscard]] ShapingChangeResult set_settings(
         const NamespaceProof&,
         const PlacedVethProof&,
-        ShapingDirection,
-        std::optional<std::uint64_t>,
-        std::optional<std::uint64_t>,
+        const ShapingDirection direction,
+        const DirectionSettings&,
+        const DirectionSettings& requested,
         const TimePoint deadline) override
     {
-        const ScriptStep step{next(Operation::set_delay, deadline)};
+        const ScriptStep step{next(Operation::set_settings, deadline)};
+        state_->trace->shaping_requests.push_back({direction, requested});
         if (step.outcome == Outcome::success) {
-            return DelayChangeResult::applied;
+            return ShapingChangeResult::applied;
         }
         return step.outcome == Outcome::fail_unchanged
-            ? DelayChangeResult::restored_after_failure
-            : DelayChangeResult::state_unknown;
+            ? ShapingChangeResult::restored_after_failure
+            : ShapingChangeResult::state_unknown;
     }
 
     [[nodiscard]] ConnectivityMutationResult configure_connectivity(
@@ -809,178 +887,120 @@ public:
             ip_path_, arguments, *namespace_proof.exact_handle_, deadline));
     }
 
-    [[nodiscard]] DelayChangeResult set_delay(
+    [[nodiscard]] ShapingChangeResult set_settings(
         const NamespaceProof& namespace_proof,
         const PlacedVethProof& veth_proof,
         const ShapingDirection direction,
-        const std::optional<std::uint64_t> current,
-        const std::optional<std::uint64_t> requested,
+        const DirectionSettings& current,
+        const DirectionSettings& requested,
         const TimePoint deadline) override
     {
         if (!veth_proof.identity_ || !namespace_proof.exact_handle_) {
-            return DelayChangeResult::state_unknown;
+            return ShapingChangeResult::state_unknown;
         }
         const bool outbound{direction == ShapingDirection::outbound};
         const std::string_view device{outbound ? "nll-app" : "nll-host"};
         const VethObservation observed{observe_veth(true, &namespace_proof, deadline)};
         if (!observed.complete || !observed.identity
             || *observed.identity != *veth_proof.identity_) {
-            return DelayChangeResult::state_unknown;
+            return ShapingChangeResult::state_unknown;
         }
+
+        const auto inspect = [&](const TimePoint query_deadline) {
+            return outbound
+                ? production_->query_namespace_qdisc(
+                      *namespace_proof.exact_handle_, device, query_deadline)
+                : production_->query_host_qdisc(device, query_deadline);
+        };
+        const auto matches = [&](const detail::QdiscQuery& query,
+                                 const DirectionSettings& settings) {
+            return query.status == detail::InventoryStatus::present
+                && query.root && qdisc_matches(*query.root, settings);
+        };
+        const auto requested_loss{
+            loss_probability(requested.packet_loss_percent)};
+        if (requested.bandwidth_kbps || !nanoseconds(requested.delay)
+            || !nanoseconds(requested.jitter) || !requested_loss
+            || (requested.packet_loss_percent > 0.0
+                && *requested_loss == 0U)) {
+            return ShapingChangeResult::restored_after_failure;
+        }
+        const detail::QdiscQuery before{inspect(deadline)};
+        if (!matches(before, current)) return ShapingChangeResult::state_unknown;
+        if (current == requested) return ShapingChangeResult::applied;
+
         const std::optional<std::string> tc_path{tool_path("tc")};
-        if (!tc_path) {
-            return current.has_value()
-                ? DelayChangeResult::state_unknown
-                : DelayChangeResult::restored_after_failure;
-        }
+        if (!tc_path) return ShapingChangeResult::restored_after_failure;
 
-        const auto inspect = [&]() -> std::optional<std::string> {
-            const std::vector<std::string> arguments{
-                "qdisc", "show", "dev", std::string{device}};
-            const TimePoint query_deadline{std::chrono::steady_clock::now()
-                                           + operation_limit};
-            const CommandResult result = outbound
-                ? production_->run_ip_in_namespace(
-                      *tc_path, arguments, *namespace_proof.exact_handle_, query_deadline)
-                : production_->run_tool(*tc_path, arguments, query_deadline);
-            if (result.kind != CommandResultKind::success) return std::nullopt;
-            return result.standard_output;
-        };
-        const auto sole_line = [](const std::optional<std::string>& output)
-            -> std::optional<std::string_view> {
-            if (!output) return std::nullopt;
-            std::optional<std::string_view> result;
-            std::size_t line_start{};
-            while (line_start < output->size()) {
-                const std::size_t line_end{output->find('\n', line_start)};
-                std::string_view line{output->data() + line_start,
-                    (line_end == std::string::npos ? output->size() : line_end)
-                        - line_start};
-                const std::size_t content_start{line.find_first_not_of(" \t\r")};
-                if (content_start != std::string_view::npos) {
-                    line.remove_prefix(content_start);
-                    const std::size_t content_end{line.find_last_not_of(" \t\r")};
-                    line = line.substr(0U, content_end + 1U);
-                    if (result) return std::nullopt;
-                    result = line;
+        const auto make_arguments = [&](const std::string_view operation,
+                                        const DirectionSettings& settings)
+            -> std::optional<std::vector<std::string>> {
+            if (settings.bandwidth_kbps || !nanoseconds(settings.delay)
+                || !nanoseconds(settings.jitter)
+                || !loss_probability(settings.packet_loss_percent)) {
+                return std::nullopt;
+            }
+            if (unrestricted(settings)) {
+                return std::vector<std::string>{
+                    "qdisc", "del", "dev", std::string{device}, "root",
+                    "handle", "4e4c:"};
+            }
+            std::vector<std::string> arguments{
+                "qdisc", std::string{operation}, "dev", std::string{device},
+                "root", "handle", "4e4c:", "netem"};
+            if (settings.delay.count() != 0 || settings.jitter.count() != 0) {
+                arguments.push_back("delay");
+                arguments.push_back(std::to_string(settings.delay.count()) + "ms");
+                if (settings.jitter.count() != 0) {
+                    arguments.push_back(std::to_string(settings.jitter.count()) + "ms");
                 }
-                if (line_end == std::string::npos) break;
-                line_start = line_end + 1U;
             }
-            return result;
-        };
-        const auto tokens = [](const std::string_view line) {
-            std::vector<std::string_view> result;
-            std::size_t start{};
-            while (start < line.size()) {
-                start = line.find_first_not_of(" \t\r", start);
-                if (start == std::string_view::npos) break;
-                const std::size_t end{line.find_first_of(" \t\r", start)};
-                result.push_back(line.substr(start,
-                    (end == std::string_view::npos ? line.size() : end) - start));
-                if (end == std::string_view::npos) break;
-                start = end + 1U;
-            }
-            return result;
-        };
-        const auto numeric_token = [](const std::string_view token) {
-            return !token.empty() && std::all_of(token.begin(), token.end(),
-                [](const char character) {
-                    return character >= '0' && character <= '9';
-                });
-        };
-        const auto unrestricted = [&](const std::optional<std::string>& output) {
-            const auto line{sole_line(output)};
-            if (!line) return false;
-            const auto fields{tokens(*line)};
-            return fields.size() == 6U && fields[0] == "qdisc"
-                && fields[1] == "noqueue" && fields[2] == "0:"
-                && fields[3] == "root" && fields[4] == "refcnt"
-                && numeric_token(fields[5]);
-        };
-        const auto owned_qdisc = [&](const std::optional<std::string>& output) {
-            if (!output) return false;
-            std::size_t line_start{};
-            while (line_start < output->size()) {
-                const std::size_t line_end{output->find('\n', line_start)};
-                const std::string_view line{output->data() + line_start,
-                    (line_end == std::string::npos ? output->size() : line_end)
-                        - line_start};
-                const auto fields{tokens(line)};
-                if (fields.size() >= 4U && fields[0] == "qdisc"
-                    && fields[1] == "netem" && fields[2] == "4e4c:"
-                    && fields[3] == "root") {
-                    return true;
+            if (settings.packet_loss_percent != 0.0) {
+                const auto probability{loss_probability(settings.packet_loss_percent)};
+                const auto percentage{
+                    format_loss_percentage(settings.packet_loss_percent)};
+                if (!probability || *probability == 0U || !percentage) {
+                    return std::nullopt;
                 }
-                if (line_end == std::string::npos) break;
-                line_start = line_end + 1U;
+                arguments.push_back("loss");
+                arguments.push_back(*percentage + "%");
             }
-            return false;
+            return arguments;
         };
-        const auto matches = [&](const std::optional<std::string>& output,
-                                 const std::optional<std::uint64_t> value) {
-            if (!output) return false;
-            if (!value) return unrestricted(output);
-            const auto line{sole_line(output)};
-            if (!line) return false;
-            const auto fields{tokens(*line)};
-            if (fields.size() != 10U || fields[0] != "qdisc"
-                || fields[1] != "netem" || fields[2] != "4e4c:"
-                || fields[3] != "root" || fields[4] != "refcnt"
-                || !numeric_token(fields[5]) || fields[6] != "limit"
-                || !numeric_token(fields[7]) || fields[8] != "delay") {
-                return false;
-            }
-            const std::string milliseconds{std::to_string(*value) + "ms"};
-            const std::string decimal_milliseconds{
-                std::to_string(*value) + ".0ms"};
-            return fields[9] == milliseconds || fields[9] == decimal_milliseconds;
-        };
-        if (!matches(inspect(), current)) return DelayChangeResult::state_unknown;
-
-        const auto realize = [&](const std::optional<std::uint64_t> value,
-                                 const std::string_view operation,
-                                 const TimePoint command_deadline) {
-            std::vector<std::string> arguments{"qdisc"};
-            if (value) {
-                arguments.insert(arguments.end(), {std::string{operation}, "dev",
-                    std::string{device}, "root", "handle", "4e4c:", "netem", "delay",
-                    std::to_string(*value) + "ms"});
-            } else {
-                arguments.insert(arguments.end(), {"del", "dev", std::string{device},
-                    "root", "handle", "4e4c:"});
+        const auto run = [&](const DirectionSettings& settings,
+                             const detail::RootQdisc& existing,
+                             const TimePoint command_deadline) {
+            const std::string_view operation{unrestricted(settings)
+                    ? "del"
+                    : (existing.kind == detail::RootQdiscKind::noqueue
+                              ? "add"
+                              : "change")};
+            const auto arguments{make_arguments(operation, settings)};
+            if (!arguments) {
+                return CommandResult{CommandResultKind::nonzero_exit, EINVAL, {}};
             }
             return outbound
-                ? production_->run_ip_in_namespace(
-                      *tc_path, arguments, *namespace_proof.exact_handle_, command_deadline)
-                : production_->run_tool(*tc_path, arguments, command_deadline);
+                ? production_->run_ip_in_namespace(*tc_path, *arguments,
+                      *namespace_proof.exact_handle_, command_deadline)
+                : production_->run_tool(*tc_path, *arguments, command_deadline);
         };
-        const std::string_view attempt_operation{
-            requested ? (current ? "change" : "add") : "del"};
-        const CommandResult attempt{realize(requested, attempt_operation, deadline)};
-        if (attempt.kind == CommandResultKind::success) return DelayChangeResult::applied;
-        const std::optional<std::string> after_attempt{inspect()};
-        if (matches(after_attempt, requested)) return DelayChangeResult::applied;
+
+        (void)run(requested, *before.root, deadline);
+        const detail::QdiscQuery after_attempt{inspect(deadline)};
+        if (matches(after_attempt, requested)) return ShapingChangeResult::applied;
         if (matches(after_attempt, current)) {
-            return DelayChangeResult::restored_after_failure;
+            return ShapingChangeResult::restored_after_failure;
         }
-        if (!after_attempt) return DelayChangeResult::state_unknown;
-        std::string_view rollback_operation{"del"};
-        if (current) {
-            if (owned_qdisc(after_attempt)) rollback_operation = "change";
-            else if (unrestricted(after_attempt)) rollback_operation = "add";
-            else return DelayChangeResult::state_unknown;
-        } else if (!owned_qdisc(after_attempt)) {
-            return DelayChangeResult::state_unknown;
+        if (after_attempt.status != detail::InventoryStatus::present
+            || !after_attempt.root || !is_owned_root_qdisc(*after_attempt.root)) {
+            return ShapingChangeResult::state_unknown;
         }
-        const CommandResult rollback{realize(
-            current, rollback_operation,
-            std::chrono::steady_clock::now() + operation_limit)};
-        (void)rollback;
-        if (matches(inspect(), current)) {
-            return DelayChangeResult::restored_after_failure;
-        }
-        return DelayChangeResult::state_unknown;
+
+        (void)run(current, *after_attempt.root, deadline);
+        const detail::QdiscQuery after_rollback{inspect(deadline)};
+        return matches(after_rollback, current)
+            ? ShapingChangeResult::restored_after_failure
+            : ShapingChangeResult::state_unknown;
     }
 
     [[nodiscard]] ConnectivityMutationResult configure_connectivity(
@@ -2140,6 +2160,21 @@ public:
     {
         return {detail::InventoryStatus::absent, std::nullopt};
     }
+
+    [[nodiscard]] detail::QdiscQuery query_host_qdisc(
+        std::string_view,
+        TimePoint) override
+    {
+        return {detail::InventoryStatus::failure, std::nullopt};
+    }
+
+    [[nodiscard]] detail::QdiscQuery query_namespace_qdisc(
+        const detail::NamespaceHandle&,
+        std::string_view,
+        TimePoint) override
+    {
+        return {detail::InventoryStatus::failure, std::nullopt};
+    }
 };
 
 class TrackedHostLock final : public detail::HostLock {
@@ -2204,8 +2239,8 @@ struct OwnerState {
     NamespaceState namespace_root;
     VethState veth_root;
     ConnectivityState connectivity_root;
-    std::optional<std::uint64_t> outbound_delay;
-    std::optional<std::uint64_t> inbound_delay;
+    std::optional<DirectionSettings> outbound_settings{DirectionSettings{}};
+    std::optional<DirectionSettings> inbound_settings{DirectionSettings{}};
 };
 
 struct PreparationAccess {
@@ -2427,29 +2462,30 @@ WorkloadNamespaceEntry PreparedNetworkEnvironment::workload_namespace() const no
     return WorkloadNamespaceEntry{detail::OwnerAccess::namespace_handle(*this)};
 }
 
-DelayChangeResult PreparedNetworkEnvironment::set_delay(
+ShapingChangeResult PreparedNetworkEnvironment::set_direction_settings(
     const ShapingDirection direction,
-    const std::optional<std::uint64_t> requested)
+    const DirectionSettings& requested)
 {
     if (!state_ || !is_proven(state_->namespace_root)
         || !std::holds_alternative<PlacedVethProof>(state_->veth_root)) {
-        return DelayChangeResult::state_unknown;
+        return ShapingChangeResult::state_unknown;
     }
-    std::optional<std::uint64_t>& current = direction == ShapingDirection::outbound
-        ? state_->outbound_delay : state_->inbound_delay;
-    if (current == requested) {
-        return DelayChangeResult::applied;
+    std::optional<DirectionSettings>& current = direction == ShapingDirection::outbound
+        ? state_->outbound_settings : state_->inbound_settings;
+    if (!current) return ShapingChangeResult::state_unknown;
+    if (*current == requested) {
+        return ShapingChangeResult::applied;
     }
-    const DelayChangeResult result{state_->runtime->adapter->set_delay(
+    const ShapingChangeResult result{state_->runtime->adapter->set_settings(
         std::get<NamespaceProof>(state_->namespace_root),
         std::get<PlacedVethProof>(state_->veth_root),
         direction,
-        current,
+        *current,
         requested,
         state_->runtime->clock->now() + operation_limit)};
-    if (result == DelayChangeResult::applied) {
+    if (result == ShapingChangeResult::applied) {
         current = requested;
-    } else if (result == DelayChangeResult::state_unknown) {
+    } else if (result == ShapingChangeResult::state_unknown) {
         current.reset();
     }
     return result;

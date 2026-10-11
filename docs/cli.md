@@ -56,11 +56,13 @@ Delay and jitter use milliseconds by default and accept `ms` or `s`. Bandwidth u
 by default and accepts `kbps` or `mbps`; it must be greater than zero. Loss uses percent by
 default, accepts `%`, and must be between 0 and 100 inclusive. Units may be attached or
 separated. Commands and names are lowercase; spaces and tabs may surround and separate tokens.
-The production helper applies `delay` changes with `tc/netem` on the proven Session interfaces:
-outbound uses `nll-app` egress and inbound uses `nll-host` egress. Resetting the final delay in a
-direction removes its qdisc. Jitter, loss, and bandwidth remain unsupported; requests for those
-settings are rejected without changing the confirmed profile. If a failed delay change cannot
-be reconciled or rolled back, the Session terminates with an infrastructure failure.
+The production helper applies delay, jitter, and loss changes with `tc/netem` on the proven
+Session interfaces: outbound uses `nll-app` egress and inbound uses `nll-host` egress. Changes
+compose with the other confirmed settings in that direction. Resetting the final active setting
+removes its qdisc. Bandwidth remains unsupported and is rejected without changing the confirmed
+profile. The helper confirms and reconciles the complete qdisc state after each attempt; if a
+failed change cannot be reconciled or rolled back, the Session terminates with an infrastructure
+failure.
 
 Controller lines are limited to 1024 raw bytes before trimming. At most 32 parsed commands may
 wait behind the operation in flight. Ordinary syntax errors return a fixed `ERROR` response and
@@ -68,7 +70,7 @@ do not consume queue capacity. An oversized command or queue overflow reports a 
 disconnects the Controller without cancelling an already dispatched Profile Change.
 
 Status reports the last helper-confirmed profile. It shows `shaping: applied` after a successful
-delay change, including after resetting the delay; a Session with no applied shaping remains
+shaping change, including after resetting one setting while others remain; a Session with no applied shaping remains
 `shaping: not applied`. Automated contract tests do not qualify privileged packet behavior.
 
 Only one controller can be connected at a time. After a successful `detach`, another

@@ -4,11 +4,11 @@
 
 The code contains typed outbound and inbound profile settings, validation, and
 an integrated Controller-to-helper Profile Change path. The helper applies live
-directional delay with `tc/netem` on the Session's proven veth endpoints. Status
-reflects only helper-confirmed changes. Jitter, packet loss, and bandwidth are
-not applied and cannot be acknowledged as applied. Deterministic scripted tests
-cover the operation and rollback contract; privileged Session qualification has
-not been run for this implementation.
+directional delay, jitter, and packet loss with `tc/netem` on the Session's
+proven veth endpoints. Status reflects only helper-confirmed changes. Bandwidth
+is not applied and cannot be acknowledged as applied. Deterministic tests cover
+the operation, qdisc decoding, reconciliation, and rollback contract; privileged
+Session qualification has not been run for this implementation.
 
 ## Network Profile meaning
 
@@ -29,11 +29,17 @@ routing, NAT, DNS, or firewall setup.
 The MVP has no initial-profile or configuration-file CLI. Live `set` and
 `reset` operations begin only after the Session becomes active.
 
-Each active direction uses one root `netem` qdisc with fixed delay. A reset of
-the last delay removes that qdisc and restores the interface's unrestricted
-`noqueue` state. If a command fails ambiguously, the helper inspects the qdisc
-and either confirms the requested or previous delay, attempts bounded rollback,
-or fails the Session when it cannot establish the state.
+Each shaped direction uses one root `netem` qdisc containing the complete
+confirmed delay, jitter, and loss settings. A reset of the last active setting
+removes that qdisc and restores the interface's unrestricted `noqueue` state.
+Before mutation and after every attempt, the helper reads qdisc state with a
+bounded, read-only `RTM_GETQDISC` dump. It compares netem delay and jitter
+nanoseconds and kernel loss probability, and treats additional netem options or
+an unrecognized root qdisc as unowned state. This readback is needed because
+`tc qdisc show` omits jitter when the base delay is zero even though `tc` accepts
+and installs `delay 0ms <jitter>`. If a command fails ambiguously, the helper
+either confirms the requested or previous complete configuration, attempts
+bounded rollback, or fails the Session when it cannot establish state.
 
 ## Traffic direction
 
@@ -139,12 +145,10 @@ The manual experiment showed fixed delay, variable delay with jitter, and
 packet loss on the two veth endpoints. It also demonstrated that round-trip
 ping can conceal direction. It did not prove production rollback, live profile
 updates, bandwidth limiting, Controller behavior, helper protocol behavior, or
-cleanup.
+cleanup. Automated tests do not qualify privileged packet behavior.
 
 ## Open implementation design
 
-- The exact fixed C++ operations and qdisc command/netlink realization behind
-  each typed Profile Change.
 - How bandwidth limiting composes with netem while preserving transactional
   replacement and rollback.
 - Focused privileged verification for each direction and each supported
