@@ -1855,13 +1855,15 @@ TEST(SessionShapingQualification, MeasuresLiveDirectionalChangesAndCleanup)
     const bool session_ready{scenario.launch_shaping_session(
         session, output, error, session_inode, host_peer_received_datagram,
         udp_exchange_succeeded)};
+    std::optional<int> startup_status;
+    if (!session_ready) {
+        startup_status = session.wait_for_exit(output, error, 15000ms, &session_inode);
+    }
     constexpr std::string_view unsupported_resolver{
         "DNS preflight failed: resolver must list one to three reachable IPv4 "
         "nameservers"};
     if (!session_ready
         && error.find(unsupported_resolver) != std::string::npos) {
-        const std::optional<int> startup_status{
-            session.wait_for_exit(output, error, 15000ms, &session_inode)};
         ASSERT_TRUE(startup_status.has_value())
             << "Session did not exit after rejecting the host resolver\n"
             << error << output;
