@@ -7,9 +7,10 @@ private Network Environment library. The library owns the root host lock,
 namespace and veth proofs, setup transaction, and explicit cleanup. The helper
 passes a narrow capability for entering the exact retained namespace to the
 forked Workload child; the long-lived helper remains in the host network
-namespace. The production Session path has deterministic coverage but has not
-yet passed the separate privileged qualification. DNS contents and host route
-selection remain deliberately open.
+namespace. The production Session path has deterministic coverage and passed
+the controlled privileged shaping qualification on 2026-10-11. It snapshots
+supported IPv4 resolver contents and validates host routing; Internet DNS, TCP,
+and UDP remain separately unqualified by this run.
 
 The private transaction foundation is implemented and tested without
 privilege. One preparation operation drives the complete fixed semantic setup
@@ -186,9 +187,8 @@ preflight. A private move-only runtime containing that lock, the semantic
 adapter, and the monotonic clock then moves into the prepared or residual owner
 and remains there through cleanup, retry, and any destructor safety pass. The
 module releases the lock only after the owner no longer has cleanup work. The
-current helper-side manual lock remains untouched while this standalone module
-is unintegrated; later integration must replace that acquisition with this one,
-not nest a second lock.
+Session helper uses this acquisition through the integrated preparation
+operation; it does not nest a second host lock.
 
 The public module surface consists of concrete move-only owner types with opaque
 implementations and consuming prepare, cleanup, and residual-retry operations.
@@ -415,15 +415,25 @@ UID/GID/supplementary groups, stdin/stdout/stderr, no-new-privileges policy,
 and absence of inherited namespace, host-lock, or helper-socket descriptors.
 It exchanges one bounded UDP datagram with a host-side peer at `10.200.0.1`,
 then exercises natural exit, Controller `stop`, Supervisor loss, and failed
-exec. Every case checks the owned namespace and veth roots and confirms that
+exec. A separate shaping case measures independent, timestamped UDP streams
+through the veth pair. It receives outbound packets on `nll-host` with a
+filtered packet socket after `nll-app` egress, before host INPUT filtering;
+inbound packets travel from an ordinary host UDP socket through `nll-host`
+egress to the Workload's UDP socket. This permits directional measurements
+without adding a host INPUT exception. The shaping case still requires a real
+UDP handshake, baseline traffic, asymmetric delay, jitter, loss, and reset.
+The connectivity case reports Internet DNS, TCP, and UDP separately; local
+shaping results cannot qualify those paths. Every case checks the owned
+namespace and veth roots and confirms that
 `/run/netlaglab/host.lock` is available after completion.
 
 The target is built and registered only with
 `NETLAGLAB_BUILD_PRIVILEGED_TESTS=ON`, is labelled `privileged`, runs serially,
 and is skipped unless `NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1` is set and the test
 process is root. The harness itself never invokes `sudo`; the actual
-`netlaglab run` command starts the helper through the product's normal `sudo`
-launcher. Enabling the CMake option or approving this test plan does not
+`netlaglab run` command starts the helper directly when already root, and uses
+the product's normal `sudo` launcher for an unprivileged caller. Enabling the
+CMake option or approving this test plan does not
 authorize execution. Run it only after separate explicit authorization:
 
 ```bash
@@ -433,11 +443,20 @@ NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 ctest --test-dir build \
   -R '^netlaglab_session_qualification$' --output-on-failure
 ```
 
-The qualification remains unverified until this command completes on a
-supported host. A skipped test, compile-only result, or failed/blocked host
-operation is not evidence that Session namespace integration passed. The test
-uses only numeric local addresses and does not configure forwarding, NAT,
-firewall policy, DNS, or shaping.
+Each qualification case remains unverified until it completes on a supported
+host. A skipped test, compile-only result, or failed/blocked host
+operation is not evidence that Session namespace integration passed. Production
+Session preparation requires host IPv4 forwarding to be enabled, installs its
+owned NAT and private DNS view, and may request consent for a scoped firewall
+forwarding exception. Shaping adds qdiscs only to the owned veth endpoints.
+
+On 2026-10-11, the controlled shaping case passed through the production
+Session with UFW active, a consented source-scoped forwarding exception, and a
+supported IPv4 resolver snapshot supplied in a private mount namespace. It
+verified directional delay, zero-base-delay jitter, loss, live resets, and
+cleanup. The post-run inventory contained no journal, owned UFW/NAT state,
+namespace, or veth. See `traffic-shaping.md` for the transport path and evidence
+limits; this result does not qualify Internet DNS/TCP/UDP or host UDP INPUT.
 
 ## Experimentally verified behavior
 

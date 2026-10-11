@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-10-10
+Last verified: 2026-10-11
 
 ## How to use this file
 
@@ -75,13 +75,15 @@ cross-platform support are not current goals.
   helper applies directional delay, jitter, and packet loss through bounded
   `tc/netem` operations on the proven Session links, restores the preceding
   confirmed profile after recoverable failure, and ends the Session if state
-  becomes unknown. Bandwidth remains unsupported; privileged directional
-  qualification is still pending. An attached Controller
+  becomes unknown. Bandwidth remains unsupported. Privileged directional
+  shaping and live reset were qualified on 2026-10-11. An attached Controller
   receives the complete typed Session Outcome after Supervisor cleanup and
   reports the Workload result independently from infrastructure failures.
 - Session paths and Unix sockets are validated for ownership, type, permissions,
   stale entries, peer credentials, and descriptor inheritance.
-- The Supervisor starts the helper through `sudo`, authenticates the root peer
+- The Supervisor starts the helper through `sudo` for an unprivileged caller
+  or directly when already root, preserving its controlling terminal for
+  firewall consent. It authenticates the root peer
   as part of that launcher process tree, and runs the typed lifecycle through
   activation, Workload termination, helper cleanup, and bounded launcher
   reaping. The helper owns the directly managed Workload, a root-owned
@@ -92,8 +94,11 @@ cross-platform support are not current goals.
   host's mount namespace.
 - The helper snapshots supported host IPv4 resolver settings, rejects
   unsupported resolver behavior, and creates sealed resolver/NSS files. The
-  Workload mounts them read-only in a private mount namespace before restoring
-  invoking credentials. The production Network Environment requires host IPv4
+  Workload copies their contents onto a bounded child-private tmpfs and binds
+  them read-only in a private mount namespace before restoring invoking
+  credentials. It removes the staging mount before exec, exposing the original
+  `/tmp`; namespace destruction releases the private DNS mounts and files.
+  The production Network Environment requires host IPv4
   forwarding to be already enabled, creates source-scoped NAT in a unique
   nftables table, and supports scoped UFW or firewalld policy changes after
   controlling-terminal consent. A root-owned durable journal records mutation
@@ -104,8 +109,15 @@ cross-platform support are not current goals.
   the unprivileged contracts; end-to-end DNS/TCP/UDP behavior remains
   unqualified.
 - Deterministic adapter tests cover directional delay, jitter, loss, rollback,
-  reset, and unsupported bandwidth; real privileged traffic qualification has
-  not been run for the shaping implementation.
+  reset, and unsupported bandwidth. Controlled shaping qualification measures
+  outbound packets at the host veth before INPUT filtering and inbound packets
+  at the Workload socket. The production Session qualification passed on
+  2026-10-11 with independent outbound/inbound delay, outbound jitter at zero
+  base delay, loss in both directions, live reset, and cleanup. UFW remained
+  active; a private mount namespace supplied supported IPv4 resolver settings.
+  The journal, scoped firewall/NAT state, namespace, and veth roots were removed
+  after both failed runs and the successful run. This local traffic evidence
+  does not qualify Internet DNS/TCP/UDP or the host UDP INPUT path.
 
 ## Candidate capabilities
 

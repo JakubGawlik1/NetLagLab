@@ -6,9 +6,9 @@ The code contains typed outbound and inbound profile settings, validation, and
 an integrated Controller-to-helper Profile Change path. The helper applies
 delay, jitter, and packet loss through bounded `tc/netem` operations on the
 proven Session veth pair. Status owns the last helper-confirmed profile. The
-production path has deterministic adapter coverage; real privileged
-directional qualification has not been run for this change. Bandwidth limiting
-remains unsupported.
+production path has deterministic adapter coverage and passed controlled
+privileged directional qualification on 2026-10-11. Bandwidth limiting remains
+unsupported.
 
 ## Network Profile meaning
 
@@ -138,10 +138,37 @@ ping can conceal direction. It did not prove production rollback, live profile
 updates, bandwidth limiting, Controller behavior, helper protocol behavior, or
 cleanup.
 
+## Production qualification (2026-10-11)
+
+The user ran the opt-in
+`TrafficShapingQualification.MeasuresDirectionalDelayJitterLossAndReset` case
+against the production Session, helper, and Controller. It passed in 30,558 ms
+with `qualification_exit=0`. The case required a real local UDP handshake and
+baseline, then confirmed outbound delay of 80 ms, inbound delay of 120 ms,
+outbound jitter of 30 ms with zero base delay, 40% loss independently in both
+directions, and live per-setting resets. Timing spread and loss use statistical
+bounds rather than exact sample values. Session stop, Workload reaping, and
+topology/lock cleanup passed; the subsequent inventory also showed no recovery
+journal, token-matched UFW rule, owned nftables table, namespace, or host veth.
+
+The host kept UFW active with incoming and routed traffic denied by default.
+The user approved the exact source-scoped forwarding rule, which cleanup
+removed. The diagnostic wrapper supplied a supported IPv4 resolver snapshot in
+a private mount namespace; it did not change the host resolver configuration.
+The nonprivileged CTest selection passed 262/262 tests, and the implementation
+and integration corrections received separate standards and spec reviews.
+
+- The controlled local IPv4/UDP qualification receives outbound traffic at
+  `nll-host` through a filtered packet socket after `nll-app` egress. Inbound
+  traffic is sent through an ordinary host UDP socket and measured at the
+  Workload after `nll-host` egress. Both use the host monotonic clock for
+  independent one-way measurements. Host INPUT policy cannot prevent outbound
+  observation; no additional firewall exception is added for the measurement.
+  This passing case does not qualify host UDP socket access or Internet DNS,
+  TCP, and UDP, which have separate checks.
+
 ## Remaining qualification
 
-- Run focused privileged verification for each direction and supported
-  setting, separately authorized from ordinary automated tests. Use asymmetric
-  controlled traffic so delay, jitter, and loss evidence identifies the
-  direction being exercised.
+- Other supported resolver/firewall configurations and the separate Internet
+  DNS, TCP, and UDP case remain unqualified by this run.
 - Bandwidth limiting and its composition with netem remain out of scope.

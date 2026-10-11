@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <atomic>
 #include <cerrno>
@@ -19,6 +20,8 @@
 #include <ifaddrs.h>
 #include <iostream>
 #include <net/if.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
 #include <netdb.h>
 #include <memory>
 #include <mutex>
@@ -703,6 +706,115 @@ private:
     bool valid_{};
 };
 
+class TrafficPacketReceiver {
+public:
+    struct Datagram {
+        sockaddr_in source;
+        std::string payload;
+        std::int64_t observed_at;
+    };
+
+    explicit TrafficPacketReceiver(const std::uint16_t port)
+        : descriptor_{socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)}
+        , port_{port}
+    {
+    }
+
+    ~TrafficPacketReceiver()
+    {
+        if (descriptor_ != -1) {
+            (void)close(descriptor_);
+        }
+    }
+    TrafficPacketReceiver(const TrafficPacketReceiver&) = delete;
+    TrafficPacketReceiver& operator=(const TrafficPacketReceiver&) = delete;
+
+    [[nodiscard]] bool valid() const noexcept { return descriptor_ != -1; }
+    [[nodiscard]] int descriptor() const noexcept { return descriptor_; }
+    [[nodiscard]] bool failed() const noexcept { return failed_.load(); }
+
+    [[nodiscard]] bool bind_when_present()
+    {
+        if (interface_index_ != 0) {
+            return true;
+        }
+        const unsigned int index{if_nametoindex("nll-host")};
+        if (index == 0) {
+            return true;
+        }
+        sockaddr_ll address{};
+        address.sll_family = AF_PACKET;
+        address.sll_protocol = htons(ETH_P_IP);
+        address.sll_ifindex = static_cast<int>(index);
+        if (bind(descriptor_, reinterpret_cast<const sockaddr*>(&address),
+                sizeof(address)) == -1) {
+            failed_ = true;
+            return false;
+        }
+        interface_index_ = index;
+        return true;
+    }
+
+    [[nodiscard]] std::optional<Datagram> receive()
+    {
+        std::array<unsigned char, 2048> packet{};
+        sockaddr_ll origin{};
+        socklen_t origin_size{sizeof(origin)};
+        const ssize_t size{recvfrom(
+            descriptor_, packet.data(), packet.size(), MSG_TRUNC,
+            reinterpret_cast<sockaddr*>(&origin), &origin_size)};
+        const int receive_error{size == -1 ? errno : 0};
+        const auto observed_at{std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count()};
+        if (size == -1) {
+            // Setup binds the socket before the new link is necessarily up.
+            if (receive_error != EAGAIN && receive_error != EWOULDBLOCK
+                && receive_error != EINTR && receive_error != ENETDOWN) {
+                failed_.store(true);
+            }
+            return std::nullopt;
+        }
+        if (origin_size != sizeof(origin) || origin.sll_family != AF_PACKET
+            || origin.sll_pkttype != PACKET_HOST || interface_index_ == 0
+            || origin.sll_ifindex != static_cast<int>(interface_index_)
+            || size < 28 || size > static_cast<ssize_t>(packet.size())) {
+            return std::nullopt;
+        }
+        const auto read_u16{[&packet](const std::size_t at) {
+            return static_cast<std::uint16_t>(
+                (static_cast<unsigned int>(packet[at]) << 8U) | packet[at + 1U]);
+        }};
+        const std::size_t header_size{(packet[0] & 0x0fU) * 4U};
+        const std::size_t ip_size{read_u16(2)};
+        if ((packet[0] >> 4U) != 4U || header_size < 20U
+            || ip_size < header_size + 8U || ip_size > static_cast<std::size_t>(size)
+            || packet[9] != IPPROTO_UDP || (read_u16(6) & 0x3fffU) != 0U
+            || packet[12] != 10 || packet[13] != 200 || packet[14] != 0
+            || packet[15] != 2 || packet[16] != 10 || packet[17] != 200
+            || packet[18] != 0 || packet[19] != 1
+            || read_u16(header_size + 2U) != port_
+            || read_u16(header_size + 4U) != ip_size - header_size) {
+            return std::nullopt;
+        }
+        sockaddr_in source{};
+        source.sin_family = AF_INET;
+        std::memcpy(&source.sin_addr, packet.data() + 12U, sizeof(source.sin_addr));
+        source.sin_port = htons(read_u16(header_size));
+        return Datagram{
+            source,
+            std::string{reinterpret_cast<const char*>(packet.data() + header_size + 8U),
+                        ip_size - header_size - 8U},
+            observed_at,
+        };
+    }
+
+private:
+    int descriptor_{-1};
+    std::uint16_t port_;
+    unsigned int interface_index_{};
+    std::atomic_bool failed_{};
+};
+
 class ChildProcess {
 public:
     ChildProcess() = default;
@@ -796,14 +908,20 @@ public:
         std::uint64_t& session_inode,
         bool& host_peer_received_datagram,
         bool& udp_exchange_succeeded,
-        const std::chrono::milliseconds timeout = 20000ms)
+        const std::chrono::milliseconds timeout = 20000ms,
+        TrafficPacketReceiver* const traffic_receiver = nullptr)
     {
         const auto deadline{std::chrono::steady_clock::now() + timeout};
         bool udp_seen{};
         while (std::chrono::steady_clock::now() < deadline) {
+            if (traffic_receiver != nullptr && !traffic_receiver->bind_when_present()) {
+                return false;
+            }
             pollfd descriptors[3]{{output_.get(), POLLIN, 0},
                                   {error_.get(), POLLIN, 0},
-                                  {udp_descriptor, POLLIN, 0}};
+                                  {traffic_receiver == nullptr
+                                       ? udp_descriptor : traffic_receiver->descriptor(),
+                                   POLLIN, 0}};
             const auto remaining{std::chrono::duration_cast<std::chrono::milliseconds>(
                 deadline - std::chrono::steady_clock::now())};
             int polled{};
@@ -811,9 +929,11 @@ public:
                 polled = poll(
                     descriptors,
                     3,
-                    static_cast<int>(std::max<std::int64_t>(0, remaining.count())));
+                    static_cast<int>(std::max<std::int64_t>(0,
+                        traffic_receiver == nullptr ? remaining.count()
+                                                    : std::min<std::int64_t>(20, remaining.count()))));
             } while (polled == -1 && errno == EINTR);
-            if (polled <= 0) {
+            if (polled < 0 || (polled == 0 && traffic_receiver == nullptr)) {
                 return false;
             }
             if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0
@@ -824,7 +944,25 @@ public:
                 && !read_available(error_.get(), stderr_text)) {
                 return false;
             }
-            if ((descriptors[2].revents & POLLIN) != 0) {
+            if (traffic_receiver != nullptr
+                && (descriptors[2].revents & (POLLIN | POLLERR)) != 0) {
+                const auto datagram{traffic_receiver->receive()};
+                if (traffic_receiver->failed()) {
+                    return false;
+                }
+                const std::string expected_request{
+                    std::string{request_prefix} + std::string{token}};
+                if (datagram.has_value() && datagram->payload == expected_request) {
+                    const std::string response{
+                        std::string{response_prefix} + std::string{token}};
+                    if (sendto(udp_descriptor, response.data(), response.size(), 0,
+                            reinterpret_cast<const sockaddr*>(&datagram->source),
+                            sizeof(datagram->source)) != static_cast<ssize_t>(response.size())) {
+                        return false;
+                    }
+                    host_peer_received_datagram = true;
+                }
+            } else if ((descriptors[2].revents & POLLIN) != 0) {
                 udp_seen = echo_one_datagram(udp_descriptor, token);
                 if (!udp_seen) {
                     return false;
@@ -1086,23 +1224,28 @@ private:
     bool valid_{};
 };
 
-class UdpEchoPump {
+class DirectionalTrafficPump {
 public:
     struct Sample {
         std::int64_t sent_at;
         std::int64_t observed_at;
     };
 
-    UdpEchoPump(const int descriptor, std::string token, const std::uint16_t port)
+    DirectionalTrafficPump(
+        const int descriptor,
+        std::string token,
+        const std::uint16_t port,
+        TrafficPacketReceiver& receiver)
         : descriptor_{descriptor}
         , token_{std::move(token)}
         , port_{port}
+        , receiver_{receiver}
         , worker_{[this] { run(); }}
     {
     }
 
-    UdpEchoPump(const UdpEchoPump&) = delete;
-    UdpEchoPump& operator=(const UdpEchoPump&) = delete;
+    DirectionalTrafficPump(const DirectionalTrafficPump&) = delete;
+    DirectionalTrafficPump& operator=(const DirectionalTrafficPump&) = delete;
 
     [[nodiscard]] std::vector<Sample> outbound_samples() const
     {
@@ -1116,7 +1259,7 @@ public:
         return inbound_sends_;
     }
 
-    ~UdpEchoPump()
+    ~DirectionalTrafficPump()
     {
         stopping_.store(true);
         if (worker_.joinable()) {
@@ -1131,12 +1274,10 @@ private:
             std::string{outbound_probe_prefix} + token_ + ':'};
         const std::string inbound_prefix{
             std::string{inbound_probe_prefix} + token_ + ':'};
-        in_addr expected_source{};
         sockaddr_in inbound_peer{};
         inbound_peer.sin_family = AF_INET;
         inbound_peer.sin_port = htons(port_);
-        if (inet_pton(AF_INET, "10.200.0.2", &expected_source) != 1
-            || inet_pton(AF_INET, "10.200.0.2", &inbound_peer.sin_addr) != 1) {
+        if (inet_pton(AF_INET, "10.200.0.2", &inbound_peer.sin_addr) != 1) {
             return;
         }
         auto next_inbound_send{std::chrono::steady_clock::now()};
@@ -1154,25 +1295,22 @@ private:
                 }
                 next_inbound_send = now + 20ms;
             }
-            pollfd watched{descriptor_, POLLIN, 0};
+            pollfd watched{receiver_.descriptor(), POLLIN, 0};
             int ready{};
             do {
                 ready = poll(&watched, 1, 5);
             } while (ready == -1 && errno == EINTR);
-            if (ready <= 0 || (watched.revents & POLLIN) == 0) {
+            if (ready <= 0 || (watched.revents & (POLLIN | POLLERR)) == 0) {
                 continue;
             }
-            char buffer[256]{};
-            sockaddr_in peer{};
-            socklen_t peer_size{sizeof(peer)};
-            const ssize_t size{recvfrom(
-                descriptor_, buffer, sizeof(buffer), 0,
-                reinterpret_cast<sockaddr*>(&peer), &peer_size)};
-            if (size <= 0 || peer.sin_family != AF_INET || peer_size != sizeof(peer)
-                || peer.sin_addr.s_addr != expected_source.s_addr) {
+            const auto datagram{receiver_.receive()};
+            if (receiver_.failed()) {
+                return;
+            }
+            if (!datagram.has_value() || ntohs(datagram->source.sin_port) != port_) {
                 continue;
             }
-            const std::string_view message{buffer, static_cast<std::size_t>(size)};
+            const std::string_view message{datagram->payload};
             if (!message.starts_with(outbound_prefix)) {
                 continue;
             }
@@ -1181,11 +1319,8 @@ private:
             const auto parsed{std::from_chars(
                 value.data(), value.data() + value.size(), sent_at)};
             if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size()) {
-                const auto observed_at{std::chrono::duration_cast<
-                    std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count()};
                 std::lock_guard lock{mutex_};
-                outbound_samples_.push_back({sent_at, observed_at});
+                outbound_samples_.push_back({sent_at, datagram->observed_at});
             }
         }
     }
@@ -1193,6 +1328,7 @@ private:
     int descriptor_;
     std::string token_;
     std::uint16_t port_;
+    TrafficPacketReceiver& receiver_;
     mutable std::mutex mutex_;
     std::vector<Sample> outbound_samples_;
     std::vector<std::int64_t> inbound_sends_;
@@ -1317,10 +1453,17 @@ private:
 
 class Scenario {
 public:
-    Scenario() : token_{"qualification-" + std::to_string(getpid())}
+    explicit Scenario(const bool capture_traffic = false)
+        : token_{"qualification-" + std::to_string(getpid())}
     {
         if (!directory_.valid() || !peer_.valid()) {
             return;
+        }
+        if (capture_traffic) {
+            traffic_receiver_ = std::make_unique<TrafficPacketReceiver>(peer_.port());
+            if (!traffic_receiver_->valid()) {
+                return;
+            }
         }
         const std::optional<std::uint64_t> host_inode{current_namespace_inode()};
         if (!host_inode.has_value()) {
@@ -1357,6 +1500,10 @@ public:
     }
     [[nodiscard]] std::uint16_t port() const noexcept { return peer_.port(); }
     [[nodiscard]] int udp_descriptor() const noexcept { return peer_.descriptor(); }
+    [[nodiscard]] TrafficPacketReceiver* traffic_receiver() const noexcept
+    {
+        return traffic_receiver_.get();
+    }
 
     [[nodiscard]] std::vector<std::string> run_arguments(
         const std::string_view mode) const
@@ -1401,12 +1548,14 @@ public:
             session_inode,
             host_peer_received_datagram,
             udp_exchange_succeeded,
-            timeout);
+            timeout,
+            traffic_receiver_.get());
     }
 
 private:
     SessionDirectory directory_;
     UdpPeer peer_;
+    std::unique_ptr<TrafficPacketReceiver> traffic_receiver_;
     std::string token_;
     std::filesystem::path marker_;
     std::uint64_t host_inode_{};
@@ -1697,7 +1846,7 @@ TEST(TrafficShapingQualification, MeasuresDirectionalDelayJitterLossAndReset)
         GTEST_SKIP() << "run this CTest directly as root; the qualification harness "
                         "does not invoke sudo";
     }
-    Scenario scenario;
+    Scenario scenario{true};
     ASSERT_TRUE(scenario.valid());
     ChildProcess session;
     std::string session_output;
@@ -1712,12 +1861,16 @@ TEST(TrafficShapingQualification, MeasuresDirectionalDelayJitterLossAndReset)
         session_error,
         session_inode,
         host_peer_received_datagram,
-        udp_exchange_succeeded))
+        udp_exchange_succeeded,
+        60000ms))
         << "Workload did not report readiness for controlled UDP traffic\n"
         << session_error << session_output;
     ASSERT_TRUE(udp_exchange_succeeded);
-    UdpEchoPump echo_pump{
-        scenario.udp_descriptor(), scenario.token(), scenario.port()};
+    ASSERT_TRUE(host_peer_received_datagram);
+    ASSERT_NE(scenario.traffic_receiver(), nullptr);
+    DirectionalTrafficPump echo_pump{
+        scenario.udp_descriptor(), scenario.token(), scenario.port(),
+        *scenario.traffic_receiver()};
     std::jthread output_drain_thread{[&](const std::stop_token stop) {
         while (!stop.stop_requested()) {
             session.drain_output(session_output, session_error);
@@ -1738,7 +1891,7 @@ TEST(TrafficShapingQualification, MeasuresDirectionalDelayJitterLossAndReset)
     const std::int64_t outbound_delay_confirmed{monotonic_microseconds()};
     ASSERT_TRUE(outbound_delay_status.has_value()) << controller_error;
     ASSERT_EQ(*outbound_delay_status, 0) << controller_error;
-    EXPECT_NE(controller_output.find("PROFILE_CHANGED\n"), std::string::npos)
+    EXPECT_NE(controller_output.find("Network Profile changed.\n"), std::string::npos)
         << controller_output << controller_error;
     EXPECT_NE(controller_output.find("shaping: applied\n"), std::string::npos)
         << controller_output;
@@ -1755,7 +1908,7 @@ TEST(TrafficShapingQualification, MeasuresDirectionalDelayJitterLossAndReset)
     const std::int64_t outbound_reset_confirmed{monotonic_microseconds()};
     ASSERT_TRUE(outbound_reset_status.has_value()) << controller_error;
     ASSERT_EQ(*outbound_reset_status, 0) << controller_error;
-    EXPECT_NE(controller_output.find("PROFILE_CHANGED\n"), std::string::npos)
+    EXPECT_NE(controller_output.find("Network Profile changed.\n"), std::string::npos)
         << controller_output << controller_error;
     (void)poll(nullptr, 0, 1200);
 
@@ -1801,6 +1954,7 @@ TEST(TrafficShapingQualification, MeasuresDirectionalDelayJitterLossAndReset)
     const std::int64_t jitter_reset_confirmed{monotonic_microseconds()};
     ASSERT_TRUE(jitter_reset_status.has_value()) << controller_error;
     ASSERT_EQ(*jitter_reset_status, 0) << controller_error;
+    (void)poll(nullptr, 0, 1200);
 
     const std::int64_t outbound_loss_beginning{monotonic_microseconds()};
     controller_output.clear();
@@ -1868,7 +2022,9 @@ TEST(TrafficShapingQualification, MeasuresDirectionalDelayJitterLossAndReset)
         parse_inbound_samples(session_output, scenario.token())};
     std::vector<TrafficSample> outbound_samples;
     std::vector<std::int64_t> outbound_received;
-    for (const UdpEchoPump::Sample& sample : echo_pump.outbound_samples()) {
+    ASSERT_FALSE(scenario.traffic_receiver()->failed())
+        << "packet reception failed during directional measurement";
+    for (const DirectionalTrafficPump::Sample& sample : echo_pump.outbound_samples()) {
         outbound_samples.push_back({sample.sent_at, sample.observed_at});
         outbound_received.push_back(sample.sent_at);
     }
@@ -1944,9 +2100,15 @@ TEST(TrafficShapingQualification, MeasuresDirectionalDelayJitterLossAndReset)
         << "outbound delay remained after reset";
     EXPECT_LE(reset_inbound[reset_inbound.size() / 2U], inbound_baseline_median + 40000)
         << "inbound delay remained after reset";
-    EXPECT_GT(jitter.back() - jitter.front(), 5000)
+    const auto central_spread{[](const std::vector<std::int64_t>& samples) {
+        return samples[samples.size() * 9U / 10U] - samples[samples.size() / 10U];
+    }};
+    const auto baseline_spread{central_spread(baseline_outbound)};
+    EXPECT_GT(central_spread(jitter), baseline_spread + 5000)
         << "outbound jitter did not produce a one-way delay spread";
-    EXPECT_GE(jitter_reset[jitter_reset.size() / 2U], outbound_baseline_median - 10000);
+    EXPECT_LE(central_spread(jitter_reset), baseline_spread + 5000)
+        << "outbound jitter remained after reset";
+    EXPECT_LE(jitter_reset[jitter_reset.size() / 2U], outbound_baseline_median + 40000);
     ASSERT_GE(outbound_loss_count, 20U) << "too few outbound-loss observations";
     ASSERT_GE(inbound_loss_count, 20U) << "too few inbound-loss observations";
     ASSERT_GE(outbound_loss_reset_count, 4U) << "too few outbound-loss-reset observations";
