@@ -133,5 +133,26 @@ TEST(AttachClientTest, RetainsLegacyTerminalCompatibility)
     EXPECT_EQ(failed.error, "NetLagLab: session failed\n");
 }
 
+TEST(AttachClientTest, AcceptsProfileConfirmationBeforeStatusAndDetach)
+{
+    const AttachRunResult result{run_controller_with_response(
+        "ATTACHED\n"
+        "PROFILE_CHANGED\n"
+        "STATUS_BEGIN\n"
+        "shaping: applied\n"
+        "outbound:\n"
+        "  delay: 80 ms\n"
+        "STATUS_END\n"
+        "DETACHED\n")};
+
+    EXPECT_EQ(result.status, 0);
+    EXPECT_EQ(result.output,
+              "Network Profile changed.\n"
+              "shaping: applied\n"
+              "outbound:\n"
+              "  delay: 80 ms\n");
+    EXPECT_TRUE(result.error.empty()) << result.error;
+}
+
 } // namespace
 } // namespace netlaglab

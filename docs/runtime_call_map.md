@@ -57,11 +57,12 @@ main
          -> posix_spawnp("sudo", ["sudo", "--", helper, "--runtime-dir", ...,
             "--supervisor-pid", getpid(), "--supervisor-start-time",
             /proc/self/stat.starttime])
+            (when already root, spawn helper directly with the same arguments)
       -> wait_for_helper_connection
          -> connect_to_unix_socket(helper.sock)
          -> validate helper.sock type, owner, and mode
          -> authenticate root peer with SO_PEERCRED and bind its PID to the
-            launched sudo process tree
+            launched helper process tree (including sudo when elevation is needed)
       -> remove stale control.sock; do not publish a new listener yet
       -> ProductionLifecycleAdapter
       -> run_session_lifecycle(adapter)
@@ -93,7 +94,8 @@ netlaglab-helper main
     -> read the authenticated Supervisor's supplementary groups from
        /proc/<peer-pid>/status
     -> remove helper.sock listener path
-    -> ignore helper-side SIGINT
+    -> ignore helper-side SIGPIPE from startup so diagnostic-reader loss cannot
+       interrupt privileged cleanup; ignore helper-side SIGINT after authentication
     -> send READY
     -> receive the standard-descriptor marker and optional SCM_RIGHTS payload
     -> read and validate the bounded START block (30-second deadline begins
@@ -105,7 +107,7 @@ netlaglab-helper main
        -> fork
        -> child: PR_SET_PDEATHSIG(SIGKILL)
        -> child: setns() through capability for the exact retained handle
-       -> child: restore default SIGINT
+       -> child: restore default SIGINT and SIGPIPE
        -> child: map transferred/inherited/closed stdin, stdout, and stderr
        -> child: setgroups -> setgid -> setuid
        -> child: PR_SET_NO_NEW_PRIVS

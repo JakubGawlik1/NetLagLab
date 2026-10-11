@@ -54,7 +54,8 @@ reset <outbound|inbound> <delay|jitter|loss|bandwidth>
 
 Delay, jitter, and packet loss are applied independently to outbound and inbound traffic.
 The helper confirms a change before it appears in `status`; a recoverable failure preserves
-the last confirmed profile. If it cannot establish or restore the qdisc state, the Session ends
+the last confirmed profile. A confirmed change prints `Network Profile changed.`;
+the Controller remains attached for further commands. If it cannot establish or restore the qdisc state, the Session ends
 with a profile-state infrastructure failure. Bandwidth limiting is not supported; a bandwidth
 `set` is rejected without changing the confirmed profile.
 

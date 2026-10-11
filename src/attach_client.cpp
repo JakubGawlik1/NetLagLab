@@ -137,6 +137,11 @@ struct SupervisorResponseState {
         return std::nullopt;
     }
 
+    if (line == "PROFILE_CHANGED") {
+        output << "Network Profile changed.\n";
+        return std::nullopt;
+    }
+
     if (const std::optional<int> legacy_result{
             report_legacy_attached_session_outcome(
                 line, output, error)};

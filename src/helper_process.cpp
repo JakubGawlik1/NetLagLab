@@ -130,14 +130,26 @@ std::optional<pid_t> spawn_helper(
         argument_pointers[index] = arguments[index].data();
     }
 
+    // A second sudo can replace the controlling terminal without relaying its
+    // input when stdin is a pipe. Root needs no elevation and keeps that terminal.
+    const bool already_root{geteuid() == 0};
+    const std::size_t argument_offset{already_root ? 2U : 0U};
+    // The helper authenticates the Supervisor against these IDs. An outer sudo's
+    // IDs belong to another caller; the Workload environment travels separately.
+    std::array<std::string, 2> root_environment{
+        "SUDO_UID=0",
+        "SUDO_GID=" + std::to_string(getegid()),
+    };
+    std::array<char*, 3> root_environment_pointers{
+        root_environment[0].data(), root_environment[1].data(), nullptr};
     pid_t helper_launcher_pid{};
     const int spawn_error{posix_spawnp(
         &helper_launcher_pid,
-        argument_pointers[0],
+        argument_pointers[argument_offset],
         nullptr,
         nullptr,
-        argument_pointers.data(),
-        environ)};
+        argument_pointers.data() + argument_offset,
+        already_root ? root_environment_pointers.data() : environ)};
 
     if (spawn_error != 0) {
         error << "NetLagLab: failed to launch privileged helper: "

@@ -2,6 +2,7 @@
 
 #include "file_descriptor.hpp"
 
+#include <array>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -103,15 +104,14 @@ namespace {
 }
 
 [[nodiscard]] bool mount_read_only_snapshot(
-    const int descriptor,
+    const char* const source,
     const char* const target)
 {
     struct stat status {};
     if (stat(target, &status) == -1 || !S_ISREG(status.st_mode)) {
         return false;
     }
-    const std::string source{"/proc/self/fd/" + std::to_string(descriptor)};
-    if (mount(source.c_str(), target, nullptr, MS_BIND, nullptr) == -1) {
+    if (mount(source, target, nullptr, MS_BIND, nullptr) == -1) {
         return false;
     }
     return mount(
@@ -123,16 +123,65 @@ namespace {
            == 0;
 }
 
+[[nodiscard]] bool copy_resolver_snapshot(
+    const int source,
+    const char* const target)
+{
+    FileDescriptor destination{open(
+        target, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600)};
+    if (destination.get() == -1) {
+        return false;
+    }
+    std::array<char, 4096> buffer{};
+    off_t offset{};
+    while (true) {
+        const ssize_t received{pread(source, buffer.data(), buffer.size(), offset)};
+        if (received == 0) {
+            return fchmod(destination.get(), 0444) == 0;
+        }
+        if (received == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        std::size_t written{};
+        while (written < static_cast<std::size_t>(received)) {
+            const ssize_t count{write(
+                destination.get(), buffer.data() + written,
+                static_cast<std::size_t>(received) - written)};
+            if (count > 0) {
+                written += static_cast<std::size_t>(count);
+            } else if (count == -1 && errno == EINTR) {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        offset += received;
+    }
+}
+
 [[nodiscard]] bool install_resolver_view(const WorkloadResolverView& view)
 {
     if (unshare(CLONE_NEWNS) == -1
         || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1) {
         return false;
     }
-    return mount_read_only_snapshot(
-               view.resolv_conf_descriptor(), "/etc/resolv.conf")
-           && mount_read_only_snapshot(
-               view.nsswitch_conf_descriptor(), "/etc/nsswitch.conf");
+    // memfd files have no mountable backing mount. Stage their sealed contents
+    // on a child-private tmpfs, then uncover the original /tmp before exec.
+    if (mount(
+            "netlaglab-dns", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+            "size=64k,mode=0700") == -1) {
+        return false;
+    }
+    const bool installed{
+        copy_resolver_snapshot(view.resolv_conf_descriptor(), "/tmp/resolv.conf")
+        && copy_resolver_snapshot(view.nsswitch_conf_descriptor(), "/tmp/nsswitch.conf")
+        && mount_read_only_snapshot("/tmp/resolv.conf", "/etc/resolv.conf")
+        && mount_read_only_snapshot("/tmp/nsswitch.conf", "/etc/nsswitch.conf")};
+    const bool staging_removed{umount("/tmp") == 0};
+    return installed && staging_removed;
 }
 
 } // namespace
@@ -281,7 +330,8 @@ WorkloadLaunchResult launch_workload(
         struct sigaction default_action {};
         default_action.sa_handler = SIG_DFL;
         sigemptyset(&default_action.sa_mask);
-        if (sigaction(SIGINT, &default_action, nullptr) == -1) {
+        if (sigaction(SIGINT, &default_action, nullptr) == -1
+            || sigaction(SIGPIPE, &default_action, nullptr) == -1) {
             report_child_failure_and_exit(error_writer.get(), 125);
         }
 

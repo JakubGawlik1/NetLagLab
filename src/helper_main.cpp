@@ -753,5 +753,12 @@ int run_helper(const int argc, char* argv[])
 
 int main(const int argc, char* argv[])
 {
+    // A vanished diagnostic reader must not interrupt privileged cleanup.
+    struct sigaction ignore_broken_pipe {};
+    ignore_broken_pipe.sa_handler = SIG_IGN;
+    sigemptyset(&ignore_broken_pipe.sa_mask);
+    if (sigaction(SIGPIPE, &ignore_broken_pipe, nullptr) == -1) {
+        return 125;
+    }
     return run_helper(argc, argv);
 }

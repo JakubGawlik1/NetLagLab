@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <csignal>
 #include <fcntl.h>
 #include <string>
 #include <string_view>
@@ -168,6 +169,37 @@ TEST(WorkloadProcessTest, ExplicitlyRedirectsWorkloadStandardOutput)
     ASSERT_GT(size, 0);
     EXPECT_EQ(std::string_view(output.data(), static_cast<std::size_t>(size)),
               "redirected\n");
+}
+
+TEST(WorkloadProcessTest, RestoresDefaultBrokenPipeSignalForWorkload)
+{
+    int pipe_descriptors[2]{};
+    ASSERT_EQ(pipe2(pipe_descriptors, O_CLOEXEC), 0);
+    FileDescriptor reader{pipe_descriptors[0]};
+    FileDescriptor writer{pipe_descriptors[1]};
+    reader.reset();
+    struct sigaction ignored {};
+    ignored.sa_handler = SIG_IGN;
+    sigemptyset(&ignored.sa_mask);
+    struct sigaction previous {};
+    ASSERT_EQ(sigaction(SIGPIPE, &ignored, &previous), 0);
+    const WorkloadContext context{
+        .working_directory = "/",
+        .arguments = {"/bin/echo", "closed-reader"},
+        .environment = {"PATH=/bin"},
+    };
+    WorkloadStandardDescriptors descriptors;
+    descriptors.sources[1] = writer.get();
+    WorkloadLaunchResult launch{
+        launch_workload(context, current_identity(), descriptors)};
+    // Restore the test process before any assertion can return from this scope.
+    const int restored{sigaction(SIGPIPE, &previous, nullptr)};
+    ASSERT_EQ(restored, 0);
+    ASSERT_TRUE(launch.process.has_value());
+    const auto status{launch.process->wait()};
+    ASSERT_TRUE(status.has_value());
+    EXPECT_FALSE(status->exited);
+    EXPECT_EQ(status->value, SIGPIPE);
 }
 
 TEST(WorkloadProcessTest, TransfersOpenDescriptionsAndClosedMarkersOverUnixSocket)

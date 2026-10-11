@@ -229,7 +229,8 @@ public:
         const PlacedVethProof& veth_proof,
         TimePoint deadline) = 0;
     [[nodiscard]] virtual ConnectivityMutationResult configure_connectivity(
-        TimePoint deadline) = 0;
+        TimePoint operation_deadline,
+        TimePoint transaction_deadline) = 0;
     [[nodiscard]] virtual OperationResult validate_connectivity(
         const ConnectivityProof& proof,
         TimePoint deadline) = 0;
@@ -416,7 +417,8 @@ public:
     }
 
     [[nodiscard]] ConnectivityMutationResult configure_connectivity(
-        const TimePoint deadline) override
+        const TimePoint deadline,
+        const TimePoint) override
     {
         if (state_->steps.empty()
             || state_->steps.front().operation != Operation::configure_connectivity) {
@@ -917,7 +919,8 @@ public:
     }
 
     [[nodiscard]] ConnectivityMutationResult configure_connectivity(
-        const TimePoint deadline) override
+        TimePoint deadline,
+        const TimePoint transaction_deadline) override
     {
         const std::optional<bool> forwarding{
             production_->ipv4_forwarding_enabled()};
@@ -972,18 +975,19 @@ public:
         }
         const bool ufw_active{*ufw_status};
         const bool firewalld_active{*firewalld_status};
-        const std::vector<std::string> list_ruleset_arguments{"list", "ruleset"};
-        const CommandResult nft_ruleset{production_->run_tool(
-            *nft_path, list_ruleset_arguments, deadline)};
-        if (nft_ruleset.kind != CommandResultKind::success
-            || nft_ruleset.standard_output.size() >= 4096U) {
-            return {false, command_cause(nft_ruleset), {}};
-        }
-        if (!ufw_active && !firewalld_active
-            && (*legacy_rules
+        if (!ufw_active && !firewalld_active) {
+            const std::vector<std::string> list_ruleset_arguments{"list", "ruleset"};
+            const CommandResult nft_ruleset{production_->run_tool(
+                *nft_path, list_ruleset_arguments, deadline)};
+            if (nft_ruleset.kind != CommandResultKind::success) {
+                return {false, command_cause(nft_ruleset), {}};
+            }
+            if (nft_ruleset.standard_output.size() >= 4096U
+                || *legacy_rules
                 || nft_ruleset.standard_output.find("hook forward")
-                    != std::string::npos)) {
-            return {false, Cause::unsupported_host_configuration, {}};
+                    != std::string::npos) {
+                return {false, Cause::unsupported_host_configuration, {}};
+            }
         }
 
         const auto token{detail::create_recovery_token()};
@@ -1021,8 +1025,13 @@ public:
         }
         if ((ufw_active || firewalld_active)
             && !production_->request_firewall_consent(
-                consent_description, deadline)) {
+                consent_description, transaction_deadline)) {
             return {false, Cause::unsupported_host_configuration, {}};
+        }
+        if (ufw_active || firewalld_active) {
+            deadline = std::min(
+                std::chrono::steady_clock::now() + operation_limit,
+                transaction_deadline);
         }
 
         const int raw_directory{production_->open_recovery_directory()};
@@ -2790,7 +2799,7 @@ PreparationResult prepare_network_environment(PreparationInput input)
             std::move(state), Stage::internet_connectivity, Cause::timeout);
     }
     ConnectivityMutationResult connectivity_result{
-        state->runtime->adapter->configure_connectivity(deadline())};
+        state->runtime->adapter->configure_connectivity(deadline(), setup_deadline)};
     state->connectivity_root = std::move(connectivity_result.state);
     if (!connectivity_result.succeeded) {
         return preparation_failure(

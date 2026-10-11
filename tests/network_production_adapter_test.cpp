@@ -120,6 +120,8 @@ struct FakeProductionTrace {
     std::vector<RecordedCommand> recorded_tools;
     std::vector<RecordedLinkQuery> recorded_link_queries;
     std::vector<std::string> consent_requests;
+    std::optional<std::chrono::steady_clock::time_point> consent_deadline;
+    std::optional<std::chrono::steady_clock::time_point> ufw_allow_deadline;
     std::shared_ptr<std::vector<std::string>> events{
         std::make_shared<std::vector<std::string>>()};
 };
@@ -219,7 +221,7 @@ public:
     [[nodiscard]] CommandResult run_tool(
         const std::string_view executable_path,
         const std::span<const std::string> arguments,
-        std::chrono::steady_clock::time_point) override
+        const std::chrono::steady_clock::time_point deadline) override
     {
         recorded_tools.push_back({
             std::string{executable_path},
@@ -235,6 +237,10 @@ public:
         }
         const std::string_view command{
             arguments.empty() ? std::string_view{} : std::string_view{arguments.front()}};
+        if (arguments.size() > 1U && arguments[0] == "route"
+            && arguments[1] == "allow") {
+            trace->ufw_allow_deadline = deadline;
+        }
         if (arguments.size() == 3U && arguments[0] == "-4"
             && arguments[1] == "rule" && arguments[2] == "show") {
             return {CommandResultKind::success, 0, {}, ipv4_rules_output};
@@ -397,9 +403,10 @@ public:
 
     [[nodiscard]] bool request_firewall_consent(
         const std::string_view rule,
-        std::chrono::steady_clock::time_point) override
+        const std::chrono::steady_clock::time_point deadline) override
     {
         trace->consent_requests.emplace_back(rule);
+        trace->consent_deadline = deadline;
         return consent_granted;
     }
 
@@ -1063,6 +1070,12 @@ TEST(NetworkProductionAdapterTest, AddsAndRemovesOnlyTheConsentedUfwRule)
     EXPECT_NE(observed->consent_requests.front().find("persistent"), std::string::npos);
     EXPECT_NE(observed->consent_requests.front().find("cleanup"), std::string::npos);
     EXPECT_NE(observed->consent_requests.front().find("nll-host"), std::string::npos);
+    ASSERT_TRUE(observed->consent_deadline.has_value());
+    EXPECT_GT(
+        *observed->consent_deadline,
+        std::chrono::steady_clock::now() + std::chrono::seconds{5});
+    ASSERT_TRUE(observed->ufw_allow_deadline.has_value());
+    EXPECT_GT(*observed->ufw_allow_deadline, std::chrono::steady_clock::now());
     const auto allow{std::find_if(
         observed->recorded_tools.begin(),
         observed->recorded_tools.end(),
@@ -1318,6 +1331,31 @@ TEST(NetworkProductionAdapterTest, RefusesTruncatedNftRulesetInspection)
                 && command.arguments[0] == "add"
                 && command.arguments[1] == "table";
         }));
+}
+
+TEST(NetworkProductionAdapterTest, DoesNotInspectFullRulesetWhenUfwManagesFirewall)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    production->ufw_status_output = "Status: active\n";
+    production->nft_ruleset_output = std::string(4096U, ' ');
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    CleanupResult cleanup{std::move(
+        std::get<PreparedNetworkEnvironment>(result)).cleanup()};
+    EXPECT_TRUE(cleanup.failures.empty());
+    EXPECT_FALSE(cleanup.residual.has_value());
 }
 
 TEST(NetworkProductionAdapterTest, RecreatesMissingJournalFromInMemoryOwnershipProof)
