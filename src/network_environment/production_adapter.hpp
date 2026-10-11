@@ -6,6 +6,7 @@
 #include "qdisc_inventory.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -58,7 +59,8 @@ public:
     [[nodiscard]] virtual CommandResult run_tool(
         std::string_view executable_path,
         std::span<const std::string> arguments,
-        std::chrono::steady_clock::time_point deadline) = 0;
+        std::chrono::steady_clock::time_point deadline,
+        std::size_t maximum_stdout_size = 4096) = 0;
     [[nodiscard]] virtual std::optional<bool> ipv4_forwarding_enabled() = 0;
     [[nodiscard]] virtual std::optional<bool> legacy_iptables_rules_present() = 0;
     [[nodiscard]] virtual bool request_firewall_consent(

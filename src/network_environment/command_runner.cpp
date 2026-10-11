@@ -71,7 +71,8 @@ enum class NamespaceMode {
     const int descriptor,
     bool& pipe_open,
     std::string& captured,
-    const bool drain_completely)
+    const bool drain_completely,
+    const std::size_t capture_limit = maximum_diagnostic_size)
 {
     std::array<char, 1024> buffer{};
     std::size_t reads{};
@@ -79,7 +80,7 @@ enum class NamespaceMode {
         const ssize_t result{read(descriptor, buffer.data(), buffer.size())};
         if (result > 0) {
             const std::size_t available{
-                maximum_diagnostic_size - captured.size()};
+                capture_limit - captured.size()};
             const std::size_t count{
                 std::min(available, static_cast<std::size_t>(result))};
             captured.append(buffer.data(), count);
@@ -156,7 +157,8 @@ enum class NamespaceMode {
     const int namespace_descriptor,
     const NamespaceMode namespace_mode,
     const std::chrono::steady_clock::time_point deadline,
-    const bool capture_stdout)
+    const bool capture_stdout,
+    const std::size_t maximum_stdout_size = maximum_diagnostic_size)
 {
     if (std::chrono::steady_clock::now() >= deadline) {
         return {CommandResultKind::timeout, 0, {}};
@@ -279,7 +281,7 @@ enum class NamespaceMode {
     std::string diagnostic;
     diagnostic.reserve(maximum_diagnostic_size);
     std::string standard_output;
-    standard_output.reserve(maximum_diagnostic_size);
+    standard_output.reserve(std::min(maximum_stdout_size, maximum_diagnostic_size));
     ChildFailureMessage child_failure{};
     std::size_t child_failure_bytes{};
     bool standard_error_open{true};
@@ -309,7 +311,8 @@ enum class NamespaceMode {
                     standard_output_reader->get(),
                     standard_output_open,
                     standard_output,
-                    false))
+                    false,
+                    maximum_stdout_size))
             || !drain_child_failure(
                 child_failure_reader.get(),
                 child_failure_open,
@@ -351,7 +354,8 @@ enum class NamespaceMode {
                     standard_output_reader->get(),
                     standard_output_open,
                     standard_output,
-                    true);
+                    true,
+                    maximum_stdout_size);
             }
             if (termination_error != 0) {
                 return {
@@ -399,7 +403,8 @@ enum class NamespaceMode {
                 standard_output_reader->get(),
                 standard_output_open,
                 standard_output,
-                true))
+                true,
+                maximum_stdout_size))
         || !drain_child_failure(
             child_failure_reader.get(),
             child_failure_open,
@@ -464,10 +469,12 @@ CommandResult run_command(
 CommandResult run_command_capturing_stdout(
     const std::string_view executable_path,
     const std::span<const std::string> arguments,
-    const std::chrono::steady_clock::time_point deadline)
+    const std::chrono::steady_clock::time_point deadline,
+    const std::size_t maximum_stdout_size)
 {
     return run_command_impl(
-        executable_path, arguments, -1, NamespaceMode::none, deadline, true);
+        executable_path, arguments, -1, NamespaceMode::none, deadline, true,
+        maximum_stdout_size);
 }
 
 CommandResult run_command_with_inherited_descriptor(

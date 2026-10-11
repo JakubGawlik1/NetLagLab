@@ -36,6 +36,7 @@ using testing::ScriptStep;
 
 constexpr auto transaction_limit{std::chrono::seconds{30}};
 constexpr auto operation_limit{std::chrono::seconds{5}};
+constexpr std::size_t maximum_firewall_inventory_size{64U * 1024U};
 constexpr std::uint32_t owned_netem_handle{0x4e4c0000U};
 constexpr std::uint64_t nanoseconds_per_millisecond{1'000'000U};
 
@@ -1060,11 +1061,16 @@ public:
         const bool ufw_active{*ufw_status};
         const bool firewalld_active{*firewalld_status};
         const std::vector<std::string> list_ruleset_arguments{"list", "ruleset"};
+        // One extra byte distinguishes a complete inventory at the limit from
+        // a truncated prefix, which cannot safely prove absence of forward hooks.
         const CommandResult nft_ruleset{production_->run_tool(
-            *nft_path, list_ruleset_arguments, deadline)};
-        if (nft_ruleset.kind != CommandResultKind::success
-            || nft_ruleset.standard_output.size() >= 4096U) {
+            *nft_path, list_ruleset_arguments, deadline,
+            maximum_firewall_inventory_size + 1U)};
+        if (nft_ruleset.kind != CommandResultKind::success) {
             return {false, command_cause(nft_ruleset), {}};
+        }
+        if (nft_ruleset.standard_output.size() > maximum_firewall_inventory_size) {
+            return {false, Cause::unsupported_host_configuration, {}};
         }
         if (!ufw_active && !firewalld_active
             && (*legacy_rules
@@ -2113,7 +2119,8 @@ public:
     [[nodiscard]] CommandResult run_tool(
         std::string_view,
         std::span<const std::string>,
-        TimePoint) override
+        TimePoint,
+        std::size_t) override
     {
         return {CommandResultKind::system_failure, 0, {}};
     }

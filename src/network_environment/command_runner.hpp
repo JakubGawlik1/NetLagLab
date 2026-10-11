@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <span>
 #include <string>
 #include <string_view>
@@ -46,7 +47,8 @@ struct CommandResult {
 [[nodiscard]] CommandResult run_command_capturing_stdout(
     std::string_view executable_path,
     std::span<const std::string> arguments,
-    std::chrono::steady_clock::time_point deadline);
+    std::chrono::steady_clock::time_point deadline,
+    std::size_t maximum_stdout_size = 4096);
 
 [[nodiscard]] CommandResult run_command_with_inherited_descriptor(
     std::string_view executable_path,

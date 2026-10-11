@@ -231,7 +231,8 @@ public:
     [[nodiscard]] CommandResult run_tool(
         const std::string_view executable_path,
         const std::span<const std::string> arguments,
-        std::chrono::steady_clock::time_point) override
+        std::chrono::steady_clock::time_point,
+        const std::size_t maximum_stdout_size) override
     {
         if (arguments.size() >= 2U && arguments[0] == "qdisc") {
             CommandResult result{std::move(tc_commands.front())};
@@ -342,7 +343,8 @@ public:
         }
         if (command == "list" && arguments.size() == 2U
             && arguments[1] == "ruleset") {
-            return {CommandResultKind::success, 0, {}, nft_ruleset_output};
+            return {CommandResultKind::success, 0, {},
+                    nft_ruleset_output.substr(0, maximum_stdout_size)};
         }
         if (command == "list" && arguments.size() == 4U
             && arguments[1] == "table") {
@@ -1339,11 +1341,64 @@ TEST(NetworkProductionAdapterTest, RemovesPartialFirewalldPolicyAfterSetupFailur
         }));
 }
 
+TEST(NetworkProductionAdapterTest, AcceptsCompleteNftRulesetLargerThanDiagnosticLimit)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    production->nft_ruleset_output = std::string(18497U, ' ');
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparedNetworkEnvironment>(result));
+    CleanupResult cleanup{std::move(
+        std::get<PreparedNetworkEnvironment>(result)).cleanup()};
+    EXPECT_TRUE(cleanup.failures.empty());
+    EXPECT_FALSE(cleanup.residual.has_value());
+}
+
+TEST(NetworkProductionAdapterTest, RefusesUnmanagedForwardHookBeyondDiagnosticLimit)
+{
+    auto production{std::make_unique<FakeProductionPlatform>()};
+    const auto observed{production->trace};
+    production->nft_ruleset_output = std::string(18497U, ' ') + "hook forward";
+    for (int index{}; index < 11; ++index) {
+        production->commands.push_back({CommandResultKind::success, 0, {}});
+    }
+    queue_namespace_creation(*production);
+    queue_namespace_cleanup(*production);
+    queue_host_pair(*production);
+    queue_placed_pair(*production);
+    queue_placed_pair(*production);
+    queue_absent_placed_pair(*production);
+
+    PreparationResult result{testing::prepare_with_production_platform(
+        std::make_unique<PassingPreflight>(), std::move(production))};
+
+    ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
+    EXPECT_EQ(std::get<PreparationFailure>(result).primary.cause,
+              Cause::unsupported_host_configuration);
+    EXPECT_TRUE(std::none_of(
+        observed->recorded_tools.begin(), observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() > 1U
+                && command.arguments[0] == "add" && command.arguments[1] == "table";
+        }));
+}
+
 TEST(NetworkProductionAdapterTest, RefusesTruncatedNftRulesetInspection)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
     const auto observed{production->trace};
-    production->nft_ruleset_output = std::string(4096U, ' ');
+    production->nft_ruleset_output = std::string(65537U, ' ');
     for (int index{}; index < 11; ++index) {
         production->commands.push_back({CommandResultKind::success, 0, {}});
     }
@@ -1361,6 +1416,8 @@ TEST(NetworkProductionAdapterTest, RefusesTruncatedNftRulesetInspection)
     EXPECT_EQ(
         std::get<PreparationFailure>(result).primary.stage,
         Stage::internet_connectivity);
+    EXPECT_EQ(std::get<PreparationFailure>(result).primary.cause,
+              Cause::unsupported_host_configuration);
     EXPECT_TRUE(std::none_of(
         observed->recorded_tools.begin(),
         observed->recorded_tools.end(),

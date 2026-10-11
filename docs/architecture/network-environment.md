@@ -143,6 +143,13 @@ MVP does not add redundant full-state readback, public ping, public DNS lookup,
 or Internet-connectivity tests. Those tests would impose external policy and
 availability as startup requirements without proving every relevant protocol.
 
+The read-only nftables ruleset inventory has a separate 64 KiB stdout limit.
+The command runner captures one extra byte to detect overflow before any
+connectivity mutation. An oversized inventory is an unsupported host
+configuration; a partial prefix is never accepted as proof that forward hooks
+are absent. Other command stdout and stderr diagnostics retain their 4 KiB
+limits.
+
 Each iproute2 child operation has a five-second deadline. The setup transaction
 has one non-renewing 30-second budget, and rollback receives a separate
 30-second budget so setup delay cannot consume cleanup time. The coordinator

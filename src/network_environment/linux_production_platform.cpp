@@ -476,9 +476,11 @@ public:
     [[nodiscard]] CommandResult run_tool(
         const std::string_view executable_path,
         const std::span<const std::string> arguments,
-        const std::chrono::steady_clock::time_point deadline) override
+        const std::chrono::steady_clock::time_point deadline,
+        const std::size_t maximum_stdout_size) override
     {
-        return run_command_capturing_stdout(executable_path, arguments, deadline);
+        return run_command_capturing_stdout(
+            executable_path, arguments, deadline, maximum_stdout_size);
     }
 
     [[nodiscard]] std::optional<bool> ipv4_forwarding_enabled() override
