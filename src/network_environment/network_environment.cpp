@@ -36,6 +36,7 @@ using testing::ScriptStep;
 
 constexpr auto transaction_limit{std::chrono::seconds{30}};
 constexpr auto operation_limit{std::chrono::seconds{5}};
+constexpr auto firewall_consent_limit{std::chrono::seconds{30}};
 constexpr std::size_t maximum_firewall_inventory_size{64U * 1024U};
 constexpr std::uint32_t owned_netem_handle{0x4e4c0000U};
 constexpr std::uint64_t nanoseconds_per_millisecond{1'000'000U};
@@ -1005,7 +1006,7 @@ public:
     }
 
     [[nodiscard]] ConnectivityMutationResult configure_connectivity(
-        const TimePoint deadline) override
+        TimePoint deadline) override
     {
         const std::optional<bool> forwarding{
             production_->ipv4_forwarding_enabled()};
@@ -1104,10 +1105,30 @@ public:
                 "firewalld policy " + policy + " from zone " + *firewalld_zone
                 + " for IPv4 source 10.200.0.2/32 to any routed destination";
         }
-        if ((ufw_active || firewalld_active)
-            && !production_->request_firewall_consent(
-                consent_description, deadline)) {
-            return {false, Cause::unsupported_host_configuration, {}};
+        if (ufw_active || firewalld_active) {
+            const TimePoint consent_started{std::chrono::steady_clock::now()};
+            if (consent_started >= deadline) {
+                return {false, Cause::timeout, {}};
+            }
+            // Human decision time is separate from the shared command budget.
+            // Connectivity is the final setup stage: at most 30s extra for
+            // consent and one fresh 5s budget for all ensuing mutations.
+            const detail::FirewallConsentResult consent{
+                production_->request_firewall_consent(
+                    consent_description, consent_started + firewall_consent_limit)};
+            switch (consent) {
+            case detail::FirewallConsentResult::declined:
+                return {false, Cause::firewall_consent_declined, {}};
+            case detail::FirewallConsentResult::timed_out:
+                return {false, Cause::firewall_consent_timeout, {}};
+            case detail::FirewallConsentResult::terminal_unavailable:
+                return {false, Cause::firewall_consent_unavailable, {}};
+            case detail::FirewallConsentResult::io_failure:
+                return {false, Cause::system_failure, {}};
+            case detail::FirewallConsentResult::granted:
+                break;
+            }
+            deadline = std::chrono::steady_clock::now() + operation_limit;
         }
 
         const int raw_directory{production_->open_recovery_directory()};
@@ -2135,9 +2156,10 @@ public:
         return std::nullopt;
     }
 
-    [[nodiscard]] bool request_firewall_consent(std::string_view, TimePoint) override
+    [[nodiscard]] detail::FirewallConsentResult request_firewall_consent(
+        std::string_view, TimePoint) override
     {
-        return false;
+        return detail::FirewallConsentResult::terminal_unavailable;
     }
 
     [[nodiscard]] int open_recovery_directory() override { return -1; }

@@ -42,6 +42,14 @@ struct NamespaceQuery {
     std::unique_ptr<NamespaceHandle> handle;
 };
 
+enum class FirewallConsentResult {
+    granted,
+    declined,
+    timed_out,
+    terminal_unavailable,
+    io_failure,
+};
+
 class ProductionPlatform {
 public:
     virtual ~ProductionPlatform() = default;
@@ -63,7 +71,7 @@ public:
         std::size_t maximum_stdout_size = 4096) = 0;
     [[nodiscard]] virtual std::optional<bool> ipv4_forwarding_enabled() = 0;
     [[nodiscard]] virtual std::optional<bool> legacy_iptables_rules_present() = 0;
-    [[nodiscard]] virtual bool request_firewall_consent(
+    [[nodiscard]] virtual FirewallConsentResult request_firewall_consent(
         std::string_view rule,
         std::chrono::steady_clock::time_point deadline) = 0;
     [[nodiscard]] virtual int open_recovery_directory() = 0;

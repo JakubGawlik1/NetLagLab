@@ -33,6 +33,9 @@ enum class Cause {
     identity_mismatch,
     incomplete_cleanup,
     unsupported_host_configuration,
+    firewall_consent_declined,
+    firewall_consent_timeout,
+    firewall_consent_unavailable,
 };
 
 struct Failure {

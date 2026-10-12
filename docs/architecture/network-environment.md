@@ -151,11 +151,15 @@ are absent. Other command stdout and stderr diagnostics retain their 4 KiB
 limits.
 
 Each iproute2 child operation has a five-second deadline. The setup transaction
-has one non-renewing 30-second budget, and rollback receives a separate
-30-second budget so setup delay cannot consume cleanup time. The coordinator
-passes an absolute operation deadline bounded by both the transaction deadline
-and the five-second child limit; an adapter cannot renew either budget. A
-timed-out child is terminated and reaped. The adapter returns a typed cause and
+has a 30-second budget for pre-consent setup and inspections. When the final
+connectivity stage needs a UFW or firewalld exception, the exact rule is shown
+on the controlling terminal with a separate 30-second consent deadline. Only
+`y` followed by Enter grants consent. Decline, consent timeout, and unavailable
+terminal have distinct typed startup diagnostics and begin no NAT or firewall
+mutation. After consent, all connectivity commands share one fresh five-second
+deadline. This path can extend setup to at most 65 seconds; other setup stages
+cannot renew their deadlines. Rollback retains its independent 30-second budget.
+A timed-out child is terminated and reaped. The adapter returns a typed cause and
 captures at most 4 KiB of diagnostic standard error, while the coordinator
 assigns the semantic stage. The helper presents stable diagnostics rather than
 treating raw tool text as a protocol contract.
@@ -458,17 +462,27 @@ cleanup with a shaping qdisc still active. Its output records the compiled
 revision/dirty marker, kernel, `tc` path, command sequence, and packet samples.
 It does not inject privileged runtime failures; rollback evidence remains the
 separate deterministic test result.
-This case is opt-in and has not been run as part of this change. To run only
-the shaping qualification (after authorizing its temporary namespace, veth,
-qdiscs, helper lock, and Session processes), use:
+This case is opt-in and has not yet completed successfully on the qualification
+host. To run only the shaping qualification (after authorizing its temporary
+namespace, veth, qdiscs, source-scoped NAT, helper lock, and Session processes), use:
 
 ```bash
-NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 GTEST_FILTER='SessionShapingQualification.*' \
-  ctest --test-dir build -R '^netlaglab_session_qualification$' --verbose \
+sudo env NETLAGLAB_ALLOW_PRIVILEGED_TESTS=1 NETLAGLAB_QUALIFICATION_INTERACTIVE=1 \
+  GTEST_FILTER='SessionShapingQualification.*' ctest --test-dir build -R '^netlaglab_session_qualification$' --verbose \
   --output-on-failure
 ```
 
-No forwarding, NAT, DNS, firewall policy, or public Internet access is needed.
+The measured packets stay on the local veth path and require no public
+Internet peer. Production Session preparation still requires enabled forwarding
+and a supported IPv4 resolver, installs owned source-scoped NAT, and asks for
+any supported UFW/firewalld exception. Include these resources in the run
+authorization. Interactive qualification gives the Session its own terminal,
+uses it for all three standard streams so nested `sudo` relays input, relays
+the displayed prompt and the person's reply, and sends probe stdin only after
+preparation. Terminal capture merges stdout/stderr and normalizes CRLF for the
+textual probe protocol; ordinary pipe-based tests retain separate streams.
+It does not automatically approve an exception. Startup
+readiness allows 70 seconds; the shaping CTest retains its 180-second limit.
 
 ## Experimentally verified behavior
 

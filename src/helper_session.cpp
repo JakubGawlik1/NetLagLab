@@ -42,6 +42,12 @@ using network_environment::Stage;
     case Cause::incomplete_cleanup: return "incomplete cleanup";
     case Cause::unsupported_host_configuration:
         return "unsupported host configuration";
+    case Cause::firewall_consent_declined:
+        return "temporary firewall exception was not approved";
+    case Cause::firewall_consent_timeout:
+        return "firewall consent timed out; reply y on the controlling terminal";
+    case Cause::firewall_consent_unavailable:
+        return "firewall consent requires an accessible controlling terminal";
     }
     return "unknown";
 }

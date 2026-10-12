@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <string>
 #include <utility>
+#include <thread>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -126,6 +127,10 @@ struct FakeProductionTrace {
     std::vector<RecordedLinkQuery> recorded_link_queries;
     std::vector<RecordedQdiscQuery> recorded_qdisc_queries;
     std::vector<std::string> consent_requests;
+    std::vector<std::chrono::steady_clock::time_point> tool_deadlines;
+    std::chrono::steady_clock::time_point consent_started{};
+    std::chrono::steady_clock::time_point consent_deadline{};
+    std::chrono::steady_clock::time_point consent_finished{};
     std::shared_ptr<std::vector<std::string>> events{
         std::make_shared<std::vector<std::string>>()};
 };
@@ -162,6 +167,8 @@ public:
     std::optional<bool> forwarding_enabled{true};
     std::optional<bool> legacy_rules{false};
     bool consent_granted{true};
+    std::optional<detail::FirewallConsentResult> consent_result;
+    std::chrono::milliseconds consent_delay{};
     std::string ufw_status_output{"Status: inactive\n"};
     std::string ufw_rules_output;
     std::string firewalld_state_output{"not running\n"};
@@ -231,9 +238,10 @@ public:
     [[nodiscard]] CommandResult run_tool(
         const std::string_view executable_path,
         const std::span<const std::string> arguments,
-        std::chrono::steady_clock::time_point,
+        const std::chrono::steady_clock::time_point deadline,
         const std::size_t maximum_stdout_size) override
     {
+        trace->tool_deadlines.push_back(deadline);
         if (arguments.size() >= 2U && arguments[0] == "qdisc") {
             CommandResult result{std::move(tc_commands.front())};
             tc_commands.pop_front();
@@ -384,12 +392,18 @@ public:
         return legacy_rules;
     }
 
-    [[nodiscard]] bool request_firewall_consent(
+    [[nodiscard]] detail::FirewallConsentResult request_firewall_consent(
         const std::string_view rule,
-        std::chrono::steady_clock::time_point) override
+        const std::chrono::steady_clock::time_point deadline) override
     {
         trace->consent_requests.emplace_back(rule);
-        return consent_granted;
+        trace->consent_started = std::chrono::steady_clock::now();
+        trace->consent_deadline = deadline;
+        std::this_thread::sleep_for(consent_delay);
+        trace->consent_finished = std::chrono::steady_clock::now();
+        return consent_result.value_or(consent_granted
+                ? detail::FirewallConsentResult::granted
+                : detail::FirewallConsentResult::declined);
     }
 
     [[nodiscard]] int open_recovery_directory() override
@@ -1174,12 +1188,20 @@ TEST(NetworkProductionAdapterTest, DoesNotTreatFirewalldInspectionFailureAsInact
         }));
 }
 
-TEST(NetworkProductionAdapterTest, RefusesFirewallMutationWithoutInteractiveConsent)
+struct ConsentFailureCase {
+    detail::FirewallConsentResult result;
+    Cause cause;
+};
+
+class NetworkFirewallConsentFailureTest : public ::testing::TestWithParam<ConsentFailureCase> {
+};
+
+TEST_P(NetworkFirewallConsentFailureTest, RefusesFirewallMutationWithSpecificCause)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
     const auto observed{production->trace};
     production->ufw_status_output = "Status: active\n";
-    production->consent_granted = false;
+    production->consent_result = GetParam().result;
     for (int index{}; index < 11; ++index) {
         production->commands.push_back({CommandResultKind::success, 0, {}});
     }
@@ -1196,6 +1218,7 @@ TEST(NetworkProductionAdapterTest, RefusesFirewallMutationWithoutInteractiveCons
     ASSERT_TRUE(std::holds_alternative<PreparationFailure>(result));
     const PreparationFailure& failure{std::get<PreparationFailure>(result)};
     EXPECT_EQ(failure.primary.stage, Stage::internet_connectivity);
+    EXPECT_EQ(failure.primary.cause, GetParam().cause);
     EXPECT_TRUE(failure.rollback_failures.empty());
     ASSERT_EQ(observed->consent_requests.size(), 1U);
     EXPECT_NE(observed->consent_requests.front().find("nll-host"), std::string::npos);
@@ -1211,9 +1234,20 @@ TEST(NetworkProductionAdapterTest, RefusesFirewallMutationWithoutInteractiveCons
         }));
 }
 
+INSTANTIATE_TEST_SUITE_P(
+    ConsentFailures, NetworkFirewallConsentFailureTest,
+    ::testing::Values(
+        ConsentFailureCase{detail::FirewallConsentResult::declined,
+                           Cause::firewall_consent_declined},
+        ConsentFailureCase{detail::FirewallConsentResult::timed_out,
+                           Cause::firewall_consent_timeout},
+        ConsentFailureCase{detail::FirewallConsentResult::terminal_unavailable,
+                           Cause::firewall_consent_unavailable}));
+
 TEST(NetworkProductionAdapterTest, AddsAndRemovesOnlyTheConsentedUfwRule)
 {
     auto production{std::make_unique<FakeProductionPlatform>()};
+    production->consent_delay = std::chrono::milliseconds{20};
     const auto observed{production->trace};
     production->ufw_status_output = "Status: active\n";
     for (int index{}; index < 11; ++index) {
@@ -1236,6 +1270,19 @@ TEST(NetworkProductionAdapterTest, AddsAndRemovesOnlyTheConsentedUfwRule)
     EXPECT_FALSE(cleanup.residual.has_value());
     ASSERT_EQ(observed->consent_requests.size(), 1U);
     EXPECT_NE(observed->consent_requests.front().find("nll-host"), std::string::npos);
+    EXPECT_GE(observed->consent_deadline,
+              observed->consent_started + std::chrono::seconds{29});
+    const auto first_mutation = std::find_if(
+        observed->recorded_tools.begin(), observed->recorded_tools.end(),
+        [](const RecordedCommand& command) {
+            return command.arguments.size() >= 2U
+                && command.arguments[0] == "add" && command.arguments[1] == "table";
+        });
+    ASSERT_NE(first_mutation, observed->recorded_tools.end());
+    const auto first_mutation_index = static_cast<std::size_t>(
+        first_mutation - observed->recorded_tools.begin());
+    EXPECT_GE(observed->tool_deadlines[first_mutation_index],
+              observed->consent_finished + std::chrono::seconds{5});
     const auto allow{std::find_if(
         observed->recorded_tools.begin(),
         observed->recorded_tools.end(),

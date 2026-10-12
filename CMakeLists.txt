@@ -301,9 +301,10 @@ if(BUILD_TESTING)
             netlaglab_session_qualification
             tests/session_qualification_test.cpp
         )
+        target_include_directories(netlaglab_session_qualification PRIVATE src)
         target_link_libraries(
             netlaglab_session_qualification
-            PRIVATE GTest::gtest
+            PRIVATE GTest::gtest netlaglab_network_environment
         )
         target_compile_definitions(
             netlaglab_session_qualification

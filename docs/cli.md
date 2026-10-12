@@ -22,9 +22,14 @@ standard streams. The helper is the program's direct parent and enters the retai
 network namespace in the child before dropping privileges and executing the program.
 
 The Workload can use numeric IPv4 addresses to communicate with the host endpoint at
-`10.200.0.1`. This checkpoint does not configure production Internet access, a Session DNS view,
-or traffic shaping. A preparation or namespace-entry failure prevents Workload execution; the
-Session reports cleanup separately and requires complete cleanup for infrastructure success.
+`10.200.0.1`. Session preparation also installs an IPv4 resolver view and owned
+source-scoped NAT, and requires host IPv4 forwarding to be enabled. With active
+UFW or firewalld, the helper displays the exact temporary exception on the
+controlling terminal; type `y` and Enter within 30 seconds to approve it.
+Declining, timing out, or lacking a terminal prevents launch with a specific
+diagnostic. Live shaping is available after activation. A preparation or
+namespace-entry failure prevents Workload execution; cleanup is reported
+separately. Production DNS/TCP/UDP Internet behavior remains unqualified.
 
 ## Attach a controller
 

@@ -518,13 +518,13 @@ public:
         return count > 0;
     }
 
-    [[nodiscard]] bool request_firewall_consent(
+    [[nodiscard]] FirewallConsentResult request_firewall_consent(
         const std::string_view rule,
         const std::chrono::steady_clock::time_point deadline) override
     {
         const int descriptor{open("/dev/tty", O_RDWR | O_CLOEXEC | O_NOCTTY)};
         if (descriptor == -1) {
-            return false;
+            return FirewallConsentResult::terminal_unavailable;
         }
         netlaglab::FileDescriptor terminal{descriptor};
         const std::string prompt{
@@ -540,7 +540,7 @@ public:
             } else if (count == -1 && errno == EINTR) {
                 continue;
             } else {
-                return false;
+                return FirewallConsentResult::io_failure;
             }
         }
         std::array<char, 8> response{};
@@ -548,7 +548,7 @@ public:
         while (received < response.size()) {
             const auto remaining{deadline - std::chrono::steady_clock::now()};
             if (remaining <= std::chrono::steady_clock::duration::zero()) {
-                return false;
+                return FirewallConsentResult::timed_out;
             }
             const auto milliseconds{
                 std::chrono::ceil<std::chrono::milliseconds>(remaining)};
@@ -556,18 +556,21 @@ public:
                     ? INT_MAX
                     : static_cast<int>(milliseconds.count())};
             pollfd wait_descriptor{terminal.get(), POLLIN, 0};
-            int poll_result{};
-            do {
-                poll_result = poll(&wait_descriptor, 1, timeout);
-            } while (poll_result == -1 && errno == EINTR);
-            if (poll_result <= 0 || (wait_descriptor.revents & POLLIN) == 0) {
-                return false;
+            const int poll_result{poll(&wait_descriptor, 1, timeout)};
+            if (poll_result == -1 && errno == EINTR) {
+                continue;
+            }
+            if (poll_result == 0) {
+                return FirewallConsentResult::timed_out;
+            }
+            if (poll_result < 0 || (wait_descriptor.revents & POLLIN) == 0) {
+                return FirewallConsentResult::io_failure;
             }
             const ssize_t count{read(
                 terminal.get(), response.data() + received,
                 response.size() - received)};
             if (count <= 0) {
-                return false;
+                return FirewallConsentResult::io_failure;
             }
             received += static_cast<std::size_t>(count);
             if (std::find(response.begin(), response.begin() + received, '\n')
@@ -575,7 +578,9 @@ public:
                 break;
             }
         }
-        return received == 2U && response[0] == 'y' && response[1] == '\n';
+        return received == 2U && response[0] == 'y' && response[1] == '\n'
+            ? FirewallConsentResult::granted
+            : FirewallConsentResult::declined;
     }
 
     [[nodiscard]] int open_recovery_directory() override

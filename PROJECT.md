@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-10-10
+Last verified: 2026-10-12
 
 ## How to use this file
 
@@ -95,7 +95,8 @@ cross-platform support are not current goals.
   invoking credentials. The production Network Environment requires host IPv4
   forwarding to be already enabled, creates source-scoped NAT in a unique
   nftables table, and supports scoped UFW or firewalld policy changes after
-  controlling-terminal consent. A root-owned durable journal records mutation
+  controlling-terminal consent with a separate 30-second decision budget and
+  distinct refusal diagnostics. A root-owned durable journal records mutation
   phases and is reconciled under the host lock before fixed-name preflight.
   Scripted, filesystem, helper, and Workload tests cover the unprivileged
   contracts; end-to-end DNS/TCP/UDP behavior remains unqualified.
@@ -103,8 +104,8 @@ cross-platform support are not current goals.
   `tc/netem` to proven Session links. Deterministic tests cover qdisc decoding,
   confirmation, composition, and rollback. An opt-in integrated qualification
   measures direction, updates, resets, and cleanup against a controlled local
-  UDP peer; it has not yet run, so production packet behavior remains
-  unqualified. Bandwidth is not implemented.
+  UDP peer; it has not yet completed successfully, so production packet
+  behavior remains unqualified. Bandwidth is not implemented.
 
 ## Candidate capabilities
 

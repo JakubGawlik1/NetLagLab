@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include "network_environment/production_adapter.hpp"
+
 #include <algorithm>
 #include <arpa/inet.h>
 #include <atomic>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -32,6 +35,8 @@
 #include <thread>
 #include <time.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -61,6 +66,7 @@ constexpr std::string_view marker_variable{
     "NLL_SESSION_QUALIFICATION_SIGNAL_MARKER"};
 constexpr std::string_view stdin_variable{"NLL_SESSION_QUALIFICATION_STDIN"};
 constexpr std::string_view stdin_value{"session-stdin-check"};
+constexpr std::string_view stdin_ready_prefix{"SESSION_STDIN_READY:"};
 constexpr std::string_view request_prefix{"nll-session-request:"};
 constexpr std::string_view response_prefix{"nll-session-response:"};
 constexpr std::string_view ready_prefix{"NLL_SESSION_PROBE_READY:"};
@@ -630,6 +636,7 @@ extern "C" void handle_termination(int)
         return report_probe_failure(83, "expected nll-app IPv4 address is missing");
     }
     const char* expected_stdin{required_environment(stdin_variable)};
+    std::cout << stdin_ready_prefix << token << '\n' << std::flush;
     std::string stdin_line;
     if (expected_stdin == nullptr || !std::getline(std::cin, stdin_line)
         || stdin_line != expected_stdin) {
@@ -789,6 +796,153 @@ private:
     bool valid_{};
 };
 
+
+class PseudoTerminal {
+public:
+    PseudoTerminal()
+    {
+        master_ = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK);
+        if (master_ == -1 || grantpt(master_) == -1 || unlockpt(master_) == -1) {
+            return;
+        }
+        std::array<char, 128> name{};
+        if (ptsname_r(master_, name.data(), name.size()) != 0) {
+            return;
+        }
+        slave_ = open(name.data(), O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK);
+        termios settings{};
+        if (slave_ == -1 || tcgetattr(slave_, &settings) == -1) {
+            return;
+        }
+        settings.c_lflag &= ~ECHO;
+        if (tcsetattr(slave_, TCSANOW, &settings) == -1) {
+            return;
+        }
+        valid_ = true;
+    }
+    ~PseudoTerminal()
+    {
+        if (slave_ != -1) (void)close(slave_);
+        if (master_ != -1) (void)close(master_);
+    }
+    PseudoTerminal(const PseudoTerminal&) = delete;
+    PseudoTerminal& operator=(const PseudoTerminal&) = delete;
+    [[nodiscard]] bool valid() const noexcept { return valid_; }
+    [[nodiscard]] int master() const noexcept { return master_; }
+    [[nodiscard]] int slave() const noexcept { return slave_; }
+    void close_slave() noexcept
+    {
+        if (slave_ != -1) (void)close(std::exchange(slave_, -1));
+    }
+private:
+    int master_{-1};
+    int slave_{-1};
+    bool valid_{};
+};
+
+
+// The Session gets a real controlling terminal even though its output is
+// captured. Only a reply entered on the person's terminal is relayed to it.
+class InteractiveTerminal {
+public:
+    explicit InteractiveTerminal(const int human_terminal)
+        : human_{human_terminal == -1
+                ? open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC | O_NONBLOCK)
+                : fcntl(human_terminal, F_DUPFD_CLOEXEC, 3)}
+    {
+    }
+    ~InteractiveTerminal() { if (human_ != -1) (void)close(human_); }
+    InteractiveTerminal(const InteractiveTerminal&) = delete;
+    InteractiveTerminal& operator=(const InteractiveTerminal&) = delete;
+    [[nodiscard]] bool valid() const noexcept
+    {
+        return terminal_.valid() && human_ != -1 && isatty(human_) == 1;
+    }
+    [[nodiscard]] bool enter_in_child() const
+    {
+        if (setsid() == -1 || ioctl(terminal_.slave(), TIOCSCTTY, 0) == -1
+            || dup2(terminal_.slave(), STDIN_FILENO) == -1
+            || dup2(terminal_.slave(), STDOUT_FILENO) == -1
+            || dup2(terminal_.slave(), STDERR_FILENO) == -1) {
+            return false;
+        }
+        // The Workload may block while reading a complete command line.
+        return fcntl(STDIN_FILENO, F_SETFL, 0) != -1;
+    }
+    void close_child_side() noexcept { terminal_.close_slave(); }
+    [[nodiscard]] int duplicate_master() const
+    {
+        return fcntl(terminal_.master(), F_DUPFD_CLOEXEC, 3);
+    }
+    [[nodiscard]] bool service(std::string& output)
+    {
+        pollfd descriptors[2]{{terminal_.master(), POLLIN, 0},
+                             {human_, static_cast<short>(awaiting_reply_ ? POLLIN : 0), 0}};
+        const int ready{poll(descriptors, 2, 0)};
+        if (ready < 0) return errno == EINTR;
+        if ((descriptors[0].revents & POLLIN) != 0) {
+            while (true) {
+                std::array<char, 512> buffer{};
+                const ssize_t count{read(terminal_.master(), buffer.data(), buffer.size())};
+                if (count > 0) {
+                    const std::string_view visible{buffer.data(), static_cast<std::size_t>(count)};
+                    if (!write_bytes(human_, visible)) return false;
+                    // PTYs merge stdout/stderr and may translate LF to CRLF.
+                    // The probe protocol is textual; normalize it at capture.
+                    for (char character : visible) {
+                        if (character != '\r') output.push_back(character);
+                    }
+                    prompt_tail_.append(visible);
+                    if (prompt_tail_.find("Apply it? [y/N]") != std::string::npos) {
+                        awaiting_reply_ = true;
+                        prompt_tail_.clear();
+                    } else if (prompt_tail_.size() > 512U) {
+                        prompt_tail_.erase(0, prompt_tail_.size() - 512U);
+                    }
+                } else if (count == -1 && errno == EINTR) {
+                    continue;
+                } else if (count == 0 || (count == -1 && (errno == EAGAIN || errno == EIO))) {
+                    break;
+                } else {
+                    return false;
+                }
+            }
+        }
+        if (awaiting_reply_ && (descriptors[1].revents & POLLIN) != 0) {
+            std::array<char, 64> response{};
+            const ssize_t count{read(human_, response.data(), response.size())};
+            if (count > 0) {
+                if (!write_bytes(terminal_.master(),
+                                 {response.data(), static_cast<std::size_t>(count)})) {
+                    return false;
+                }
+                if (std::find(response.begin(), response.begin() + count, '\n')
+                    != response.begin() + count) {
+                    awaiting_reply_ = false;
+                }
+            } else if (count == 0 || (errno != EAGAIN && errno != EINTR)) {
+                return false;
+            }
+        }
+        return (descriptors[1].revents & (POLLERR | POLLHUP | POLLNVAL)) == 0;
+    }
+private:
+    [[nodiscard]] static bool write_bytes(const int descriptor, std::string_view bytes)
+    {
+        while (!bytes.empty()) {
+            const ssize_t count{write(descriptor, bytes.data(), bytes.size())};
+            if (count > 0) bytes.remove_prefix(static_cast<std::size_t>(count));
+            else if (count == -1 && errno == EINTR) continue;
+            else return false;
+        }
+        return true;
+    }
+    PseudoTerminal terminal_;
+    int human_{-1};
+    bool awaiting_reply_{};
+    std::string prompt_tail_;
+};
+
 class ChildProcess {
 public:
     ChildProcess() = default;
@@ -800,8 +954,14 @@ public:
         const std::vector<std::string>& arguments,
         const std::filesystem::path& working_directory,
         const std::string_view standard_input = {},
-        const bool keep_standard_input_open = false)
+        const bool keep_standard_input_open = false,
+        const bool interactive_terminal = false,
+        const int human_terminal = -1)
     {
+        if (interactive_terminal) {
+            terminal_ = std::make_unique<InteractiveTerminal>(human_terminal);
+            if (!terminal_->valid()) return false;
+        }
         int input_pipe[2]{-1, -1};
         int output_pipe[2]{-1, -1};
         int error_pipe[2]{-1, -1};
@@ -817,9 +977,11 @@ public:
             return false;
         }
         if (child == 0) {
-            if (dup2(input_pipe[0], STDIN_FILENO) == -1
-                || dup2(output_pipe[1], STDOUT_FILENO) == -1
-                || dup2(error_pipe[1], STDERR_FILENO) == -1) {
+            if (terminal_) {
+                if (!terminal_->enter_in_child()) _exit(126);
+            } else if (dup2(input_pipe[0], STDIN_FILENO) == -1
+                       || dup2(output_pipe[1], STDOUT_FILENO) == -1
+                       || dup2(error_pipe[1], STDERR_FILENO) == -1) {
                 _exit(126);
             }
             close_pipes(input_pipe, output_pipe, error_pipe);
@@ -836,15 +998,25 @@ public:
             _exit(errno == ENOENT ? 127 : 126);
         }
         pid_ = child;
-        input_.reset(input_pipe[1]);
         output_.reset(output_pipe[0]);
         error_.reset(error_pipe[0]);
+        if (terminal_) {
+            (void)close(input_pipe[1]);
+            terminal_->close_child_side();
+            input_.reset(terminal_->duplicate_master());
+            output_.reset(terminal_->duplicate_master());
+            error_.reset();
+            pending_workload_input_ = standard_input;
+        } else {
+            input_.reset(input_pipe[1]);
+        }
         (void)fcntl(output_.get(), F_SETFL, O_NONBLOCK);
         (void)fcntl(error_.get(), F_SETFL, O_NONBLOCK);
         (void)close(input_pipe[0]);
         (void)close(output_pipe[1]);
         (void)close(error_pipe[1]);
-        if (!standard_input.empty()) {
+        if (input_.get() == -1 || output_.get() == -1) return false;
+        if (!terminal_ && !standard_input.empty()) {
             std::size_t written{};
             while (written < standard_input.size()) {
                 const ssize_t amount{write(
@@ -860,7 +1032,7 @@ public:
                 }
             }
         }
-        if (!keep_standard_input_open) {
+        if (!keep_standard_input_open && !terminal_) {
             input_.reset();
         }
         return true;
@@ -894,6 +1066,7 @@ public:
     {
         const auto deadline{std::chrono::steady_clock::now() + timeout};
         while (std::chrono::steady_clock::now() < deadline) {
+            if (terminal_ && !read_stdout(stdout_text)) return false;
             const std::size_t found{stdout_text.find(marker, search_after)};
             if (found != std::string::npos
                 && stdout_text.find('\n', found) != std::string::npos) {
@@ -906,14 +1079,14 @@ public:
             int ready{};
             do {
                 ready = poll(descriptors, 2,
-                             static_cast<int>(std::max<std::int64_t>(
-                                 0, remaining.count())));
+                             poll_interval(remaining));
             } while (ready == -1 && errno == EINTR);
+            if (ready == 0 && terminal_) continue;
             if (ready <= 0) {
                 break;
             }
             if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0
-                && !read_available(output_.get(), stdout_text)) {
+                && !read_stdout(stdout_text)) {
                 return false;
             }
             if ((descriptors[1].revents & (POLLIN | POLLHUP)) != 0
@@ -936,37 +1109,9 @@ public:
     {
         const auto deadline{std::chrono::steady_clock::now() + timeout};
         bool udp_seen{};
+        bool output_closed{};
         while (std::chrono::steady_clock::now() < deadline) {
-            pollfd descriptors[3]{{output_.get(), POLLIN, 0},
-                                  {error_.get(), POLLIN, 0},
-                                  {udp_descriptor, POLLIN, 0}};
-            const auto remaining{std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - std::chrono::steady_clock::now())};
-            int polled{};
-            do {
-                polled = poll(
-                    descriptors,
-                    3,
-                    static_cast<int>(std::max<std::int64_t>(0, remaining.count())));
-            } while (polled == -1 && errno == EINTR);
-            if (polled <= 0) {
-                return false;
-            }
-            if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0
-                && !read_available(output_.get(), stdout_text)) {
-                return false;
-            }
-            if ((descriptors[1].revents & (POLLIN | POLLHUP)) != 0
-                && !read_available(error_.get(), stderr_text)) {
-                return false;
-            }
-            if ((descriptors[2].revents & POLLIN) != 0) {
-                udp_seen = echo_one_datagram(udp_descriptor, token);
-                if (!udp_seen) {
-                    return false;
-                }
-                host_peer_received_datagram = true;
-            }
+            if (terminal_ && !read_stdout(stdout_text)) return false;
             const std::string expected_line{
                 std::string{ready_prefix} + std::string{token} + ':'};
             const std::string expected_udp_line{
@@ -975,7 +1120,8 @@ public:
             const std::size_t udp_result_at{stdout_text.find(expected_udp_line)};
             if (ready_at != std::string::npos
                 && stdout_text.find(probe_stdout) != std::string::npos
-                && stderr_text.find(probe_stderr) != std::string::npos
+                && (terminal_ ? stdout_text : stderr_text).find(probe_stderr)
+                    != std::string::npos
                 && udp_result_at != std::string::npos) {
                 const std::size_t value_start{ready_at + expected_line.size()};
                 const std::size_t value_end{stdout_text.find('\n', value_start)};
@@ -999,9 +1145,42 @@ public:
                             value_start, value_end - value_start),
                         session_inode);
             }
-            if ((descriptors[0].revents & POLLHUP) != 0
-                && (descriptors[1].revents & POLLHUP) != 0) {
+            if (output_closed) return false;
+            pollfd descriptors[3]{{output_.get(), POLLIN, 0},
+                                  {error_.get(), POLLIN, 0},
+                                  {udp_descriptor, POLLIN, 0}};
+            const auto remaining{std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now())};
+            int polled{};
+            do {
+                polled = poll(
+                    descriptors,
+                    3,
+                    poll_interval(remaining));
+            } while (polled == -1 && errno == EINTR);
+            if (polled == 0 && terminal_) continue;
+            if (polled <= 0) {
                 return false;
+            }
+            if ((descriptors[0].revents & (POLLIN | POLLHUP)) != 0
+                && !read_stdout(stdout_text)) {
+                return false;
+            }
+            if ((descriptors[1].revents & (POLLIN | POLLHUP)) != 0
+                && !read_available(error_.get(), stderr_text)) {
+                return false;
+            }
+            if ((descriptors[2].revents & POLLIN) != 0) {
+                udp_seen = echo_one_datagram(udp_descriptor, token);
+                if (!udp_seen) {
+                    return false;
+                }
+                host_peer_received_datagram = true;
+            }
+            if ((descriptors[0].revents & POLLHUP) != 0
+                && (terminal_ || (descriptors[1].revents & POLLHUP) != 0)) {
+                // Parse all bytes just received before rejecting a closed peer.
+                output_closed = true;
             }
         }
         return false;
@@ -1015,7 +1194,7 @@ public:
     {
         const auto deadline{std::chrono::steady_clock::now() + timeout};
         while (std::chrono::steady_clock::now() < deadline) {
-            (void)read_available(output_.get(), stdout_text);
+            if (!read_stdout(stdout_text)) return std::nullopt;
             (void)read_available(error_.get(), stderr_text);
             if (session_namespace_inode != nullptr
                 && *session_namespace_inode == 0) {
@@ -1111,8 +1290,31 @@ private:
         }
     }
 
+    [[nodiscard]] int poll_interval(const std::chrono::milliseconds remaining) const
+    {
+        const auto bounded{std::max<std::int64_t>(0, remaining.count())};
+        return static_cast<int>(terminal_ ? std::min<std::int64_t>(50, bounded) : bounded);
+    }
+
+    [[nodiscard]] bool read_stdout(std::string& destination)
+    {
+        if (terminal_) {
+            if (!terminal_->service(destination)) return false;
+        } else if (!read_available(output_.get(), destination)) {
+            return false;
+        }
+        if (!pending_workload_input_.empty()
+            && destination.find(stdin_ready_prefix) != std::string::npos) {
+            // Send probe data only after the helper has completed preparation.
+            if (!write_input(pending_workload_input_)) return false;
+            pending_workload_input_.clear();
+        }
+        return true;
+    }
+
     static bool read_available(const int descriptor, std::string& destination)
     {
+        if (descriptor == -1) return true;
         char buffer[4096]{};
         while (true) {
             const ssize_t size{read(descriptor, buffer, sizeof(buffer))};
@@ -1174,6 +1376,8 @@ private:
         pid_ = -1;
     }
 
+    std::unique_ptr<InteractiveTerminal> terminal_;
+    std::string pending_workload_input_;
     pid_t pid_{-1};
     Descriptor input_;
     Descriptor output_;
@@ -1506,6 +1710,12 @@ public:
                 "/netlaglab-session-qualification/nonexistent-program"};
     }
 
+    [[nodiscard]] bool interactive_requested() const
+    {
+        const char* setting{std::getenv("NETLAGLAB_QUALIFICATION_INTERACTIVE")};
+        return setting != nullptr && std::string_view{setting} == "1";
+    }
+
     [[nodiscard]] bool launch_and_wait_for_probe(
         ChildProcess& process,
         const std::string_view mode,
@@ -1517,7 +1727,8 @@ public:
         const std::chrono::milliseconds timeout = 20000ms) const
     {
         if (!process.start(
-                run_arguments(mode), work_directory(), std::string{stdin_value} + "\n")) {
+                run_arguments(mode), work_directory(), std::string{stdin_value} + "\n",
+                false, interactive_requested())) {
             return false;
         }
         return process.wait_for_ready(
@@ -1528,7 +1739,7 @@ public:
             session_inode,
             host_peer_received_datagram,
             udp_exchange_succeeded,
-            timeout);
+            interactive_requested() ? std::max(timeout, 70000ms) : timeout);
     }
 
     [[nodiscard]] bool launch_shaping_session(
@@ -1541,12 +1752,13 @@ public:
     {
         if (!process.start(
                 run_arguments("shaping"), work_directory(),
-                std::string{stdin_value} + "\n", true)) {
+                std::string{stdin_value} + "\n", true, interactive_requested())) {
             return false;
         }
         return process.wait_for_ready(
             udp_descriptor(), token_, stdout_text, stderr_text, session_inode,
-            host_peer_received_datagram, udp_exchange_succeeded);
+            host_peer_received_datagram, udp_exchange_succeeded,
+            interactive_requested() ? 70000ms : 20000ms);
     }
 
 private:
@@ -1558,6 +1770,117 @@ private:
     std::unique_ptr<ScopedEnvironment> environment_;
     bool valid_{};
 };
+
+
+[[nodiscard]] int run_terminal_probe()
+{
+    using netlaglab::network_environment::detail::FirewallConsentResult;
+    const auto platform{netlaglab::network_environment::detail::make_linux_production_platform()};
+    const auto consent{platform->request_firewall_consent(
+        "test rule (no firewall mutation)", std::chrono::steady_clock::now() + 4s)};
+    switch (consent) {
+    case FirewallConsentResult::declined: return 94;
+    case FirewallConsentResult::timed_out: return 93;
+    case FirewallConsentResult::terminal_unavailable: return 91;
+    case FirewallConsentResult::io_failure: return 92;
+    case FirewallConsentResult::granted: break;
+    }
+    std::cout << stdin_ready_prefix << "terminal\n" << std::flush;
+    std::string input;
+    if (!std::getline(std::cin, input) || input != stdin_value) return 95;
+    std::cout << "TERMINAL_TRANSPORT_OK\n" << std::flush;
+    return 0;
+}
+
+TEST(SessionTerminalTransport, RelaysConsentAndDeclineBeforeSendingWorkloadInput)
+{
+    const std::vector<std::pair<std::string, int>> replies{{"y\n", 0}, {"n\n", 94}};
+    for (const auto& [reply, expected_status] : replies) {
+        SCOPED_TRACE(expected_status == 0 ? "consent" : "decline");
+        PseudoTerminal human;
+        ASSERT_TRUE(human.valid());
+        ChildProcess child;
+        ASSERT_TRUE(child.start(
+            {NETLAGLAB_SESSION_PROBE_PATH, "--terminal-probe"},
+            std::filesystem::current_path(), std::string{stdin_value} + "\n",
+            true, true, human.slave()));
+        std::atomic<bool> answered{};
+        std::atomic<bool> finished{};
+        std::thread person{[&]() {
+            std::string visible;
+            const auto deadline{std::chrono::steady_clock::now() + 3s};
+            while (!finished.load() && std::chrono::steady_clock::now() < deadline) {
+                pollfd descriptor{human.master(), POLLIN, 0};
+                if (poll(&descriptor, 1, 20) <= 0) continue;
+                char buffer[256]{};
+                const ssize_t count{read(human.master(), buffer, sizeof(buffer))};
+                if (count <= 0) continue;
+                visible.append(buffer, static_cast<std::size_t>(count));
+                if (visible.find("Apply it? [y/N]") != std::string::npos) {
+                    answered.store(write(human.master(), reply.data(), reply.size())
+                                   == static_cast<ssize_t>(reply.size()));
+                    return;
+                }
+            }
+        }};
+        std::string output;
+        std::string error;
+        const auto status{child.wait_for_exit(output, error, 5000ms)};
+        finished.store(true);
+        person.join();
+        EXPECT_TRUE(answered.load()) << "the person did not see the live prompt";
+        ASSERT_TRUE(status.has_value()) << error << output;
+        EXPECT_EQ(*status, expected_status) << error << output;
+        if (expected_status == 0) {
+            EXPECT_NE(output.find("TERMINAL_TRANSPORT_OK"), std::string::npos) << output;
+        } else {
+            EXPECT_EQ(output.find("TERMINAL_TRANSPORT_OK"), std::string::npos) << output;
+        }
+    }
+}
+
+
+TEST(SessionTerminalTransport, AcceptsReadinessDeliveredWithProcessHangup)
+{
+    for (const bool interactive : {false, true}) {
+        SCOPED_TRACE(interactive ? "terminal" : "pipes");
+        PseudoTerminal human;
+        ASSERT_TRUE(human.valid());
+        ChildProcess child;
+        ASSERT_TRUE(child.start(
+            {NETLAGLAB_SESSION_PROBE_PATH, "--readiness-probe"},
+            std::filesystem::current_path(), {}, false, interactive, human.slave()));
+        // Observe exit without reaping, so readiness bytes and HUP are
+        // deterministically waiting for the receiver in the same iteration.
+        siginfo_t exited{};
+        const auto exit_deadline{std::chrono::steady_clock::now() + 1s};
+        do {
+            ASSERT_EQ(waitid(P_PID, child.pid(), &exited,
+                             WEXITED | WNOWAIT | WNOHANG), 0);
+            if (exited.si_pid != 0) break;
+            (void)poll(nullptr, 0, 5);
+        } while (std::chrono::steady_clock::now() < exit_deadline);
+        ASSERT_EQ(exited.si_pid, child.pid()) << "readiness probe did not exit";
+        ASSERT_EQ(exited.si_status, 37);
+        const int udp{socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)};
+        ASSERT_NE(udp, -1);
+        std::string output;
+        std::string error;
+        std::uint64_t inode{};
+        bool peer_received{};
+        bool exchanged{};
+        const bool ready{child.wait_for_ready(
+            udp, "closed-probe", output, error, inode, peer_received, exchanged, 1000ms)};
+        (void)close(udp);
+        EXPECT_TRUE(ready) << error << output;
+        EXPECT_EQ(inode, 12345U);
+        EXPECT_FALSE(exchanged);
+        EXPECT_FALSE(peer_received);
+        const auto status{child.wait_for_exit(output, error, 1000ms)};
+        ASSERT_TRUE(status.has_value());
+        EXPECT_EQ(*status, 37);
+    }
+}
 
 [[nodiscard]] bool has_authorization()
 {
@@ -1863,7 +2186,8 @@ TEST(SessionShapingQualification, MeasuresLiveDirectionalChangesAndCleanup)
         "DNS preflight failed: resolver must list one to three reachable IPv4 "
         "nameservers"};
     if (!session_ready
-        && error.find(unsupported_resolver) != std::string::npos) {
+        && (error.find(unsupported_resolver) != std::string::npos
+            || output.find(unsupported_resolver) != std::string::npos)) {
         ASSERT_TRUE(startup_status.has_value())
             << "Session did not exit after rejecting the host resolver\n"
             << error << output;
@@ -2240,11 +2564,14 @@ TEST(SessionNetworkQualification, FailedExecPreservesLookupStatusAndCleansTopolo
     std::uint64_t session_inode{};
     ActiveSessionCleanup cleanup{session, scenario, session_inode};
     ASSERT_TRUE(session.start(
-        scenario.failed_exec_arguments(), scenario.work_directory()));
+        scenario.failed_exec_arguments(), scenario.work_directory(), {}, false,
+        scenario.interactive_requested()));
     std::string output;
     std::string error;
     const std::optional<int> status{
-        session.wait_for_exit(output, error, 30000ms, &session_inode)};
+        session.wait_for_exit(output, error,
+                              scenario.interactive_requested() ? 70000ms : 30000ms,
+                              &session_inode)};
     ASSERT_TRUE(status.has_value()) << "failed-exec Session did not finish\n" << error;
     EXPECT_EQ(*status, 127) << error;
     EXPECT_NE(session_inode, 0U)
@@ -2259,6 +2586,15 @@ int main(int argc, char* argv[])
 {
     if (argc > 1 && std::string_view{argv[1]} == "--probe") {
         return run_workload_probe(argc, argv);
+    }
+    if (argc == 2 && std::string_view{argv[1]} == "--terminal-probe") {
+        return run_terminal_probe();
+    }
+    if (argc == 2 && std::string_view{argv[1]} == "--readiness-probe") {
+        std::cout << ready_prefix << "closed-probe:12345\n" << probe_stdout
+                  << udp_result_prefix << "closed-probe:unavailable\n" << std::flush;
+        std::cerr << probe_stderr << std::flush;
+        return 37;
     }
     testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
