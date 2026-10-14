@@ -141,6 +141,8 @@ TEST(WorkloadProcessTest, ResolverViewSetupFailurePreventsExec)
 
     EXPECT_FALSE(launch.process.has_value());
     EXPECT_EQ(launch.failure_exit_code, 125);
+    EXPECT_NE(launch.failure.find("resolver view setup at "), std::string::npos);
+    EXPECT_NE(launch.failure.find("errno "), std::string::npos);
 }
 
 TEST(WorkloadProcessTest, ExplicitlyRedirectsWorkloadStandardOutput)

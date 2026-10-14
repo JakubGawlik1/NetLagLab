@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-10-12
+Last verified: 2026-10-14
 
 ## How to use this file
 
@@ -91,7 +91,9 @@ cross-platform support are not current goals.
   host's mount namespace.
 - The helper snapshots supported host IPv4 resolver settings, rejects
   unsupported resolver behavior, and creates sealed resolver/NSS files. The
-  Workload mounts them read-only in a private mount namespace before restoring
+  Workload materializes mountable copies on a bounded private tmpfs, unlinks their
+  source names after read-only bind mounts, and reports setup step/errno on failure.
+  It performs this in a private mount namespace before restoring
   invoking credentials. The production Network Environment requires host IPv4
   forwarding to be already enabled, creates source-scoped NAT in a unique
   nftables table, and supports scoped UFW or firewalld policy changes after

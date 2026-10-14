@@ -72,14 +72,32 @@ namespace {
     return candidates;
 }
 
+enum class ResolverSetupStep { none, mount_namespace, private_storage, snapshot_copy, resolver_mount, nsswitch_mount };
+
+[[nodiscard]] const char* resolver_step_name(const ResolverSetupStep step)
+{
+    switch (step) {
+    case ResolverSetupStep::mount_namespace: return "private mount namespace";
+    case ResolverSetupStep::private_storage: return "private DNS storage";
+    case ResolverSetupStep::snapshot_copy: return "DNS snapshot copy";
+    case ResolverSetupStep::resolver_mount: return "resolv.conf mount";
+    case ResolverSetupStep::nsswitch_mount: return "nsswitch.conf mount";
+    case ResolverSetupStep::none: return "unknown";
+    }
+    return "unknown";
+}
+
 [[noreturn]] void report_child_failure_and_exit(
     const int descriptor,
-    const int exit_code)
+    const int exit_code,
+    const ResolverSetupStep step = ResolverSetupStep::none,
+    const int error_number = errno)
 {
-    const char* data{reinterpret_cast<const char*>(&exit_code)};
+    const std::array<int, 3> failure{exit_code, error_number, static_cast<int>(step)};
+    const char* data{reinterpret_cast<const char*>(failure.data())};
     std::size_t written{};
-    while (written < sizeof(exit_code)) {
-        const ssize_t result{write(descriptor, data + written, sizeof(exit_code) - written)};
+    while (written < sizeof(failure)) {
+        const ssize_t result{write(descriptor, data + written, sizeof(failure) - written)};
         if (result > 0) {
             written += static_cast<std::size_t>(result);
         } else if (result == -1 && errno == EINTR) {
@@ -107,9 +125,8 @@ namespace {
     const char* const target)
 {
     struct stat status {};
-    if (stat(target, &status) == -1 || !S_ISREG(status.st_mode)) {
-        return false;
-    }
+    if (stat(target, &status) == -1) return false;
+    if (!S_ISREG(status.st_mode)) { errno = EINVAL; return false; }
     const std::string source{"/proc/self/fd/" + std::to_string(descriptor)};
     if (mount(source.c_str(), target, nullptr, MS_BIND, nullptr) == -1) {
         return false;
@@ -123,16 +140,44 @@ namespace {
            == 0;
 }
 
-[[nodiscard]] bool install_resolver_view(const WorkloadResolverView& view)
+[[nodiscard]] bool install_resolver_view(
+    const WorkloadResolverView& view, ResolverSetupStep& step, int& failure_errno)
 {
+    const auto fail = [&]() { failure_errno = errno; return false; };
+    step = ResolverSetupStep::mount_namespace;
     if (unshare(CLONE_NEWNS) == -1
-        || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1) {
-        return false;
+        || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == -1) return fail();
+
+    step = ResolverSetupStep::private_storage;
+    constexpr const char* storage_path{"/run/netlaglab"};
+    FileDescriptor original{open(storage_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+    if (original.get() == -1) return fail();
+    struct stat status{};
+    if (fstat(original.get(), &status) == -1) return fail();
+    if (status.st_uid != 0 || (status.st_mode & 0777) != 0755) {
+        errno = EACCES;
+        return fail();
     }
-    return mount_read_only_snapshot(
-               view.resolv_conf_descriptor(), "/etc/resolv.conf")
-           && mount_read_only_snapshot(
-               view.nsswitch_conf_descriptor(), "/etc/nsswitch.conf");
+    // This shadows only the helper's runtime directory, in the child's private
+    // mount namespace. No source pathname is ever created on the host filesystem.
+    if (mount("tmpfs", storage_path, "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC,
+              "size=64k,nr_inodes=8,mode=0700") == -1) return fail();
+    FileDescriptor storage{open(storage_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+    if (storage.get() == -1) return fail();
+    step = ResolverSetupStep::snapshot_copy;
+    FileDescriptor resolver{materialize_resolver_snapshot(
+        view.resolv_conf_descriptor(), storage.get(), ResolverSnapshotFile::resolv_conf)};
+    if (resolver.get() == -1) return fail();
+    FileDescriptor nsswitch{materialize_resolver_snapshot(
+        view.nsswitch_conf_descriptor(), storage.get(), ResolverSnapshotFile::nsswitch_conf)};
+    if (nsswitch.get() == -1) return fail();
+    step = ResolverSetupStep::resolver_mount;
+    if (!mount_read_only_snapshot(resolver.get(), "/etc/resolv.conf")) return fail();
+    if (unlinkat(storage.get(), "resolv.conf", 0) == -1) return fail();
+    step = ResolverSetupStep::nsswitch_mount;
+    if (!mount_read_only_snapshot(nsswitch.get(), "/etc/nsswitch.conf")) return fail();
+    if (unlinkat(storage.get(), "nsswitch.conf", 0) == -1) return fail();
+    return true;
 }
 
 } // namespace
@@ -274,8 +319,11 @@ WorkloadLaunchResult launch_workload(
         if (namespace_entry != nullptr && !namespace_entry->enter()) {
             report_child_failure_and_exit(error_writer.get(), 125);
         }
-        if (resolver_view != nullptr && !install_resolver_view(*resolver_view)) {
-            report_child_failure_and_exit(error_writer.get(), 125);
+        ResolverSetupStep resolver_step{ResolverSetupStep::none};
+        int resolver_errno{};
+        if (resolver_view != nullptr
+            && !install_resolver_view(*resolver_view, resolver_step, resolver_errno)) {
+            report_child_failure_and_exit(error_writer.get(), 125, resolver_step, resolver_errno);
         }
 
         struct sigaction default_action {};
@@ -344,19 +392,19 @@ WorkloadLaunchResult launch_workload(
     }
 
     error_writer.reset();
-    int failure_exit_code{};
-    char* data{reinterpret_cast<char*>(&failure_exit_code)};
+    std::array<int, 3> child_failure{};
+    char* data{reinterpret_cast<char*>(child_failure.data())};
     std::size_t received{};
-    while (received < sizeof(failure_exit_code)) {
+    while (received < sizeof(child_failure)) {
         const ssize_t result{read(
-            error_reader.get(), data + received, sizeof(failure_exit_code) - received)};
+            error_reader.get(), data + received, sizeof(child_failure) - received)};
         if (result > 0) {
             received += static_cast<std::size_t>(result);
         } else if (result == 0) {
             break;
         } else if (errno != EINTR) {
             received = 1;
-            failure_exit_code = 125;
+            child_failure[0] = 125;
             break;
         }
     }
@@ -368,10 +416,18 @@ WorkloadLaunchResult launch_workload(
     int status{};
     while (waitpid(child_pid, &status, 0) == -1 && errno == EINTR) {
     }
-    if (received != sizeof(failure_exit_code)) {
-        failure_exit_code = 125;
+    if (received != sizeof(child_failure)) {
+        child_failure[0] = 125;
     }
-    return {.process = std::nullopt, .failure_exit_code = failure_exit_code};
+    std::string failure;
+    if (received == sizeof(child_failure) && child_failure[2] != 0) {
+        failure = std::string{"resolver view setup at "}
+            + resolver_step_name(static_cast<ResolverSetupStep>(child_failure[2]))
+            + ": " + std::strerror(child_failure[1])
+            + " (errno " + std::to_string(child_failure[1]) + ")";
+    }
+    return {.process = std::nullopt, .failure_exit_code = child_failure[0],
+            .failure = std::move(failure)};
 }
 
 } // namespace netlaglab

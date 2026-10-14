@@ -69,6 +69,7 @@ private:
 struct WorkloadLaunchResult {
     std::optional<WorkloadProcess> process;
     int failure_exit_code{};
+    std::string failure{};
 };
 
 [[nodiscard]] WorkloadLaunchResult launch_workload(

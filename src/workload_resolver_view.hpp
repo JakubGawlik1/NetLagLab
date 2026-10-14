@@ -44,6 +44,12 @@ private:
     FileDescriptor nsswitch_conf_;
 };
 
+enum class ResolverSnapshotFile { resolv_conf, nsswitch_conf };
+
+// Materialize a sealed snapshot in a trusted private directory for bind mount.
+[[nodiscard]] FileDescriptor materialize_resolver_snapshot(
+    int sealed_source, int directory, ResolverSnapshotFile file);
+
 struct WorkloadResolverViewResult {
     std::optional<WorkloadResolverView> view;
     std::string failure;

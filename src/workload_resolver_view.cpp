@@ -381,6 +381,61 @@ int WorkloadResolverView::nsswitch_conf_descriptor() const noexcept
     return nsswitch_conf_.get();
 }
 
+FileDescriptor materialize_resolver_snapshot(
+    const int sealed_source, const int directory, const ResolverSnapshotFile file)
+{
+    struct stat directory_status{};
+    struct stat source_status{};
+    constexpr int required_seals{F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE};
+    if (fstat(directory, &directory_status) == -1 || fstat(sealed_source, &source_status) == -1) {
+        return FileDescriptor{-1};
+    }
+    const int seals{fcntl(sealed_source, F_GET_SEALS)};
+    if (!S_ISDIR(directory_status.st_mode) || directory_status.st_uid != geteuid()
+        || (directory_status.st_mode & 0022) != 0 || !S_ISREG(source_status.st_mode)
+        || source_status.st_size < 0
+        || static_cast<std::uint64_t>(source_status.st_size) > maximum_file_size
+        || seals == -1 || (seals & required_seals) != required_seals) {
+        errno = EINVAL;
+        return FileDescriptor{-1};
+    }
+    const char* name{};
+    switch (file) {
+    case ResolverSnapshotFile::resolv_conf: name = "resolv.conf"; break;
+    case ResolverSnapshotFile::nsswitch_conf: name = "nsswitch.conf"; break;
+    }
+    if (name == nullptr) { errno = EINVAL; return FileDescriptor{-1}; }
+    FileDescriptor copy{openat(directory, name,
+        O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600)};
+    if (copy.get() == -1) return copy;
+    const auto fail = [&]() {
+        const int failure{errno};
+        copy.reset();
+        (void)unlinkat(directory, name, 0);
+        errno = failure;
+        return FileDescriptor{-1};
+    };
+    std::array<char, 4096> buffer{};
+    off_t offset{};
+    while (offset < source_status.st_size) {
+        const auto wanted{std::min<std::size_t>(buffer.size(), source_status.st_size - offset)};
+        const ssize_t count{pread(sealed_source, buffer.data(), wanted, offset)};
+        if (count == -1 && errno == EINTR) continue;
+        if (count <= 0) { if (count == 0) errno = EIO; return fail(); }
+        std::size_t written{};
+        while (written < static_cast<std::size_t>(count)) {
+            const ssize_t result{write(copy.get(), buffer.data() + written,
+                                      static_cast<std::size_t>(count) - written)};
+            if (result == -1 && errno == EINTR) continue;
+            if (result <= 0) { if (result == 0) errno = EIO; return fail(); }
+            written += static_cast<std::size_t>(result);
+        }
+        offset += count;
+    }
+    if (fchmod(copy.get(), 0444) == -1) return fail();
+    return copy;
+}
+
 WorkloadResolverViewResult create_workload_resolver_view(
     const ResolverViewConfiguration& configuration)
 {

@@ -27,7 +27,12 @@ source-scoped NAT, and requires host IPv4 forwarding to be enabled. With active
 UFW or firewalld, the helper displays the exact temporary exception on the
 controlling terminal; type `y` and Enter within 30 seconds to approve it.
 Declining, timing out, or lacking a terminal prevents launch with a specific
-diagnostic. Live shaping is available after activation. A preparation or
+diagnostic. DNS/NSS snapshots are copied from sealed files into a private
+64 KiB tmpfs under the helper runtime directory, then bind-mounted read-only
+over the application's resolver files. Source names are removed after binding;
+no snapshot file is created on the host filesystem. A failed setup reports
+the resolver step and errno, prevents exec, and leaves cleanup to the normal
+Session failure path. Live shaping is available after activation. A preparation or
 namespace-entry failure prevents Workload execution; cleanup is reported
 separately. Production DNS/TCP/UDP Internet behavior remains unqualified.
 
