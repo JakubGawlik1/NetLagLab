@@ -210,20 +210,29 @@ std::optional<std::string> make_resolver_snapshot(
         const std::vector<std::string_view> tokens{words(line)};
         if (!tokens.empty()) {
             if (tokens.front() == "nameserver") {
-                in_addr address{};
-                if (tokens.size() != 2U
-                    || inet_pton(AF_INET,
-                                 std::string{tokens[1]}.c_str(), &address)
-                           != 1
-                    || !routable_resolver_address(address) || nameservers == 3U) {
-                    failure = "resolver must list one to three reachable IPv4 nameservers; "
-                              "host-local and unsupported addresses are refused";
+                if (tokens.size() != 2U) {
+                    failure = "nameserver must contain exactly one IP address";
                     return std::nullopt;
                 }
-                snapshot += "nameserver ";
-                snapshot.append(tokens[1]);
-                snapshot.push_back('\n');
-                ++nameservers;
+                const std::string text{tokens[1]};
+                in_addr address{};
+                in6_addr ipv6_address{};
+                if (inet_pton(AF_INET, text.c_str(), &address) == 1) {
+                    if (!routable_resolver_address(address) || nameservers == 3U) {
+                        failure = "resolver must list one to three reachable IPv4 nameservers; "
+                                  "host-local and unsupported addresses are refused";
+                        return std::nullopt;
+                    }
+                    snapshot += "nameserver ";
+                    snapshot += text;
+                    snapshot.push_back('\n');
+                    ++nameservers;
+                } else if (inet_pton(AF_INET6, text.c_str(), &ipv6_address) != 1) {
+                    failure = "nameserver contains an invalid IP address";
+                    return std::nullopt;
+                }
+                // The Session has IPv4 connectivity only. Valid IPv6 entries
+                // do not invalidate usable IPv4 resolvers in the same host file.
             } else if (tokens.front() == "search" || tokens.front() == "domain") {
                 if (search_seen || tokens.size() < 2U || tokens.size() > 7U) {
                     failure = "resolver search configuration must contain at most six domains";

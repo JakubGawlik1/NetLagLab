@@ -592,7 +592,7 @@ int run_session(char* const child_arguments[], std::ostream& error)
     }
 
     error << "NetLagLab: root privileges are required for the isolated Session helper. "
-             "A future network backend may separately request confirmation for an exact "
+             "The helper may separately request confirmation for an exact temporary "
              "firewall exception.\n";
     const std::optional<pid_t> helper_launcher_pid{spawn_helper(*paths, error)};
     if (!helper_launcher_pid.has_value()) {

@@ -95,11 +95,35 @@ TEST(WorkloadResolverViewTest, BuildsBoundedIpv4ResolverSnapshot)
         "options timeout:2 attempts:2\n");
 }
 
+TEST(WorkloadResolverViewTest, SelectsIpv4ResolversFromMixedHostConfiguration)
+{
+    std::string failure;
+    const auto snapshot{make_resolver_snapshot(
+        "# NetworkManager\nsearch home play.pl\n"
+        "nameserver 2001:db8::53\n"
+        "nameserver 192.0.2.53\n"
+        "nameserver 2001:db8::54\n"
+        "nameserver 192.0.2.54\n"
+        "options timeout:2 attempts:2\n",
+        failure)};
+
+    ASSERT_TRUE(snapshot.has_value()) << failure;
+    EXPECT_EQ(*snapshot,
+        "search home play.pl\n"
+        "nameserver 192.0.2.53\n"
+        "nameserver 192.0.2.54\n"
+        "options timeout:2 attempts:2\n");
+}
+
 TEST(WorkloadResolverViewTest, RejectsHostOnlyAndNonIpv4Resolvers)
 {
     std::string failure;
     EXPECT_FALSE(make_resolver_snapshot("nameserver 127.0.0.53\n", failure));
     EXPECT_FALSE(make_resolver_snapshot("nameserver 2001:db8::53\n", failure));
+    EXPECT_FALSE(make_resolver_snapshot(
+        "nameserver 192.0.2.53\nnameserver not:an:address\n", failure));
+    EXPECT_FALSE(make_resolver_snapshot(
+        "nameserver 192.0.2.53\nnameserver 2001:db8::53 extra\n", failure));
     EXPECT_FALSE(failure.empty());
 }
 
