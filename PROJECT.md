@@ -1,6 +1,6 @@
 # NetLagLab project context
 
-Last verified: 2026-10-14
+Last verified: 2026-10-15
 
 ## How to use this file
 
@@ -59,8 +59,8 @@ cross-platform support are not current goals.
   Natural exit also verified its exit result and cleanup, then skipped the UDP
   exchange assertion because the packet reached `nll-host` but no reply reached
   the host peer. This is a recorded host receive-path limitation, not a passing
-  UDP qualification; no firewall changes were made and DNS/TCP/UDP connectivity
-  has not been qualified. See `docs/architecture/mvp-implementation-audit.md`
+  UDP qualification; no firewall changes were made in that run, and it did
+  not qualify DNS/TCP/UDP connectivity. See `docs/architecture/mvp-implementation-audit.md`
   for the run result.
 - `netlaglab run -- <program> [arguments...]` transports a bounded execution
   context to the helper, which launches one child without a shell, supervises
@@ -87,10 +87,11 @@ cross-platform support are not current goals.
   host-wide lock, signalling, and reaping.
 - The Workload receives the original bounded argv/environment/cwd snapshot,
   invoking UID/GID/supplementary groups, and explicit standard-descriptor
-  semantics. It enters the exact Session network namespace while retaining the
-  host's mount namespace.
-- The helper snapshots supported host IPv4 resolver settings, rejects
-  unsupported resolver behavior, and creates sealed resolver/NSS files. The
+  semantics. It enters the exact Session network namespace and a private mount namespace
+  for the resolver view.
+- The helper selects IPv4 resolver servers from supported IPv4-only or mixed
+  IPv4/IPv6 host settings, rejects configurations without a usable IPv4 server
+  and unsupported resolver behavior, and creates sealed resolver/NSS files. The
   Workload materializes mountable copies on a bounded private tmpfs, unlinks their
   source names after read-only bind mounts, and reports setup step/errno on failure.
   It performs this in a private mount namespace before restoring
@@ -101,13 +102,21 @@ cross-platform support are not current goals.
   distinct refusal diagnostics. A root-owned durable journal records mutation
   phases and is reconciled under the host lock before fixed-name preflight.
   Scripted, filesystem, helper, and Workload tests cover the unprivileged
-  contracts; end-to-end DNS/TCP/UDP behavior remains unqualified.
+  contracts. On 2026-10-14, a user-run production Session with active UFW
+  and the host's mixed DNS configuration completed an IPv4 HTTPS request to
+  `example.com` (HTTP 200, 0.192196 s), then reported Workload exit 0 without
+  an infrastructure failure. This confirms name resolution and HTTPS for that
+  host; separate UDP and broader host configurations remain unqualified.
 - Live outbound and inbound delay, jitter, and packet loss are applied with
   `tc/netem` to proven Session links. Deterministic tests cover qdisc decoding,
   confirmation, composition, and rollback. An opt-in integrated qualification
   measures direction, updates, resets, and cleanup against a controlled local
-  UDP peer; it has not yet completed successfully, so production packet
-  behavior remains unqualified. Bandwidth is not implemented.
+  UDP peer; that qualification remains incomplete. On 2026-10-15, a production
+  CLI demonstration confirmed live delay and jitter changes, packet drops,
+  complete traffic loss in either direction, restored HTTPS after resets,
+  Controller reconnection, and clean stop on the current UFW host. This is
+  application-level evidence, not an exact one-way measurement. Results and
+  scope are recorded in `docs/demo.md`. Bandwidth is not implemented.
 
 ## Candidate capabilities
 
@@ -117,7 +126,6 @@ current code whenever work begins.
 
 - Qualify the production Session DNS and scoped Internet connectivity paths
   across supported host resolver and firewall configurations.
-- Apply separate outbound and inbound shaping and allow live profile updates.
 - Record the settings timeline as JSON Lines for replay and reports.
 - Add a GUI over the same typed operations after the CLI/control path supports
   them.

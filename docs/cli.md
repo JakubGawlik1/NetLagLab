@@ -1,5 +1,7 @@
 # Command-line interface
 
+For a short live walkthrough, see [CLI demonstration](demo.md).
+
 ## Run a program
 
 ```text
@@ -21,9 +23,13 @@ the captured argv, environment, working directory, user identity, supplementary 
 standard streams. The helper is the program's direct parent and enters the retained Session
 network namespace in the child before dropping privileges and executing the program.
 
-The Workload can use numeric IPv4 addresses to communicate with the host endpoint at
-`10.200.0.1`. Session preparation also installs an IPv4 resolver view and owned
-source-scoped NAT, and requires host IPv4 forwarding to be enabled. With active
+The host endpoint is reachable at `10.200.0.1`, subject to the host INPUT
+firewall policy. The temporary forwarding exception does not open host services.
+Session preparation also installs an IPv4 resolver view and owned
+source-scoped NAT, and requires host IPv4 forwarding to be enabled. Mixed host
+IPv4/IPv6 DNS configurations use their valid IPv4 servers in the Session; a
+configuration without a usable IPv4 server is refused. Host DNS files are not
+changed. With active
 UFW or firewalld, the helper displays the exact temporary exception on the
 controlling terminal; type `y` and Enter within 30 seconds to approve it.
 Declining, timing out, or lacking a terminal prevents launch with a specific
@@ -34,7 +40,9 @@ no snapshot file is created on the host filesystem. A failed setup reports
 the resolver step and errno, prevents exec, and leaves cleanup to the normal
 Session failure path. Live shaping is available after activation. A preparation or
 namespace-entry failure prevents Workload execution; cleanup is reported
-separately. Production DNS/TCP/UDP Internet behavior remains unqualified.
+separately. A production Session completed name resolution and IPv4 HTTPS with UFW on
+2026-10-14. Separate UDP connectivity and other host configurations remain
+unqualified; see `PROJECT.md` for the recorded scope.
 
 ## Attach a controller
 
