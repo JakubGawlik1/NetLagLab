@@ -1,5 +1,7 @@
 #include "qdisc_inventory.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <linux/netlink.h>
@@ -56,13 +58,14 @@ template<typename Value>
     }
     qdisc.loss_probability = options.loss;
     qdisc.has_unsupported_options = options.limit != 1000U
-        || options.latency != 0U || options.jitter != 0U || options.gap != 0U
+        || options.gap != 0U
         || options.duplicate != 0U;
 
     std::size_t cursor{offset + sizeof(options)};
     std::size_t remaining{length - sizeof(options)};
     bool has_delay{};
     bool has_jitter{};
+    std::array<bool, TCA_NETEM_MAX + 1U> seen{};
     while (remaining != 0U) {
         rtattr attribute{};
         if (!copy_object(bytes, cursor, attribute)
@@ -74,6 +77,10 @@ template<typename Value>
         const std::size_t payload_offset{cursor + RTA_LENGTH(0)};
         const std::uint16_t type{static_cast<std::uint16_t>(
             attribute.rta_type & NLA_TYPE_MASK)};
+        if (type < seen.size() && type != TCA_NETEM_PAD) {
+            if (seen[type]) return false;
+            seen[type] = true;
+        }
         if (type == TCA_NETEM_LATENCY64) {
             if (has_delay || payload_length != sizeof(qdisc.delay_nanoseconds)
                 || !copy_object(bytes, payload_offset, qdisc.delay_nanoseconds)) {
@@ -87,13 +94,52 @@ template<typename Value>
             }
             has_jitter = true;
         } else {
-            qdisc.has_unsupported_options = true;
+            std::optional<std::size_t> expected_size;
+            bool must_be_zero{true};
+            switch (type) {
+            case TCA_NETEM_CORR:
+                expected_size = sizeof(tc_netem_corr);
+                break;
+            case TCA_NETEM_REORDER:
+                expected_size = sizeof(tc_netem_reorder);
+                break;
+            case TCA_NETEM_CORRUPT:
+                expected_size = sizeof(tc_netem_corrupt);
+                break;
+            case TCA_NETEM_RATE:
+                expected_size = sizeof(tc_netem_rate);
+                break;
+            case TCA_NETEM_PRNG_SEED:
+                expected_size = sizeof(std::uint64_t);
+                must_be_zero = false;
+                break;
+            case TCA_NETEM_PAD:
+                expected_size = 0U;
+                must_be_zero = false;
+                break;
+            default:
+                qdisc.has_unsupported_options = true;
+                break;
+            }
+            if (expected_size) {
+                if (payload_length != *expected_size) return false;
+                const auto payload{bytes.subspan(payload_offset, payload_length)};
+                if (must_be_zero && !std::all_of(payload.begin(), payload.end(),
+                        [](const std::byte value) { return value == std::byte{0}; })) {
+                    qdisc.has_unsupported_options = true;
+                }
+            }
         }
         const std::size_t aligned{RTA_ALIGN(attribute.rta_len)};
         if (aligned > remaining) return false;
         cursor += aligned;
         remaining -= aligned;
     }
+    // Kernel dumps include legacy tick values alongside authoritative 64-bit
+    // nanoseconds. Without the latter, nonzero timing cannot be confirmed.
+    qdisc.has_unsupported_options = qdisc.has_unsupported_options
+        || (!has_delay && options.latency != 0U)
+        || (!has_jitter && options.jitter != 0U);
     return true;
 }
 

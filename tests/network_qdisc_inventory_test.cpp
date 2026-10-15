@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -12,6 +13,7 @@
 #include <span>
 #include <string>
 #include <sys/socket.h>
+#include <utility>
 #include <vector>
 
 namespace netlaglab::network_environment::detail {
@@ -48,7 +50,29 @@ void append_attribute(
     append_attribute(bytes, type, std::as_bytes(std::span{&value, std::size_t{1}}));
 }
 
-std::vector<std::byte> netem_root_message()
+std::vector<std::byte> kernel_netem_options()
+{
+    tc_netem_qopt base_options{};
+    base_options.limit = 1000U;
+    base_options.jitter = 156250U; // Legacy ticks also accompany JITTER64 in kernel dumps.
+    base_options.loss = 64424509U; // tc's 1.5% fixed-point value.
+    std::vector<std::byte> options(sizeof(base_options));
+    std::memcpy(options.data(), &base_options, sizeof(base_options));
+    constexpr std::uint64_t zero_delay{};
+    constexpr std::uint64_t ten_milliseconds{10'000'000U};
+    append_attribute(options, TCA_NETEM_LATENCY64, zero_delay);
+    append_attribute(options, TCA_NETEM_JITTER64, ten_milliseconds);
+    // netem_dump includes these disabled features and an informational seed.
+    append_attribute(options, TCA_NETEM_CORR, tc_netem_corr{});
+    append_attribute(options, TCA_NETEM_REORDER, tc_netem_reorder{});
+    append_attribute(options, TCA_NETEM_CORRUPT, tc_netem_corrupt{});
+    append_attribute(options, TCA_NETEM_RATE, tc_netem_rate{});
+    append_attribute(options, TCA_NETEM_PAD, std::span<const std::byte>{});
+    append_attribute(options, TCA_NETEM_PRNG_SEED, std::uint64_t{123456789U});
+    return options;
+}
+
+std::vector<std::byte> netem_root_message(const std::vector<std::byte>& options)
 {
     constexpr std::uint32_t sequence{19};
     constexpr std::uint32_t port_id{31};
@@ -57,7 +81,7 @@ std::vector<std::byte> netem_root_message()
     tcmsg information{};
     information.tcm_family = AF_UNSPEC;
     information.tcm_ifindex = static_cast<int>(ifindex);
-    information.tcm_handle = TC_H_MAKE(0x4e4cU, 0U);
+    information.tcm_handle = TC_H_MAKE(0x4e4c0000U, 0U);
     information.tcm_parent = TC_H_ROOT;
     write_object(message, NLMSG_HDRLEN, information);
 
@@ -66,15 +90,6 @@ std::vector<std::byte> netem_root_message()
     std::memcpy(kind_bytes.data(), kind.data(), kind.size());
     append_attribute(message, TCA_KIND, std::span<const std::byte>{kind_bytes});
 
-    tc_netem_qopt base_options{};
-    base_options.limit = 1000U;
-    base_options.loss = 64424509U; // tc's 1.5% fixed-point value.
-    std::vector<std::byte> options(sizeof(base_options));
-    std::memcpy(options.data(), &base_options, sizeof(base_options));
-    constexpr std::uint64_t zero_delay{};
-    constexpr std::uint64_t ten_milliseconds{10'000'000U};
-    append_attribute(options, TCA_NETEM_LATENCY64, zero_delay);
-    append_attribute(options, TCA_NETEM_JITTER64, ten_milliseconds);
     append_attribute(
         message,
         static_cast<std::uint16_t>(TCA_OPTIONS | NLA_F_NESTED),
@@ -94,22 +109,78 @@ TEST(QdiscMessageDecoderTest, ReadsZeroDelayJitterAndLossFromNetemAttributes)
 {
     QdiscMessageDecoder decoder{19U, 31U, 20U};
 
-    const QdiscMessage result{decoder.consume(netem_root_message())};
+    const QdiscMessage result{decoder.consume(netem_root_message(kernel_netem_options()))};
 
     ASSERT_EQ(result.status, InventoryStatus::present);
     ASSERT_EQ(result.kind, QdiscMessageKind::root);
     ASSERT_TRUE(result.root.has_value());
     EXPECT_EQ(result.root->kind, RootQdiscKind::netem);
-    EXPECT_EQ(result.root->handle, TC_H_MAKE(0x4e4cU, 0U));
+    EXPECT_EQ(result.root->handle, TC_H_MAKE(0x4e4c0000U, 0U));
     EXPECT_EQ(result.root->delay_nanoseconds, 0U);
     EXPECT_EQ(result.root->jitter_nanoseconds, 10'000'000U);
     EXPECT_EQ(result.root->loss_probability, 64424509U);
     EXPECT_FALSE(result.root->has_unsupported_options);
 }
 
+TEST(QdiscMessageDecoderTest, MarksActiveOrUnknownOptionsUnsupported)
+{
+    const std::array<std::pair<std::uint16_t, std::size_t>, 5> attributes{{
+        {TCA_NETEM_CORR, sizeof(tc_netem_corr)},
+        {TCA_NETEM_REORDER, sizeof(tc_netem_reorder)},
+        {TCA_NETEM_CORRUPT, sizeof(tc_netem_corrupt)},
+        {TCA_NETEM_RATE, sizeof(tc_netem_rate)},
+        {TCA_NETEM_MAX + 1U, 1U},
+    }};
+    for (const auto& [type, size] : attributes) {
+        SCOPED_TRACE(type);
+        tc_netem_qopt base{};
+        base.limit = 1000U;
+        std::vector<std::byte> options(sizeof(base));
+        write_object(options, 0U, base);
+        std::vector<std::byte> payload(size);
+        payload.back() = std::byte{1};
+        append_attribute(options, type, std::span<const std::byte>{payload});
+        QdiscMessageDecoder decoder{19U, 31U, 20U};
+        const auto result{decoder.consume(netem_root_message(options))};
+        ASSERT_EQ(result.status, InventoryStatus::present);
+        ASSERT_TRUE(result.root.has_value());
+        EXPECT_TRUE(result.root->has_unsupported_options);
+    }
+}
+
+TEST(QdiscMessageDecoderTest, RejectsMalformedAndDuplicateMetadata)
+{
+    auto options{kernel_netem_options()};
+    append_attribute(options, TCA_NETEM_PRNG_SEED, std::uint64_t{42U});
+    QdiscMessageDecoder duplicate_decoder{19U, 31U, 20U};
+    EXPECT_EQ(duplicate_decoder.consume(netem_root_message(options)).status,
+              InventoryStatus::malformed);
+
+    // Padding has no payload, even when another well-formed PAD precedes it.
+    options = kernel_netem_options();
+    append_attribute(options, TCA_NETEM_PAD, std::uint32_t{0U});
+    QdiscMessageDecoder padding_decoder{19U, 31U, 20U};
+    EXPECT_EQ(padding_decoder.consume(netem_root_message(options)).status,
+              InventoryStatus::malformed);
+}
+
+TEST(QdiscMessageDecoderTest, DoesNotConfirmNonzeroLegacyTimingWithoutNanoseconds)
+{
+    tc_netem_qopt base{};
+    base.limit = 1000U;
+    base.latency = 2343750U;
+    std::vector<std::byte> options(sizeof(base));
+    write_object(options, 0U, base);
+    QdiscMessageDecoder decoder{19U, 31U, 20U};
+    const auto result{decoder.consume(netem_root_message(options))};
+    ASSERT_EQ(result.status, InventoryStatus::present);
+    ASSERT_TRUE(result.root.has_value());
+    EXPECT_TRUE(result.root->has_unsupported_options);
+}
+
 TEST(QdiscMessageDecoderTest, RejectsTruncatedNetemAttributes)
 {
-    std::vector<std::byte> message{netem_root_message()};
+    std::vector<std::byte> message{netem_root_message(kernel_netem_options())};
     message.pop_back();
     QdiscMessageDecoder decoder{19U, 31U, 20U};
 
