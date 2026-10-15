@@ -6,10 +6,12 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cerrno>
 #include <fcntl.h>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
@@ -125,6 +127,10 @@ TEST(WorkloadProcessTest, NamespaceEntryFailurePreventsExec)
 
     EXPECT_FALSE(launch.process.has_value());
     EXPECT_EQ(launch.failure_exit_code, 125);
+    int status{};
+    errno = 0;
+    EXPECT_EQ(waitpid(-1, &status, WNOHANG), -1);
+    EXPECT_EQ(errno, ECHILD);
 }
 
 TEST(WorkloadProcessTest, ResolverViewSetupFailurePreventsExec)

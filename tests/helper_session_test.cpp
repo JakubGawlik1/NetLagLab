@@ -112,6 +112,11 @@ public:
         PreparedNetworkEnvironment&) override
     {
         actions.push_back("supervise");
+        if (simulate_protocol_failure) {
+            actions.push_back("protocol failed");
+            (void)stop_and_reap(workload);
+            return 125;
+        }
         if (simulate_supervisor_loss) {
             actions.push_back("supervisor lost");
             (void)stop_and_reap(workload);
@@ -124,6 +129,10 @@ public:
         }
         actions.push_back("reaped");
         lock_was_held_after_reap = trace_->host_lock_alive;
+        if (simulate_workload_result_delivery_failure) {
+            actions.push_back("workload result delivery failed");
+            return 125;
+        }
         if (status->exited) {
             workload_exit_codes.push_back(status->value);
             (void)send(WorkloadExitedEvent{status->value});
@@ -149,6 +158,8 @@ public:
     std::optional<int> launch_failure;
     bool active_delivery_succeeds{true};
     bool simulate_supervisor_loss{};
+    bool simulate_protocol_failure{};
+    bool simulate_workload_result_delivery_failure{};
     bool lock_was_held_after_reap{};
     std::vector<Operation> operations_at_start_failure;
     std::vector<int> workload_exit_codes;
@@ -387,6 +398,44 @@ TEST(HelperSessionTest, SupervisorLossStillReapsBeforeExplicitCleanup)
     EXPECT_EQ(operations.actions[5], "stop and reap");
     EXPECT_EQ(operations.actions[6], "reaped");
     EXPECT_EQ(operations.actions[7], "cleanup succeeded");
+    EXPECT_TRUE(operations.lock_was_held_after_reap);
+    EXPECT_FALSE(trace->host_lock_alive);
+}
+
+TEST(HelperSessionTest, ProtocolFailureStillReapsBeforeExplicitCleanup)
+{
+    auto trace{std::make_shared<SharedTrace>()};
+    ScriptedHelperSession operations{successful_preparation(), trace};
+    const WorkloadContext context{"/", {"/bin/sleep", "5"}, {"PATH=/bin"}};
+    std::ostringstream error;
+    operations.simulate_protocol_failure = true;
+
+    const int result{run_helper_session(
+        operations, context, current_identity(), {}, error)};
+
+    EXPECT_EQ(result, 125);
+    EXPECT_EQ(operations.actions[4], "protocol failed");
+    EXPECT_EQ(operations.actions[5], "stop and reap");
+    EXPECT_EQ(operations.actions[6], "reaped");
+    EXPECT_EQ(operations.actions[7], "cleanup succeeded");
+    EXPECT_TRUE(operations.lock_was_held_after_reap);
+    EXPECT_FALSE(trace->host_lock_alive);
+}
+
+TEST(HelperSessionTest, FailedWorkloadResultDeliveryStillCleansEnvironment)
+{
+    auto trace{std::make_shared<SharedTrace>()};
+    ScriptedHelperSession operations{successful_preparation(), trace};
+    std::ostringstream error;
+    operations.simulate_workload_result_delivery_failure = true;
+
+    const int result{run_helper_session(
+        operations, true_context(), current_identity(), {}, error)};
+
+    EXPECT_EQ(result, 125);
+    EXPECT_EQ(operations.actions[4], "reaped");
+    EXPECT_EQ(operations.actions[5], "workload result delivery failed");
+    EXPECT_EQ(operations.actions[6], "cleanup succeeded");
     EXPECT_TRUE(operations.lock_was_held_after_reap);
     EXPECT_FALSE(trace->host_lock_alive);
 }
